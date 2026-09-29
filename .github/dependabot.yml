@@ -1,0 +1,28 @@
+# Version updates: Dependabot proposes newer dependencies and action versions
+# as pull requests, which CI then tests. Security updates are separate --
+# they are enabled in the repository's settings, are raised as soon as an
+# advisory is published, and are not delayed by the cooldown below.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # A release is not proposed until it is a week old. A compromised or
+    # broken release is usually caught and yanked within days.
+    cooldown:
+      default-days: 7
+    # One pull request for everything, rather than one per package.
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

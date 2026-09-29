@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ianderso/gramps-evidence-mcp/security/advisories/new
+    about: Privately, not in a public issue. See SECURITY.md.
+  - name: A problem with Gramps Web itself
+    url: https://github.com/gramps-project/gramps-web-api/issues
+    about: This project does not maintain Gramps Web. Problems in its API, its interface or its data handling go to the Gramps project.

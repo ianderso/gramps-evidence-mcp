@@ -1,0 +1,70 @@
+# Local Gramps Web (gramps-webapi + frontend) for gramps-evidence-mcp.
+#
+# Backend: SQLite (the default) -- no external DB needed.
+# Storage: BIND MOUNTS under ./docker/gramps_data and ./docker/media instead of
+#   named volumes, so the whole tree + media is a plain directory tree you can
+#   later move elsewhere and re-mount. Keep these dirs backed up.
+# Port:    host 5555 -> container 5000. 5555 avoids macOS's AirPlay Receiver,
+#   which squats on 5000. This matches GRAMPS_MCP_API_URL=http://localhost:5555.
+#
+# Bring-up:
+#   docker compose -f docker/docker-compose.yml up -d
+# First user (owner) via the browser wizard at http://localhost:5555, OR CLI:
+#   docker compose -f docker/docker-compose.yml exec grampsweb \
+#       gramps-web user add owner 'STRONG_PW' --fullname 'Owner' --role 4
+# Dedicated MCP user (editor role is the minimum for writes; owner also works):
+#   docker compose -f docker/docker-compose.yml exec grampsweb \
+#       gramps-web user add mcp 'MCP_PW' --fullname 'MCP client' --role 3
+
+x-common: &grampsweb-env
+  GRAMPSWEB_TREE: "MyTree"                       # created on first start if absent
+  GRAMPSWEB_CELERY_CONFIG__broker_url: "redis://grampsweb_redis:6379/0"
+  GRAMPSWEB_CELERY_CONFIG__result_backend: "redis://grampsweb_redis:6379/0"
+  GRAMPSWEB_RATELIMIT_STORAGE_URI: "redis://grampsweb_redis:6379/1"
+  # SECRET_KEY and USER_DB_URI use the image defaults, persisted in the
+  # bind-mounted /app/secret and /app/users dirs below.
+
+services:
+  grampsweb:
+    image: ghcr.io/gramps-project/grampsweb:latest
+    container_name: grampsweb
+    restart: unless-stopped
+    ports:
+      - "5555:5000"
+    environment: *grampsweb-env
+    depends_on:
+      - grampsweb_redis
+    volumes:
+      - ./gramps_data/users:/app/users              # user DB (SQLite) + config
+      - ./gramps_data/index:/app/indexdir           # search index
+      - ./gramps_data/thumb_cache:/app/thumbnail_cache
+      - ./gramps_data/cache:/app/cache
+      - ./gramps_data/secret:/app/secret            # Flask secret key
+      - ./gramps_data/db:/root/.gramps/grampsdb     # the family tree database
+      - ./media:/app/media                          # managed media directory
+      - ./gramps_data/tmp:/tmp
+
+  grampsweb_celery:
+    image: ghcr.io/gramps-project/grampsweb:latest
+    container_name: grampsweb_celery
+    restart: unless-stopped
+    environment: *grampsweb-env
+    depends_on:
+      - grampsweb_redis
+    volumes:
+      - ./gramps_data/users:/app/users
+      - ./gramps_data/index:/app/indexdir
+      - ./gramps_data/thumb_cache:/app/thumbnail_cache
+      - ./gramps_data/cache:/app/cache
+      - ./gramps_data/secret:/app/secret
+      - ./gramps_data/db:/root/.gramps/grampsdb
+      - ./media:/app/media
+      - ./gramps_data/tmp:/tmp
+    command: celery -A gramps_webapi.celery worker --loglevel=INFO
+
+  grampsweb_redis:
+    image: redis:7-alpine
+    container_name: grampsweb_redis
+    restart: unless-stopped
+    volumes:
+      - ./gramps_data/redis:/data

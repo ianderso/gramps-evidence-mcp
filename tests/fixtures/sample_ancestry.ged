@@ -1,0 +1,70 @@
+0 HEAD
+1 SOUR Ancestry.com
+2 NAME Ancestry.com Family Trees
+2 CORP Ancestry.com
+1 GEDC
+2 VERS 5.5.1
+2 FORM LINEAGE-LINKED
+1 CHAR UTF-8
+1 _TREE Smith Family Tree
+2 RIN 123456789
+0 @I1@ INDI
+1 NAME John /Smith/
+2 GIVN John
+2 SURN Smith
+1 SEX M
+1 _APID 1,7602::100
+1 OBJE
+2 FILE john_smith_portrait.jpg
+1 NOTE John was a carpenter who emigrated from England in 1885.
+1 EVEN
+2 TYPE Military Service
+2 DATE 1917
+2 PLAC France
+1 BIRT
+2 DATE 12 JAN 1899
+2 PLAC New York, New York, USA
+2 SOUR @S1@
+3 PAGE Vol 3, p 45
+3 _APID 1,61903::1234567
+3 DATA
+4 TEXT Name: John Smith; Birth: 12 Jan 1899 New York
+4 WWW https://www.ancestry.com/discoveryui-content/view/1234567:61903
+1 DEAT
+2 DATE 1965
+2 PLAC Boston, Massachusetts, USA
+1 FAMS @F1@
+0 @I2@ INDI
+1 NAME Mary /Jones/
+2 GIVN Mary
+2 SURN Jones
+1 SEX F
+1 BIRT
+2 DATE ABT 1902
+2 PLAC Brooklyn, New York, USA
+1 FAMS @F1@
+0 @I3@ INDI
+1 NAME Baby /Smith/
+2 GIVN Baby
+2 SURN Smith
+1 SEX U
+1 BIRT
+2 DATE 1925
+2 PLAC New York, USA
+2 SOUR Uncited family bible transcription
+1 FAMC @F1@
+0 @F1@ FAM
+1 HUSB @I1@
+1 WIFE @I2@
+1 CHIL @I3@
+1 MARR
+2 DATE 5 JUN 1921
+2 PLAC Manhattan, New York, USA
+2 SOUR @S1@
+3 _APID 1,9876::5544332
+0 @S1@ SOUR
+1 TITL New York, Marriage Index, 1866-1937
+1 AUTH New York State Department of Health
+1 PUBL Ancestry.com Operations, Inc.
+1 _APID 1,61903::0
+0 TRLR

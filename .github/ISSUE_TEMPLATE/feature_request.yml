@@ -1,0 +1,25 @@
+name: Feature request
+description: A research task the tools cannot do yet.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Some things are out of scope by decision — importing files into the tree, writing DNA matches, whole-tree destructive endpoints. See "Not planned" in [docs/ROADMAP.md](https://github.com/ianderso/gramps-evidence-mcp/blob/main/docs/ROADMAP.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The research task
+      description: What you were trying to record, correct or find, and where the current tools stopped you.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: A new tool, a new parameter, or a change to what a tool returns.
+  - type: textarea
+    id: api
+    attributes:
+      label: gramps-webapi endpoint
+      description: If you know which part of the API would answer it. docs/PITFALLS.md records where its behaviour has surprised before.

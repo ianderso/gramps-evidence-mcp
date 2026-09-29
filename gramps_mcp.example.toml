@@ -1,0 +1,44 @@
+# gramps-evidence-mcp non-secret configuration.
+# Copy to gramps_mcp.toml and edit. Secrets (API URL/user/password) go in .env
+# or the environment, NOT here -- so this file is safe to keep in version control
+# if you wish (though the default .gitignore excludes gramps_mcp.toml too).
+
+[server]
+# expose_private = true DISABLES privacy filtering (shows living/private people
+# in bulk output). Leave false unless you are doing a deliberate full audit.
+expose_private = false
+
+# Where to cache parsed reference GEDCOMs (defaults to ~/.cache/gramps-evidence-mcp).
+# cache_dir = "~/.cache/gramps-evidence-mcp"
+
+# Attribute name stamped on events created without a real citation.
+# unsourced_attribute = "UNSOURCED"
+
+# HTTP timeout in seconds for calls to gramps-webapi (default 30). Raise it if
+# your instance is slow on big collection reads.
+# request_timeout = 30.0
+
+# NOTE: there is no tree selector. On gramps-webapi the tree is bound to the
+# account you authenticate as -- no data endpoint takes a tree parameter
+# (verified against 3.20.1's /api/openapi.json). To work against a different
+# tree, use credentials belonging to that tree.
+
+# ---------------------------------------------------------------------------
+# Reference layer: legacy GEDCOM exports consulted READ-ONLY as untrusted hints.
+# Each file gets a short label and a trust note. Paths may be absolute or
+# relative to this config file.
+# ---------------------------------------------------------------------------
+[[reference]]
+path = "~/gedcoms/export_one.ged"
+label = "Ancestry (one branch)"
+trust = "User-built Ancestry tree; many hints unsourced. Verify everything."
+
+[[reference]]
+path = "~/gedcoms/export_two.ged"
+label = "Ancestry (another branch)"
+trust = "Imported from another researcher; provenance unknown. Low trust."
+
+# [[reference]]
+# path = "~/gedcoms/familysearch_export.ged"
+# label = "FamilySearch"
+# trust = "Community-edited shared tree; conflations common. Medium-low trust."

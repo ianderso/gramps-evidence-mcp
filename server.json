@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ianderso/gramps-evidence-mcp",
+  "title": "Gramps Evidence",
+  "description": "Read/write a self-hosted Gramps Web family tree where every fact carries a citation.",
+  "repository": {
+    "url": "https://github.com/ianderso/gramps-evidence-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "gramps-evidence-mcp",
+      "version": "1.0.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GRAMPS_MCP_API_URL",
+          "description": "Base URL of your Gramps Web API, e.g. http://gramps.example.org:5000.",
+          "isRequired": true
+        },
+        {
+          "name": "GRAMPS_MCP_USERNAME",
+          "description": "A dedicated Gramps Web user with at least the editor role.",
+          "isRequired": true
+        },
+        {
+          "name": "GRAMPS_MCP_PASSWORD",
+          "description": "That user's password.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "GRAMPS_MCP_CONFIG",
+          "description": "Absolute path to the TOML file listing reference GEDCOMs and the privacy setting.",
+          "default": "./gramps_mcp.toml"
+        },
+        {
+          "name": "GRAMPS_MCP_EXPOSE_PRIVATE",
+          "description": "Set true to turn off living-person and private-record filtering of bulk output.",
+          "default": "false"
+        }
+      ]
+    }
+  ]
+}

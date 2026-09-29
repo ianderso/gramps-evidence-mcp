@@ -1,0 +1,55 @@
+# Secrets and local config. .env holds the real credentials; .env.example is
+# the committed template.
+.env
+.env.*
+!.env.example
+.envrc
+gramps_mcp.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Local Gramps Web data (bind mounts from docker/docker-compose.yml)
+docker/gramps_data/
+docker/media/
+docker/tmp/
+docker/indexes/
+docker/secret/
+.cache/
+
+# Real GEDCOM exports contain living-person data. Never commit them; the only
+# tracked .ged is the synthetic test fixture.
+*.ged
+!tests/fixtures/*.ged
+
+# Genealogy media, backups and archives are never part of this repository.
+*.gramps
+*.zip
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.tif
+*.tiff
+*.bmp
+*.webp
+*.heic
+*.pdf
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

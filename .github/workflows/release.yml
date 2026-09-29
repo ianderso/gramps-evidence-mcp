@@ -1,0 +1,115 @@
+name: Release
+
+# Publishing a GitHub release builds its tag, uploads it to PyPI, and then
+# lists it in the MCP Registry. Both trust this workflow through GitHub's
+# OIDC token, so no token is stored anywhere: each publishing job gets a
+# short-lived credential, and only through its environment (pypi,
+# mcp-registry), which accepts v* tags and main.
+#
+# Every action here is pinned to a commit rather than a tag, because the
+# publishing jobs hold those credentials. Dependabot keeps the pins current;
+# mcp-publisher is pinned by version and checksum below, and updated by hand.
+on:
+  release:
+    types: [published]
+  # Publishes an existing release tag by hand. Run it from main.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, e.g. v1.0.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Only a tag is ever built, never a branch or a bare commit.
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+          # A release build starts clean: nothing restored from a cache that
+          # another workflow could have written.
+          enable-cache: false
+      - run: uv build
+      - name: Check the tag against the built version and server.json
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if [ ! -f "dist/gramps_evidence_mcp-${TAG#v}-py3-none-any.whl" ]; then
+            echo "::error::Tag $TAG does not match the built version: $(ls dist)"
+            exit 1
+          fi
+          # The registry listing must name the same version, and is checked
+          # here so that a mismatch stops the release before PyPI, not after.
+          if ! jq -e --arg v "${TAG#v}" '.version == $v and .packages[0].version == $v' server.json; then
+            echo "::error::server.json does not name version ${TAG#v}"
+            exit 1
+          fi
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/gramps-evidence-mcp
+    permissions:
+      # Trusted Publishing: exchanged with PyPI for a token scoped to this
+      # project, valid for minutes. Also signs the upload's attestations.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  registry:
+    name: List in the MCP Registry
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: mcp-registry
+    permissions:
+      # Exchanged with the registry for a token scoped to the
+      # io.github.ianderso namespace.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - name: Install mcp-publisher
+        env:
+          VERSION: "1.8.1"
+          SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          curl -fsSLo mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v${VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${SHA256}  mcp-publisher.tar.gz" | sha256sum --check --strict
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+      - run: ./mcp-publisher login github-oidc
+      - name: Publish server.json
+        # The registry confirms ownership by reading this version's README
+        # from PyPI, which can lag the upload by a minute or two.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            ./mcp-publisher publish && exit 0
+            echo "Attempt $attempt did not publish; retrying in 30 seconds."
+            sleep 30
+          done
+          exit 1

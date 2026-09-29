@@ -1,0 +1,438 @@
+{
+  "add_alternate_name": [
+    "given",
+    "name_prefix",
+    "name_suffix",
+    "name_type",
+    "nickname",
+    "person",
+    "surname"
+  ],
+  "add_attribute": [
+    "name",
+    "object_type",
+    "target",
+    "value"
+  ],
+  "add_child_to_family": [
+    "child",
+    "family",
+    "frel",
+    "mrel"
+  ],
+  "add_citation": [
+    "citation"
+  ],
+  "add_dna_match": [
+    "citation",
+    "match",
+    "person",
+    "segments"
+  ],
+  "add_event_to_family": [
+    "event",
+    "family",
+    "require_citation"
+  ],
+  "add_event_to_person": [
+    "event",
+    "person",
+    "require_citation"
+  ],
+  "add_family": [
+    "children",
+    "father",
+    "marriage",
+    "mother",
+    "relationship",
+    "require_citation"
+  ],
+  "add_media": [
+    "dedup_by_checksum",
+    "description",
+    "file_path"
+  ],
+  "add_note": [
+    "note_type",
+    "target",
+    "target_type",
+    "text"
+  ],
+  "add_person": [
+    "birth",
+    "death",
+    "gender",
+    "given",
+    "name_prefix",
+    "name_suffix",
+    "require_citation",
+    "surname"
+  ],
+  "add_place": [
+    "code",
+    "latitude",
+    "longitude",
+    "name",
+    "parent",
+    "place_type",
+    "title"
+  ],
+  "add_repository": [
+    "name",
+    "repository_type",
+    "url"
+  ],
+  "add_source": [
+    "abbreviation",
+    "author",
+    "call_number",
+    "publication_info",
+    "repository",
+    "title"
+  ],
+  "add_url": [
+    "description",
+    "object_type",
+    "target",
+    "url",
+    "url_type"
+  ],
+  "assess_living": [
+    "average_generation_gap",
+    "explain",
+    "max_age_probably_alive",
+    "person"
+  ],
+  "attach_media": [
+    "description",
+    "file_path",
+    "media_ref",
+    "target",
+    "target_type"
+  ],
+  "cite_child_link": [
+    "child",
+    "citation",
+    "family"
+  ],
+  "cite_event": [
+    "citation",
+    "event"
+  ],
+  "cite_object": [
+    "citation",
+    "object_type",
+    "ref"
+  ],
+  "consolidated_timeline": [
+    "anchor",
+    "event_types",
+    "include_private",
+    "limit",
+    "object_type",
+    "targets"
+  ],
+  "consult_reference": [
+    "approx_birth_year",
+    "include_private",
+    "name",
+    "year_tolerance"
+  ],
+  "create_filter": [
+    "comment",
+    "function",
+    "invert",
+    "name",
+    "namespace",
+    "rules"
+  ],
+  "db_stats": [],
+  "delete_filter": [
+    "name",
+    "namespace"
+  ],
+  "delete_object": [
+    "object_type",
+    "target"
+  ],
+  "detach_object": [
+    "child",
+    "child_kind",
+    "delete_if_orphan",
+    "parent",
+    "parent_type"
+  ],
+  "event_span": [
+    "as_age",
+    "event1",
+    "event2",
+    "precision"
+  ],
+  "export_backup": [
+    "dest_path",
+    "export_format"
+  ],
+  "find_duplicates": [
+    "include_private",
+    "kind",
+    "limit"
+  ],
+  "get_ancestors": [
+    "generations",
+    "include_private",
+    "person"
+  ],
+  "get_backlinks": [
+    "object_type",
+    "ref"
+  ],
+  "get_citation": [
+    "citation"
+  ],
+  "get_descendants": [
+    "generations",
+    "include_private",
+    "person"
+  ],
+  "get_dna_matches": [
+    "include_raw",
+    "person"
+  ],
+  "get_event": [
+    "event"
+  ],
+  "get_facts": [
+    "include_private",
+    "person",
+    "person_filter",
+    "rank"
+  ],
+  "get_family": [
+    "family"
+  ],
+  "get_media": [
+    "media"
+  ],
+  "get_note": [
+    "note"
+  ],
+  "get_object": [
+    "keys",
+    "object_type",
+    "ref"
+  ],
+  "get_person": [
+    "person"
+  ],
+  "get_place": [
+    "place"
+  ],
+  "get_relationship": [
+    "all_paths",
+    "depth",
+    "person1",
+    "person2"
+  ],
+  "get_report_options": [
+    "report_id"
+  ],
+  "get_repository": [
+    "repository"
+  ],
+  "get_researcher": [],
+  "get_source": [
+    "source"
+  ],
+  "get_task": [
+    "task_id"
+  ],
+  "get_timeline": [
+    "ancestors",
+    "include_private",
+    "limit",
+    "object_type",
+    "offspring",
+    "target"
+  ],
+  "get_transaction": [
+    "transaction_id"
+  ],
+  "get_ydna": [
+    "include_raw",
+    "person"
+  ],
+  "link_repository": [
+    "call_number",
+    "media_type",
+    "repository",
+    "source"
+  ],
+  "list_custom_filters": [
+    "namespace"
+  ],
+  "list_event_types": [],
+  "list_filter_rules": [
+    "namespace"
+  ],
+  "list_object_types": [],
+  "list_reports": [],
+  "list_tags": [],
+  "list_tasks": [
+    "limit"
+  ],
+  "list_transactions": [
+    "limit"
+  ],
+  "list_unsourced_facts": [
+    "include_private",
+    "person"
+  ],
+  "merge_objects": [
+    "drop",
+    "dry_run",
+    "keep",
+    "object_type"
+  ],
+  "ocr_media": [
+    "lang",
+    "media"
+  ],
+  "parse_dna_segments": [
+    "data"
+  ],
+  "query_objects": [
+    "gql",
+    "gramps_ids",
+    "handles",
+    "include_private",
+    "keys",
+    "limit",
+    "object_type",
+    "page",
+    "sort"
+  ],
+  "query_records": [
+    "after",
+    "event_type",
+    "include_private",
+    "limit",
+    "object_type",
+    "order_by",
+    "select",
+    "where",
+    "where_expr"
+  ],
+  "reindex_search": [
+    "full"
+  ],
+  "run_report": [
+    "include_private",
+    "locale",
+    "options",
+    "report_id"
+  ],
+  "search_people": [
+    "birth_year_max",
+    "birth_year_min",
+    "include_private",
+    "name"
+  ],
+  "set_private": [
+    "object_type",
+    "private",
+    "target"
+  ],
+  "tag_object": [
+    "color",
+    "object_type",
+    "tag",
+    "target"
+  ],
+  "uncite": [
+    "citation",
+    "delete_if_orphan",
+    "object_type",
+    "ref"
+  ],
+  "undo_transaction": [
+    "dry_run",
+    "force",
+    "transaction_id"
+  ],
+  "update_citation": [
+    "citation",
+    "confidence",
+    "date",
+    "page",
+    "source"
+  ],
+  "update_event": [
+    "date",
+    "description",
+    "event",
+    "place"
+  ],
+  "update_media": [
+    "date",
+    "description",
+    "media",
+    "path"
+  ],
+  "update_object_fields": [
+    "fields",
+    "object_type",
+    "ref"
+  ],
+  "update_person": [
+    "gender",
+    "name",
+    "person",
+    "private"
+  ],
+  "update_place": [
+    "code",
+    "latitude",
+    "longitude",
+    "name",
+    "parent",
+    "place",
+    "place_type",
+    "remove_parent",
+    "title"
+  ],
+  "update_source": [
+    "abbreviation",
+    "author",
+    "publication_info",
+    "source",
+    "title"
+  ],
+  "update_url": [
+    "description",
+    "match",
+    "object_type",
+    "remove",
+    "target",
+    "url",
+    "url_type"
+  ],
+  "verify_tree": [
+    "estimate_age",
+    "flag_invalid_dates",
+    "max_age_at_death",
+    "max_age_to_marry",
+    "max_child_birth_span",
+    "max_children_father",
+    "max_children_mother",
+    "max_father_age",
+    "max_husband_wife_age_gap",
+    "max_mother_age",
+    "max_spouses",
+    "max_widowhood_years",
+    "max_years_between_children",
+    "min_age_to_marry",
+    "min_father_age",
+    "min_mother_age",
+    "tree_id"
+  ]
+}

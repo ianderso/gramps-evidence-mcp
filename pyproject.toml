@@ -1,0 +1,81 @@
+[project]
+name = "gramps-evidence-mcp"
+dynamic = ["version"]
+description = "MCP server for evidence-disciplined genealogy: read/write access to a self-hosted Gramps Web tree where every fact carries a citation, plus a read-only reference layer over legacy GEDCOM exports."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ian Anderson" }]
+keywords = ["mcp", "gramps", "gramps-web", "genealogy", "gedcom", "family-history", "citations"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Sociology :: Genealogy",
+    "Topic :: Sociology :: History",
+]
+dependencies = [
+    # Capped below 3: server.refuse_unknown_arguments and the schema
+    # compaction reach into the SDK's private tool registry, which a major
+    # release is free to change.
+    "mcp>=2.0.0,<3",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ianderso/gramps-evidence-mcp"
+Repository = "https://github.com/ianderso/gramps-evidence-mcp"
+Issues = "https://github.com/ianderso/gramps-evidence-mcp/issues"
+Changelog = "https://github.com/ianderso/gramps-evidence-mcp/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    # 0.9 is the oldest ruff whose formatter agrees with the committed style.
+    "ruff>=0.9",
+]
+
+[project.scripts]
+gramps-evidence-mcp = "gramps_evidence_mcp.__main__:main"
+
+[build-system]
+# 1.27 is the first hatchling to accept an SPDX string for `license`.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/gramps_evidence_mcp/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [".github"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gramps_evidence_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: Field() in tool-parameter defaults is the standard MCP/pydantic idiom.
+# UP042: `str, Enum` is intentional (stable JSON-schema string values).
+ignore = ["B008", "UP042"]
