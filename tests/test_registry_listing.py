@@ -59,3 +59,11 @@ def test_only_the_password_is_secret():
     """A client masks a secret; the URL and user name are not."""
     secret = {v["name"] for v in PACKAGE["environmentVariables"] if v.get("isSecret")}
     assert secret == {"GRAMPS_MCP_PASSWORD"}
+
+
+def test_the_server_reports_its_version_when_a_session_starts():
+    """Clients show it; an empty string names no release at all."""
+    from gramps_evidence_mcp.server import mcp
+
+    options = mcp._lowlevel_server.create_initialization_options()
+    assert options.server_version == __version__
