@@ -22,6 +22,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from . import __version__
 from .client import ENDPOINTS, GrampsApiError, GrampsWebClient, InvalidIdentifierError
 from .config import Config, ConfigError, load_config, transport_settings
 from .gedcom_ref import ReferenceLibrary
@@ -78,6 +79,7 @@ RUNS_ON_SERVER = ToolAnnotations(
 # MCPServer is the high-level server in mcp>=2.0, formerly FastMCP.
 mcp = MCPServer(
     "gramps-evidence-mcp",
+    version=__version__,
     instructions=(
         "Read/write tools over a self-hosted Gramps Web genealogy tree. "
         "Golden rule: every fact gets a citation. Use consult_reference "

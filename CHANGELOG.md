@@ -8,6 +8,20 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-09-29
+
+### Fixed
+
+- The server reports its version to MCP clients when a session starts. It
+  sent an empty string, so a client could not show which release it was
+  talking to.
+
+### Changed
+
+- Tested against the MCP SDK 2.2.0, pydantic 2.13.5, python-dotenv 1.2.3 and
+  pyjwt 2.14.0, which the lockfile now pins. The package's own requirements
+  are unchanged, so an installed copy could already use these.
+
 ## [1.0.0] — 2026-09-29
 
 The first public release.
@@ -63,5 +77,6 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/ianderso/gramps-evidence-mcp/releases/tag/v1.0.0
