@@ -1,7 +1,7 @@
 # gramps-evidence-mcp
 
 [![CI](https://github.com/ianderso/gramps-evidence-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/ianderso/gramps-evidence-mcp/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/gramps-evidence-mcp)](https://pypi.org/project/gramps-evidence-mcp/)
+[![PyPI](https://img.shields.io/pypi/v/gramps-evidence-mcp?label=pypi)](https://pypi.org/project/gramps-evidence-mcp/)
 
 <!-- mcp-name: io.github.ianderso/gramps-evidence-mcp -->
 
