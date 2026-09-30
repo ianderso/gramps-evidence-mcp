@@ -32,7 +32,7 @@ jobs:
           # Only a tag is ever built, never a branch or a bare commit.
           ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
           # A release build starts clean: nothing restored from a cache that
