@@ -8,7 +8,7 @@ adding one is a minor release.
 
 ## [Unreleased]
 
-## [1.0.0]
+## [1.0.0] — 2026-09-29
 
 The first public release.
 
