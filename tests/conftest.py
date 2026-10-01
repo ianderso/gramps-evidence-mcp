@@ -142,6 +142,73 @@ class FakeGramps:
         self.parsed_segments: list[dict] | None = None
         self.parser_inputs: list[str] = []
         self.researcher: dict = {"name": "", "email": ""}
+        #: What GET /api/metadata/ reports. gramps-webapi 3.21.1 runs on
+        #: Gramps 6.0, which stores "from X" and "to X" dates.
+        self.metadata: dict = {
+            "gramps": {"version": "6.0.4"},
+            "gramps_webapi": {"version": "3.21.1"},
+        }
+        #: GET /api/types/: standard English names under "default" (Gramps'
+        #: get_standard_xml, every standard name but Custom) and the tree's
+        #: own under "custom". The keys are gramps-webapi 3.21.1's.
+        self.types: dict = {
+            "default": {
+                "event_types": [
+                    "Unknown",
+                    "Marriage",
+                    "Birth",
+                    "Death",
+                    "Baptism",
+                    "Burial",
+                    "Census",
+                    "Elected",
+                    "Occupation",
+                    "Property",
+                    "Residence",
+                    "Military Service",
+                ],
+                "event_role_types": [
+                    "Unknown",
+                    "Primary",
+                    "Clergy",
+                    "Celebrant",
+                    "Aide",
+                    "Bride",
+                    "Groom",
+                    "Witness",
+                    "Family",
+                    "Informant",
+                    "Godparent",
+                ],
+                "child_reference_types": [
+                    "None",
+                    "Birth",
+                    "Adopted",
+                    "Stepchild",
+                    "Sponsored",
+                    "Foster",
+                    "Unknown",
+                ],
+                "name_types": ["Unknown", "Also Known As", "Birth Name", "Married Name"],
+            },
+            "custom": {
+                "event_types": ["Widowhood"],
+                "event_role_types": [],
+                "child_reference_types": [],
+                "name_types": [],
+                "family_relation_types": [],
+            },
+        }
+        #: When set, DELETE commits and then answers this status, as
+        #: gramps-webapi 3.21.1 does when its search-index step fails after
+        #: the transaction has landed.
+        self.delete_error_after_commit: int | None = None
+        #: When set, DELETE fails with this status and deletes nothing.
+        self.delete_error_before_commit: int | None = None
+        #: When set, every PUT fails with this status and writes nothing.
+        self.put_error: int | None = None
+        #: When set, GET /api/metadata/ fails with this status, once.
+        self.metadata_error: int | None = None
         self.event_type_map: dict[str, str] = {
             "-1": "Unknown",
             "0": "Custom",
@@ -335,14 +402,13 @@ class FakeGramps:
             return httpx.Response(200, json=self.facts)
         if path == "/api/metadata/researcher/" and method == "GET":
             return httpx.Response(200, json=self.researcher)
+        if path == "/api/metadata/" and method == "GET":
+            if self.metadata_error:
+                status, self.metadata_error = self.metadata_error, None
+                return httpx.Response(status, text="Bad Gateway")
+            return httpx.Response(200, json=self.metadata)
         if path == "/api/types/":
-            return httpx.Response(
-                200,
-                json={
-                    "default": {"event_types": ["Birth", "Death", "Marriage"]},
-                    "custom": {"event_types": ["Widowhood"], "family_relation_types": []},
-                },
-            )
+            return httpx.Response(200, json=self.types)
         if path == "/api/objects/" and method == "POST":
             payloads = json.loads(request.content or b"[]")
             out = []
@@ -389,7 +455,18 @@ class FakeGramps:
             if method == "PUT":
                 return self._update(typ, handle, request)
             if method == "DELETE":
+                if handle not in self.store[typ]:
+                    return httpx.Response(404, json={"message": "not found"})
+                if self.delete_error_before_commit:
+                    return httpx.Response(self.delete_error_before_commit, text="boom")
                 self.store[typ].pop(handle, None)
+                for objects in self.store.values():
+                    for obj in objects.values():
+                        _unreference(obj, handle)
+                if self.delete_error_after_commit:
+                    return httpx.Response(
+                        self.delete_error_after_commit, text="<h1>Internal Server Error</h1>"
+                    )
                 return httpx.Response(200, json=[])
         return httpx.Response(405, json={"message": "method not allowed"})
 
@@ -402,11 +479,15 @@ class FakeGramps:
         obj.setdefault("gramps_id", self._new_gid(typ))
         self.store[typ][obj["handle"]] = obj
         self.requests.append(("POST", typ, payload))
+        if typ == "family":
+            self._family_cascade(None, obj)
         return httpx.Response(201, json=self._change_record(typ, obj, "add"))
 
     def _update(self, typ: str, handle: str, request: httpx.Request) -> httpx.Response:
         if self.write_forbidden:
             return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
+        if self.put_error:
+            return httpx.Response(self.put_error, json={"message": "write failed"})
         payload = json.loads(request.content or b"{}")
         obj = {k: v for k, v in payload.items() if k not in _COMPUTED_KEYS}
         obj["handle"] = handle
@@ -416,7 +497,54 @@ class FakeGramps:
             self.partial_writes.append((typ, handle, dropped))
         self.store[typ][handle] = obj
         self.requests.append(("PUT", typ, payload))
+        if typ == "family":
+            self._family_cascade(previous, obj)
         return httpx.Response(200, json=self._change_record(typ, obj, "update"))
+
+    def _family_cascade(self, old: dict | None, new: dict) -> None:
+        """Update family members' lists the way gramps-webapi 3.21.1 does.
+
+        ``add_family_update_refs`` and ``update_family_update_refs`` in its
+        ``api/resources/util.py``. Faithful in the two places that matter:
+        a new father or mother of an existing family gets the family
+        appended *without* a duplicate check, and a removed child loses the
+        family through ``list.remove``, which takes only the first of two
+        entries.
+        """
+        family = new["handle"]
+        people = self.store["person"]
+        if old is None:
+            for role in ("father_handle", "mother_handle"):
+                person = people.get(new.get(role) or "")
+                if person is not None and family not in person.setdefault("family_list", []):
+                    person["family_list"].append(family)
+            for ref in new.get("child_ref_list") or []:
+                person = people.get(ref.get("ref") or "")
+                if person is not None:
+                    links = person.setdefault("parent_family_list", [])
+                    if family not in links:
+                        links.append(family)
+            return
+        for role in ("father_handle", "mother_handle"):
+            before, after = old.get(role), new.get(role)
+            if before == after:
+                continue
+            if before in people and family in people[before].get("family_list", []):
+                people[before]["family_list"].remove(family)
+            if after in people:
+                people[after].setdefault("family_list", []).append(family)
+        was = {r.get("ref") for r in old.get("child_ref_list") or []}
+        now = {r.get("ref") for r in new.get("child_ref_list") or []}
+        for gone in was - now:
+            links = (people.get(gone) or {}).get("parent_family_list") or []
+            if family in links:
+                links.remove(family)
+        for added in now - was:
+            person = people.get(added)
+            if person is not None:
+                links = person.setdefault("parent_family_list", [])
+                if family not in links:
+                    links.append(family)
 
     def _merge(self, typ: str, keep: str, drop: str) -> httpx.Response:
         """Mimic the server-side merge: re-point references, then delete the loser.
@@ -432,7 +560,9 @@ class FakeGramps:
                 _repoint(obj, drop, keep)
         loser = self.store[typ].pop(drop)
         winner = self.store[typ][keep]
-        for key in ("media_list", "note_list", "citation_list", "tag_list"):
+        # Place.merge also unions the enclosures (_merge_placeref_list), which
+        # is how a merged place ends up with two undated parents.
+        for key in ("media_list", "note_list", "citation_list", "tag_list", "placeref_list"):
             if loser.get(key):
                 merged = list(winner.get(key) or [])
                 for entry in loser[key]:
@@ -656,6 +786,27 @@ def _references(node: Any, handle: str) -> bool:
     if isinstance(node, list):
         return any(_references(v, handle) for v in node)
     return False
+
+
+def _unreference(node: Any, handle: str) -> None:
+    """Drop references to a deleted object, as the server's DELETE does.
+
+    gramps-webapi 3.21.1 deletes "the object and its references"
+    (``api/resources/delete.py``): handle lists lose the handle, and ref
+    lists lose the entries pointing at it.
+    """
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if isinstance(value, list):
+                node[key] = [
+                    v
+                    for v in value
+                    if v != handle and not (isinstance(v, dict) and v.get("ref") == handle)
+                ]
+                for v in node[key]:
+                    _unreference(v, handle)
+            elif isinstance(value, dict):
+                _unreference(value, handle)
 
 
 def _repoint(node: Any, old: str, new: str) -> None:
@@ -935,6 +1086,25 @@ _MODEL_SAMPLES = {
     "name": {"given": "Sample", "surname": "Person"},
 }
 
+#: Samples by the model a property references, for inputs whose parameter
+#: name says nothing about their shape -- ``items`` is a list of citation
+#: edits on one tool and of repository links on another.
+_DEF_SAMPLES = {
+    "NameMatch": {"surname": "Person"},
+    "CitationEdit": {"citation": "C0001", "page": "p. 1"},
+    "RepositoryLink": {"source": "S0001", "repository": "R0001"},
+}
+
+
+def _def_name(spec: dict) -> str | None:
+    """The model a property (or the items of an array property) references."""
+    for node in (spec, spec.get("items") or {}, *(spec.get("anyOf") or [])):
+        ref = node.get("$ref") if isinstance(node, dict) else None
+        if ref:
+            return ref.rsplit("/", 1)[-1]
+    return None
+
+
 #: Escape hatch for a tool whose "pass at least one of these" rule cannot be
 #: satisfied from the schema and the parameter names alone.
 #:
@@ -961,6 +1131,10 @@ def _value_for(name: str, spec: dict):
     """
     if _is_model(spec) and name in _MODEL_SAMPLES:
         return _MODEL_SAMPLES[name]
+    model = _def_name(spec)
+    if model in _DEF_SAMPLES:
+        sample = _DEF_SAMPLES[model]
+        return [sample] if spec.get("type") == "array" else sample
     if spec.get("enum"):
         return spec["enum"][0]
 

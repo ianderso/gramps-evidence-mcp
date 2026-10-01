@@ -7,7 +7,7 @@ How the server is put together. [PITFALLS.md](PITFALLS.md) covers
 ## Layers
 
 ```
-server.py     83 MCP tool functions, their annotations, and the entry point.
+server.py     89 MCP tool functions, their annotations, and the entry point.
               Parameter validation, no business logic.
 service.py    Genealogy operations. Enforces the evidence model, resolves
               references, shapes results.
@@ -55,10 +55,24 @@ object, edits the returned dict, and PUTs it back. Sending a partial object, or
 one fetched with a `keys=` filter, silently drops the fields that were not
 fetched -- see [PITFALLS.md](PITFALLS.md).
 
+`_mutate()` also repairs, on every object it writes, the defects no write
+should carry forward: a family a person lists twice, which gramps-webapi's own
+family writes can create, and a stray `type` key on a place, which 1.0.x
+`add_place` wrote. So the next edit of an affected object repairs it, and no
+edit re-creates the defect. See [PITFALLS.md](PITFALLS.md) sections 15 and 18.
+
 Writes are one object at a time. `POST /api/objects/` would bundle several into
 a single transaction, but per-object writes keep the Gramps undo history legible
--- one fact per entry. `client.py` carries `create_objects` and
-`delete_by_handles` for callers that want the bulk path.
+-- one fact per entry. The batch tools, `update_citations` and
+`link_repositories`, are one call and one approval, each row its own write and
+transaction. `client.py` carries `create_objects` and `delete_by_handles` for
+callers that want the bulk path.
+
+A delete never strands evidence. The server removes every reference to a
+deleted object, but not what the object held: a note or image reachable only
+through it would be left attached to nothing. Every delete path checks for
+those first and keeps the object unless `carry_to` moves them. A delete that
+the server answers with a 5xx is looked up again, because it may have landed.
 
 ## The reference layer
 

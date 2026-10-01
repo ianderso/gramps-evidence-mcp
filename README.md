@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 **read/write access to a Gramps genealogy tree**, plus a **read-only
 "reference layer"** over legacy GEDCOM exports.
 
-**83 tools, built around evidence discipline.** The premise is that an assistant
+**89 tools, built around evidence discipline.** The premise is that an assistant
 turned loose on a family tree will happily invent a plausible ancestor, so the
 write paths here are shaped to make every claim carry its source: facts are
 created with citations attached, `uncite` deletes what it orphans, parent-child
@@ -289,7 +289,7 @@ server does not authenticate callers itself; see
 ### 5. Add the connector in claude.ai
 
 **Settings → Connectors → Add custom connector →** paste
-`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 83 tools
+`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 89 tools
 appear in chat. (Custom connectors require a paid Claude plan; on
 Team/Enterprise an admin may need to enable them.)
 
@@ -360,6 +360,7 @@ What that means tool by tool:
 | `get_facts` | …is excluded by the server before it computes anything. |
 | `run_report` | …is left out of any report that has the options for it — 21 of Gramps' 25 reports have `living_people`, and 24 `incl_private`: they are sent as "Not included" and false unless you pass either. Gramps' own default includes both. The result's `privacy_options` shows what was applied. |
 | `consult_reference` | …is left out of the matches and counted. Exports from Ancestry and similar sites privatize nobody. |
+| `check_family_links` | …has the link problems found on them left out and counted. |
 
 **A lookup by id is not filtered.** `get_person`, `get_object`, the other typed
 getters, and `list_unsourced_facts` for one named person answer in full. This is
@@ -405,13 +406,13 @@ Request URLs are kept out of the log too, because a query filter travels in one.
 
 ## Tool reference
 
-**83 tools.** Every tool that mutates the tree re-fetches the *whole* object
+**89 tools.** Every tool that mutates the tree re-fetches the *whole* object
 before PUTting it back — edits through `service._mutate()` — see
 [the `keys=` trap](docs/PITFALLS.md#1-keys-plus-put-destroys-unfetched-fields).
 
 **Every tool declares MCP annotations** saying whether it only reads, adds, or
 changes and removes, so a client can approve reads automatically and ask before
-the rest. 43 tools only read.
+the rest. 44 tools only read.
 
 **Unknown parameters are refused.** A misspelt or invented argument is an error
 that lists the parameters the tool does take. It is not silently dropped, which
@@ -427,7 +428,8 @@ unfiltered listing of the first 200 objects.
 | `add_event_to_person` | Add a cited event (residence, census, occupation…) to a person. |
 | `add_event_to_family` | Add a dated/placed event (marriage, divorce…) to a family. |
 | `add_child_to_family` | Add an existing person as a child of an existing family. |
-| `add_alternate_name` | Add a non-primary name (AKA, married name, nickname) to a person. |
+| `add_event_ref` | Share an **existing** event with another person, in a role (Witness, Informant, Godparent…): one census entry or burial, one set of citations. |
+| `add_alternate_name` | Add a non-primary name (AKA, married name, nickname) to a person, with the citation for that form of the name. |
 | `add_source` | Create a Source (record set, book, certificate), optionally in a repository. |
 | `add_citation` | Create/reuse a standalone Citation on a Source. |
 | `add_repository` | Create a Repository (archive, library, cemetery, website). |
@@ -444,36 +446,40 @@ unfiltered listing of the first 200 objects.
 | Tool | Purpose |
 | --- | --- |
 | `cite_event` | Attach a citation to an event that already exists. |
-| `cite_object` | Attach a citation to any object that carries one — notably a **family**. |
+| `cite_object` | Attach a citation to any object that carries one — notably a **family**, and one of a person's **names** (`object_type="name"`), the primary or an alternate. |
 | `cite_child_link` | Cite the parent-child link itself. Always mints the link **its own** citation, because one citation object cannot carry two different confidences. |
-| `uncite` | Detach a citation, deleting it if that leaves it orphaned. **Always delete** — detach-without-delete has produced orphan debris twice. |
+| `uncite` | Detach a citation, deleting it if that leaves it orphaned. **Always delete** — detach-without-delete has produced orphan debris twice. A citation that is the only holder of a note or image is kept instead, unless `carry_to` names a citation to move them to. |
 
 **Edit** — correcting what is already there
 
 | Tool | Purpose |
 | --- | --- |
 | `update_citation` | Locator, confidence, date — or **re-point** the citation at a different source. |
-| `update_event` | Date, place, description, type. |
+| `update_citations` | The same for many citations in one call — a sweep. `expect_page_prefix` reports a row whose page changed since the sweep was planned instead of overwriting it. |
+| `update_event` | Type (checked against the tree's vocabulary), date, place, description, in place, keeping the event's id and everything attached to it. Clears a place or date no source states. |
 | `update_source` | Title, author, pubinfo, abbrev. |
 | `update_media` | Description, date, path. |
-| `update_person` | Gender, primary name (the old one is kept as an alternate), privacy flag. |
+| `update_person` | Gender, primary name (the old one is kept as an alternate, unless it was a data-entry error — then it is corrected in place and the reason recorded in a note), privacy flag. |
+| `update_alternate_name` | Correct, retype or remove one alternate name in place, keeping its citations. A cited name is not removed. |
+| `update_child_ref` | A child's relationship to the father or mother — Birth, Stepchild, Adopted… — in place, keeping the link's citations and the birth order. |
 | `update_object_fields` | Scalar fields on anything else (places, notes, repositories). Structural lists are refused. |
 | `update_place` | Place type, parent enclosure, name, title, coordinates. The parent must already exist (never minted from a name), cycles are refused, and multi-entry dated enclosures are refused rather than flattened. |
 | `update_url` | Edit or remove ONE existing URL entry on a person/place/repository, matched by substring — must match exactly one. The fix for a link filed under the wrong type. |
 | `link_repository` | Link an existing source to an existing repository, with call number and medium. |
+| `link_repositories` | The same for many sources in one call, each row reported. |
 | `tag_object` | Attach a named Tag to an object, creating the tag if it doesn't exist. |
 | `set_private` | Set or clear the Gramps private flag on an object. |
-| `merge_objects` | Merge duplicates via the server's own merge, inside one transaction. Dry-run by default. |
-| `detach_object` | Remove an event/media/note/tag/child reference; optionally delete if orphaned. |
-| `delete_object` | Permanently delete an object by handle or Gramps ID. |
+| `merge_objects` | Merge duplicates via the server's own merge, inside one transaction. Dry-run by default. For places, settles the survivor's enclosures rather than keeping both places' parents. |
+| `detach_object` | Remove an event/media/note/tag/child/repository reference, or a place's extra parent; optionally delete if orphaned. A tag can be named; a repository link narrowed to one call number. |
+| `delete_object` | Permanently delete an object by handle or Gramps ID. Refused when it would strand a note or image only it holds, and for a source that still has citations. |
 
 **Read**
 
 | Tool | Purpose |
 | --- | --- |
-| `get_person` | Full detail: name, gender, events (+ citation counts), families, media. |
+| `get_person` | Full detail: name, every alternate name (+ citation counts), gender, events, families, media. |
 | `get_family` | Relationship, parents, children, event count. |
-| `get_event` | Type, date, place, description, citation count. |
+| `get_event` | Type, date (with its modifier: "between 1882 and 1883", never "1882"), place, description, citation count. |
 | `get_source` | Title, author, pubinfo, abbrev — and its real citation count. |
 | `get_repository` | Name, type, URLs, and the sources it holds. |
 | `get_object` | Raw record for any type. Returns the record as stored, which is what an edit needs. |
@@ -507,6 +513,7 @@ unfiltered listing of the first 200 objects.
 | `get_backlinks` | What references this object — the only correct way to ask "is this source cited?". |
 | `find_duplicates` | Candidate duplicates by strategy: `media_checksum`, `source_title`, `citation_page`, `vital_events`, `person_name`. |
 | `list_unsourced_facts` | Events with no citation, or tagged `UNSOURCED`. |
+| `check_family_links` | Person↔family links checked in both directions: a family listed twice, a link one side lacks, a link to nothing. Each finding says how to repair it. |
 | `db_stats` | Counts of people/families/events/citations/etc. |
 | `query_records` | **The structured query engine.** Indexed columns, `json_path` into the stored object, relationship traversal, regex/like/in, ordering, keyset paging. The only way to filter events by type. |
 | `list_event_types` | The tree's event type vocabulary with the integers it stores. An unexpected name here is usually a typo Gramps accepted as a custom type. |
@@ -670,7 +677,7 @@ instead of raising.
 
 ```
 src/gramps_evidence_mcp/    the MCP server
-  server.py                 tool definitions (the 83 tools) and the entry point
+  server.py                 tool definitions (the 89 tools) and the entry point
   service.py                genealogy operations; edits go through _mutate()
   client.py                 gramps-webapi REST client
   mapping.py                Gramps object <-> JSON shapes
