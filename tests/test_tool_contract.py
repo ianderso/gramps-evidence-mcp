@@ -21,12 +21,12 @@ SNAPSHOT = Path(__file__).parent / "fixtures" / "tool_schema.json"
 #: Ceiling on the combined tool descriptions, which are sent to the model on
 #: every session. Raise it deliberately, not by accident.
 #:
-#: History: 20,000 at 53 tools; 24,000 at 62; 28,000 at 82. Per-tool
-#: descriptions have stayed around 310 chars throughout, so every rise has
-#: been the tool count rather than prose bloat. If this needs raising again,
-#: consider whether the surface should be grouped instead -- 25kB of
+#: History: 20,000 at 53 tools; 24,000 at 62; 28,000 at 82; 30,000 at 89.
+#: Per-tool descriptions have stayed around 310-330 chars throughout, so every
+#: rise has been the tool count rather than prose bloat. If this needs raising
+#: again, consider whether the surface should be grouped instead -- 30kB of
 #: descriptions ships before any work happens.
-DESCRIPTION_BUDGET = 28_000
+DESCRIPTION_BUDGET = 30_000
 
 
 async def _tools() -> list:
