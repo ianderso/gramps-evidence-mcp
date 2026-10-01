@@ -33,7 +33,9 @@ mkdir -p "$dir"
 dir=$(cd "$dir" && pwd)
 echo "Installing gramps-webapi $version into $dir/venv" >&2
 uv venv -q --python 3.12 "$dir/venv" >&2
-VIRTUAL_ENV="$dir/venv" uv pip install -q -r "$lock" >&2
+# --python names the target outright: an ambient UV_PYTHON (setup-uv sets one
+# for the whole CI job) would otherwise win over VIRTUAL_ENV.
+uv pip install -q --python "$dir/venv/bin/python" -r "$lock" >&2
 
 # The settings the official image sets (its Dockerfile), under DIR.
 mkdir -p "$dir"/{home,grampsdb,media,export,reports,thumbnails,request_cache,persistent_cache}
