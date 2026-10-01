@@ -28,6 +28,7 @@ FILTERED_TOOLS = {
     "get_facts",
     "run_report",
     "consult_reference",
+    "check_family_links",
 }
 
 

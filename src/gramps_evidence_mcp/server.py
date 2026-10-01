@@ -26,13 +26,24 @@ from . import __version__
 from .client import ENDPOINTS, GrampsApiError, GrampsWebClient, InvalidIdentifierError
 from .config import Config, ConfigError, load_config, transport_settings
 from .gedcom_ref import ReferenceLibrary
-from .models import CitationInput, Confidence, EventInput, Gender, NameParts
+from .models import (
+    CitationEdit,
+    CitationInput,
+    Confidence,
+    EventInput,
+    Gender,
+    NameMatch,
+    NameParts,
+    RepositoryLink,
+)
 from .service import (
     AmbiguousPlaceError,
     CitationRequiredError,
     GrampsService,
+    InvalidCarryTargetError,
     MultipleEnclosuresError,
     NotFoundError,
+    UnknownTypeError,
 )
 
 logger = logging.getLogger("gramps_evidence_mcp")
@@ -140,6 +151,10 @@ def _error(exc: Exception) -> dict:
         return {"error": "ambiguous_place", "message": str(exc)}
     if isinstance(exc, MultipleEnclosuresError):
         return {"error": "multiple_enclosures", "message": str(exc)}
+    if isinstance(exc, UnknownTypeError):
+        return {"error": "unknown_type", "message": str(exc)}
+    if isinstance(exc, InvalidCarryTargetError):
+        return {"error": "invalid_carry_to", "message": str(exc)}
     if isinstance(exc, GrampsApiError):
         hint = ""
         if exc.status in (401, 403):
@@ -280,6 +295,11 @@ async def add_source(
     call_number: str | None = Field(
         default=None, description="Call number / reference within the repository."
     ),
+    media_type: str = Field(
+        default="Unknown",
+        description="Medium of the source at that repository, e.g. 'Book', "
+        "'Microfilm', 'Electronic'. Only used with repository.",
+    ),
 ) -> dict:
     """Create a Source (a body of evidence: a record set, book, certificate, website).
 
@@ -290,7 +310,7 @@ async def add_source(
     try:
         svc = await state.service_()
         return await svc.add_source(
-            title, author, publication_info, abbreviation, repository, call_number
+            title, author, publication_info, abbreviation, repository, call_number, media_type
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -427,10 +447,18 @@ async def cite_event(
 @mcp.tool(annotations=EDITS)
 async def update_event(
     event: str = Field(description="Event handle or gramps_id (e.g. 'E0007')."),
+    event_type: str | None = Field(
+        default=None,
+        description="New event type, e.g. 'Census', 'Visit'. Must already be a "
+        "standard or custom type in the tree (list_object_types) unless "
+        "allow_new_type is set. Omit to leave unchanged.",
+    ),
     date: str | None = Field(
         default=None,
-        description="New date, free text in Gramps style ('1899', 'ABT 1900'). "
-        "Omit to leave unchanged.",
+        description="New date, Gramps style: '1899', '12 JAN 1899', 'ABT 1900', "
+        "'BEF 1950'; 'BET 1898 AND 1901' happened once within the range; "
+        "'FROM 4 MAY 1864 TO 16 SEP 1864' lasted the whole span; 'FROM 1880' or "
+        "'TO 1890' is open at one end. Omit to leave unchanged.",
     ),
     place: str | None = Field(
         default=None,
@@ -441,15 +469,60 @@ async def update_event(
     description: str | None = Field(
         default=None, description="New free-text description. Omit to leave unchanged."
     ),
+    clear_place: bool = Field(
+        default=False,
+        description="Remove the event's place, e.g. one no source states. An "
+        "empty place string is refused rather than read as this.",
+    ),
+    clear_date: bool = Field(default=False, description="Remove the event's date."),
+    allow_new_type: bool = Field(
+        default=False,
+        description="Accept an event_type the tree does not have yet, creating "
+        "it as a custom type. Only for a deliberate new type, never a typo.",
+    ),
 ) -> dict:
-    """Edit an existing event's date, place, and/or description.
+    """Edit an existing event in place: its type, date, place or description.
 
-    Only the fields you provide are changed; the rest are left as-is. This does
-    NOT change the event's citations -- use cite_event to add a source.
+    Only what you pass changes. The event keeps its id, citations, notes, media
+    and every person sharing it, so correct a wrong type or an unsupported place
+    here rather than replacing the event. Citations: cite_event.
     """
     try:
         svc = await state.service_()
-        return await svc.update_event(event, date, place, description)
+        return await svc.update_event(
+            event,
+            date,
+            place,
+            description,
+            clear_place,
+            event_type=event_type,
+            clear_date=clear_date,
+            allow_new_type=allow_new_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=ADDS)
+async def add_event_ref(
+    person: str = Field(description="Handle or gramps_id of the person to add the event to."),
+    event: str = Field(description="Handle or gramps_id of the EXISTING event, e.g. 'E0007'."),
+    role: str = Field(
+        default="Primary",
+        description="The person's role in it: 'Primary', 'Witness', 'Informant', "
+        "'Godparent', 'Family', 'Clergy', or a custom role the tree already has.",
+    ),
+) -> dict:
+    """Share an existing event with another person, in a role.
+
+    For one census entry, residence or burial that several people took part in:
+    each references the same event, so its citations and later corrections serve
+    all of them. Refused if the person already has it. A new fact is
+    add_event_to_person.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.add_event_ref(person, event, role)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -461,13 +534,17 @@ async def delete_object(
         "'source', 'citation', 'repository', 'media', 'note', 'tag'."
     ),
     target: str = Field(description="Handle or gramps_id of the object to delete."),
+    carry_to: str | None = Field(
+        default=None,
+        description="Another object of the same type to receive the notes and images "
+        "that only this one holds. Without it, such a delete is refused.",
+    ),
 ) -> dict:
     """Permanently delete an object from the tree by handle or gramps_id.
 
-    DESTRUCTIVE and irreversible. Deleting an object does not clean up references
-    to it, so this can leave dangling references (e.g. deleting a person still
-    referenced by a family, or an event still listed on a person). Prefer deleting
-    leaf objects, and detach references first where possible.
+    DESTRUCTIVE. The server also removes every reference to it. Refused when it
+    is the only holder of a note or image (pass carry_to to move them), and for a
+    source with citations, which the server would delete with it.
     """
     if object_type not in ENDPOINTS:
         return {
@@ -478,7 +555,7 @@ async def delete_object(
         }
     try:
         svc = await state.service_()
-        return await svc.delete_object(object_type, target)
+        return await svc.delete_object(object_type, target, carry_to=carry_to)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -490,7 +567,10 @@ async def tag_object(
         "'source', 'citation', 'place', 'repository', 'media', 'note'."
     ),
     target: str = Field(description="Handle or gramps_id of the object to tag."),
-    tag: str = Field(description="Tag name (found-or-created by exact match), e.g. 'Verified'."),
+    tag: str = Field(
+        description="Tag name (found-or-created by exact match), e.g. 'Verified'. To "
+        "REMOVE a tag: detach_object(child_kind='tag', child=<tag name>)."
+    ),
     color: str | None = Field(
         default=None,
         description="Optional hex color for a newly-created tag, e.g. '#FF8800'. "
@@ -673,6 +753,27 @@ async def link_repository(
 
 
 @mcp.tool(annotations=ADDS)
+async def link_repositories(
+    items: list[RepositoryLink] = Field(
+        min_length=1,
+        max_length=500,
+        description="Rows of {source, repository, call_number?, media_type?}.",
+    ),
+) -> dict:
+    """Link many sources to their repositories in one call -- a sweep.
+
+    Each row is link_repository: its own write and transaction, so a failed row
+    does not stop the rest. Each row reports linked, already_linked, missing or
+    error.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.link_repositories(items)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=ADDS)
 async def add_event_to_family(
     family: str = Field(description="Family handle or gramps_id (e.g. 'F0001')."),
     event: EventInput = Field(description="The event to add (type, date, place, citation)."),
@@ -719,6 +820,51 @@ async def add_child_to_family(
         return _error(exc)
 
 
+@mcp.tool(annotations=EDITS)
+async def update_child_ref(
+    family: str = Field(description="Family handle or gramps_id (e.g. 'F0001')."),
+    child: str = Field(description="The child's person handle or gramps_id."),
+    frel: str | None = Field(
+        default=None,
+        description="Relationship to the father: 'Birth', 'Adopted', 'Stepchild', "
+        "'Foster', 'Sponsored', 'Unknown', 'None'. Omit to keep.",
+    ),
+    mrel: str | None = Field(
+        default=None, description="Relationship to the mother, the same values. Omit to keep."
+    ),
+) -> dict:
+    """Change a child's relationship to the father or mother -- a stepson held
+    as a birth child -- in place.
+
+    The child keeps the link's citations, notes and its place in the birth
+    order, which detaching and re-adding the child loses.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.update_child_ref(family, child, frel=frel, mrel=mrel)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=READS)
+async def check_family_links(
+    limit: int = Field(default=200, ge=1, le=2000, description="Maximum findings to return."),
+    include_private: bool = _include_private(),
+) -> dict:
+    """Audit the links between people and families, in both directions.
+
+    Finds a family a person lists twice, a child a family lists twice, a link
+    one side holds and the other lacks, and links to objects that do not
+    exist. Each finding says how to repair it. Reports only.
+    """
+    try:
+        svc = await state.service_()
+        with svc.privacy_lifted(include_private, "check_family_links"):
+            return await svc.check_family_links(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
 @mcp.tool(annotations=ADDS)
 async def add_alternate_name(
     person: str = Field(description="Person handle or gramps_id (e.g. 'I0001')."),
@@ -731,11 +877,18 @@ async def add_alternate_name(
         default="Also Known As",
         description="Kind of alternate name, e.g. 'Also Known As', 'Birth Name', 'Married Name'.",
     ),
+    citation: CitationInput | None = Field(
+        default=None,
+        description="The record that gives this form of the name. It goes on the name "
+        "itself -- 'this record spells it so' -- not on the person. Cite an existing "
+        "name with cite_object(object_type='name').",
+    ),
 ) -> dict:
-    """Add an alternate (non-primary) name to a person.
+    """Add an alternate (non-primary) name to a person, cited to the record using it.
 
     Use for maiden/married names, aliases, anglicized forms, or nicknames-of-record.
-    The person's primary name is left unchanged.
+    The person's primary name is left unchanged. Correct or remove one later
+    with update_alternate_name.
     """
     try:
         svc = await state.service_()
@@ -746,7 +899,7 @@ async def add_alternate_name(
             suffix=name_suffix,
             nick=nickname,
         )
-        return await svc.add_alternate_name(person, name, name_type)
+        return await svc.add_alternate_name(person, name, name_type, citation)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1138,6 +1291,27 @@ async def update_citation(
 
 
 @mcp.tool(annotations=EDITS)
+async def update_citations(
+    items: list[CitationEdit] = Field(
+        min_length=1,
+        max_length=500,
+        description="Rows of {citation, page?, confidence?, expect_page_prefix?}.",
+    ),
+) -> dict:
+    """Re-write many citations' pages or confidences in one call -- a sweep.
+
+    Each row is update_citation: its own write and transaction. A row whose
+    live page no longer starts with expect_page_prefix is reported as drifted,
+    not overwritten. Rows report applied, unchanged, drifted, missing or error.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.update_citations(items)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
 async def update_media(
     media: str = Field(description="Media handle or gramps_id."),
     description: str | None = Field(
@@ -1164,9 +1338,20 @@ async def update_person(
     name: NameParts | None = Field(
         default=None,
         description="New PRIMARY name. The current primary name is kept as an "
-        "alternate rather than discarded.",
+        "alternate rather than discarded, unless keep_old_as_alternate is False.",
     ),
     private: bool | None = Field(default=None, description="Gramps private flag."),
+    keep_old_as_alternate: bool = Field(
+        default=True,
+        description="False only to fix a data-entry error -- a name split wrongly "
+        "between given and surname, a typo no record contains -- where keeping the "
+        "old form would invent a variant. The name is then corrected in place, "
+        "keeping its citations, and reason is recorded in a note on the person.",
+    ),
+    reason: str | None = Field(
+        default=None,
+        description="Why the old form is not kept. Required with keep_old_as_alternate=False.",
+    ),
 ) -> dict:
     """Edit a person's gender, primary name, or privacy flag.
 
@@ -1177,7 +1362,58 @@ async def update_person(
     """
     try:
         svc = await state.service_()
-        return await svc.update_person(person, gender=gender, name=name, private=private)
+        return await svc.update_person(
+            person,
+            gender=gender,
+            name=name,
+            private=private,
+            keep_old_as_alternate=keep_old_as_alternate,
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def update_alternate_name(
+    person: str = Field(description="Person handle or gramps_id."),
+    match: NameMatch = Field(
+        description="Which alternate name, e.g. {'surname': 'Calloway', 'type': "
+        "'Also Known As'}. get_person lists them with their index."
+    ),
+    given: str | None = Field(default=None, description="New given name(s). Omit to keep."),
+    surname: str | None = Field(default=None, description="New surname. Omit to keep."),
+    name_prefix: str | None = Field(default=None, description="New surname prefix."),
+    name_suffix: str | None = Field(default=None, description="New suffix."),
+    nickname: str | None = Field(default=None, description="New nickname."),
+    name_type: str | None = Field(
+        default=None,
+        description="New type, e.g. 'Married Name' for a name filed as 'Also Known As'.",
+    ),
+    remove: bool = Field(
+        default=False,
+        description="Remove the name. Refused while it carries citations or notes; "
+        "of identical duplicates, one is removed.",
+    ),
+) -> dict:
+    """Correct, retype or remove one alternate name, in place.
+
+    Edited in place, the name keeps its citations. The primary name is
+    update_person(name=...); a new name is add_alternate_name.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.update_alternate_name(
+            person,
+            match,
+            given=given,
+            surname=surname,
+            prefix=name_prefix,
+            suffix=name_suffix,
+            nickname=nickname,
+            name_type=name_type,
+            remove=remove,
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1271,10 +1507,17 @@ async def update_place(
 @mcp.tool(annotations=ADDS)
 async def cite_object(
     object_type: str = Field(
-        description="person, family, event, place, media, source, or citation."
+        description="person, family, event, place, media, source, citation, or name "
+        "(one of a person's names: ref is the person, name says which)."
     ),
     ref: str = Field(description="Handle or gramps_id of the object to cite."),
     citation: CitationInput = Field(description="Citation to attach."),
+    name: NameMatch | None = Field(
+        default=None,
+        description="With object_type='name': which of the person's names, e.g. "
+        "{'surname': 'Bittner', 'type': 'Birth Name'} or {'primary': true}. Must "
+        "match exactly one.",
+    ),
 ) -> dict:
     """Attach a citation to any object that carries one -- not just events.
 
@@ -1284,12 +1527,13 @@ async def cite_object(
     individual as a whole (an identity document) rather than about one dated
     fact -- prefer citing the specific event where one exists.
 
-    To cite a parent-child link, use cite_child_link: that is a different claim
-    and needs its own citation.
+    A NAME is cited with object_type='name': "this record gives this spelling"
+    is narrower than evidence about the person. To cite a parent-child link,
+    use cite_child_link: that is a different claim and needs its own citation.
     """
     try:
         svc = await state.service_()
-        return await svc.cite_object(object_type, ref, citation)
+        return await svc.cite_object(object_type, ref, citation, name=name)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1331,7 +1575,18 @@ async def uncite(
     delete_if_orphan: bool = Field(
         default=True,
         description="Delete the citation if nothing else references it after "
-        "detaching. Leave True unless you are keeping it deliberately.",
+        "detaching. Leave True unless you are keeping it deliberately. A citation "
+        "that holds the only link to a note or image is kept unless carry_to is given.",
+    ),
+    name: NameMatch | None = Field(
+        default=None,
+        description="With object_type='name' (ref is the person): which of the "
+        "person's names to detach the citation from.",
+    ),
+    carry_to: str | None = Field(
+        default=None,
+        description="Citation (handle or gramps_id) to receive the notes and images "
+        "only this citation holds, so it can be deleted without losing them.",
     ),
 ) -> dict:
     """Detach a citation from an object, deleting it if it is left orphaned.
@@ -1344,7 +1599,14 @@ async def uncite(
     """
     try:
         svc = await state.service_()
-        return await svc.uncite(object_type, ref, citation, delete_if_orphan=delete_if_orphan)
+        return await svc.uncite(
+            object_type,
+            ref,
+            citation,
+            delete_if_orphan=delete_if_orphan,
+            name=name,
+            carry_to=carry_to,
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1363,6 +1625,13 @@ async def merge_objects(
         default=True,
         description="True (default) reports what would move without changing "
         "anything. Set False to apply.",
+    ),
+    enclosures: str = Field(
+        default="auto",
+        description="Places only: the survivor otherwise gets both places' parents. "
+        "'auto' drops an undated parent that encloses another (a state beside its "
+        "county) and refuses if two unrelated undated parents remain; or "
+        "'keep_keeper', 'keep_drop', 'keep_both'. Dated enclosures are always kept.",
     ),
 ) -> dict:
     """Merge two objects that are the same thing. Dry-run by default.
@@ -1384,7 +1653,9 @@ async def merge_objects(
     """
     try:
         svc = await state.service_()
-        return await svc.merge_objects(object_type, keep, drop, dry_run=dry_run)
+        return await svc.merge_objects(
+            object_type, keep, drop, dry_run=dry_run, enclosures=enclosures
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1394,14 +1665,23 @@ async def detach_object(
     parent_type: str = Field(description="Type of the object holding the reference."),
     parent: str = Field(description="Its handle or gramps_id."),
     child_kind: str = Field(
-        description="What to detach: event, media, note, tag, citation, child "
-        "(a person from a family), person (a person_ref), or repository."
+        description="What to detach: event, media, note, tag (removes a tag), citation, "
+        "child (a person from a family), person (a person_ref), repository, enclosure "
+        "(a parent of a place), or -- on a person, to repair a link only the person "
+        "holds (check_family_links) -- parent_family or family."
     ),
-    child: str = Field(description="Handle or gramps_id of the thing to detach."),
+    child: str = Field(
+        description="Handle or gramps_id of the thing to detach; a tag may be given by name."
+    ),
     delete_if_orphan: bool = Field(
         default=False,
         description="Also delete the detached object if nothing else references "
         "it. Off by default -- detaching and deleting are different decisions.",
+    ),
+    call_number: str | None = Field(
+        default=None,
+        description="Repository only: detach just the link with this call number, "
+        "when a source is held twice in one repository. Omit to detach every link.",
     ),
 ) -> dict:
     """Remove a reference from an object: an event from a person, an image from a
@@ -1415,7 +1695,12 @@ async def detach_object(
     try:
         svc = await state.service_()
         return await svc.detach_object(
-            parent_type, parent, child_kind, child, delete_if_orphan=delete_if_orphan
+            parent_type,
+            parent,
+            child_kind,
+            child,
+            delete_if_orphan=delete_if_orphan,
+            call_number=call_number,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)

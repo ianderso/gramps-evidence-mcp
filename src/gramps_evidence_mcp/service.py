@@ -24,7 +24,16 @@ from typing import Any
 from . import mapping
 from .client import ENDPOINTS, GQL_NOTES, GrampsApiError, GrampsWebClient
 from .config import Config
-from .models import CitationInput, Confidence, EventInput, Gender, NameParts
+from .models import (
+    CitationEdit,
+    CitationInput,
+    Confidence,
+    EventInput,
+    Gender,
+    NameMatch,
+    NameParts,
+    RepositoryLink,
+)
 from .privacy import assess, redacted_stub
 
 logger = logging.getLogger("gramps_evidence_mcp.service")
@@ -125,6 +134,18 @@ class MultipleEnclosuresError(ValueError):
     """Raised when update_place would flatten a multi-entry (dated) enclosure list."""
 
 
+class InvalidCarryTargetError(ValueError):
+    """Raised when carry_to cannot receive what a deletion would strand."""
+
+
+class UnknownTypeError(ValueError):
+    """Raised when an edit names a type the tree's vocabulary does not hold.
+
+    Gramps would store it as a new custom type rather than refuse it, which
+    is how a typo becomes part of the vocabulary for good.
+    """
+
+
 class GrampsService:
     """Genealogy operations over a :class:`GrampsWebClient`.
 
@@ -145,6 +166,7 @@ class GrampsService:
         self.config = config
         self._place_cache: dict[str, str] = {}  # lower(name) -> place handle
         self._event_types: dict[str, int] | None = None  # label -> stored int
+        self._open_spans: bool | None = None  # server stores "from X" / "to X"
 
     @property
     def exposing_private(self) -> bool:
@@ -220,6 +242,88 @@ class GrampsService:
         return obj["handle"]
 
     # ------------------------------------------------------------------ #
+    # vocabularies and dates
+    # ------------------------------------------------------------------ #
+    async def _canonical_type(
+        self, datatype: str, value: str, allow_new: bool = False, types: dict | None = None
+    ) -> str:
+        """Match a type name against the tree's vocabulary, case-insensitively.
+
+        Gramps stores any unrecognised string as a new custom type rather than
+        refusing it, so a typo in an edit becomes a permanent entry in the
+        tree's vocabulary. The vocabulary is ``GET /api/types/``: the standard
+        English names under ``default`` and the tree's own under ``custom``
+        (gramps-webapi 3.21.1, ``api/resources/types.py``). It is read on
+        every call, so a custom type created a moment ago is known.
+
+        Parameters
+        ----------
+        datatype : str
+            The vocabulary, e.g. ``"event_types"``, ``"event_role_types"``,
+            ``"child_reference_types"``, ``"name_types"``.
+        value : str
+            The name the caller gave.
+        allow_new : bool, optional
+            Accept a name in neither list, as a deliberate new custom type.
+        types : dict, optional
+            ``GET /api/types/`` already read in this call.
+
+        Returns
+        -------
+        str
+            The name as the vocabulary spells it, or ``value`` stripped when
+            new names are allowed or the server lists no vocabulary at all.
+
+        Raises
+        ------
+        UnknownTypeError
+            If the name is in neither list and ``allow_new`` is False.
+        """
+        wanted = value.strip()
+        types = types if types is not None else await self.client.types()
+        default = list(((types.get("default") or {}).get(datatype)) or [])
+        custom = [c for c in ((types.get("custom") or {}).get(datatype)) or [] if c]
+        for name in (*default, *custom):
+            if str(name).strip().lower() == wanted.lower():
+                return str(name)
+        if allow_new or not (default or custom):
+            return wanted
+        raise UnknownTypeError(
+            f"{wanted!r} is not a type in this tree's {datatype}. Standard: "
+            f"{', '.join(default)}. Custom: {', '.join(custom) or 'none'}. Gramps "
+            "would store an unknown name as a new custom type, so check the spelling."
+        )
+
+    async def _open_spans_supported(self) -> bool:
+        """Whether the server's Gramps stores "from X" and "to X" dates.
+
+        The modifiers arrived in Gramps 5.2 (``Date.MOD_FROM`` 7,
+        ``Date.MOD_TO`` 8); gramps-webapi 2.x and 3.x run on 5.2 and 6.0.
+        ``GET /api/metadata/`` names the version under ``gramps.version``.
+        Read once per session. An unreadable answer counts as unsupported,
+        which keeps the words as a text-only date rather than writing a
+        modifier an older server cannot display; a failed read counts as
+        unsupported for that date only, and is retried for the next.
+        """
+        if self._open_spans is None:
+            try:
+                meta = await self.client.metadata()
+            except GrampsApiError:
+                # Not cached: a passing failure must not decide the session.
+                return False
+            gramps = meta.get("gramps") if isinstance(meta, dict) else None
+            version = str((gramps or {}).get("version") or "")
+            parts = [int(p) for p in re.findall(r"\d+", version)[:2]]
+            self._open_spans = len(parts) == 2 and tuple(parts) >= (5, 2)
+        return self._open_spans
+
+    async def _parse_date(self, text: str | None) -> dict:
+        """Parse a date, keeping "from X" / "to X" as text where unsupported."""
+        if mapping.is_open_span(text) and not await self._open_spans_supported():
+            return mapping.parse_date(text, open_spans=False)
+        return mapping.parse_date(text)
+
+    # ------------------------------------------------------------------ #
     # citation enforcement
     # ------------------------------------------------------------------ #
     async def resolve_citation(self, cit: CitationInput) -> str:
@@ -270,7 +374,11 @@ class GrampsService:
         citation = await self.client.create_object(
             "citation",
             mapping.citation_payload(
-                source_handle, cit.page, cit.confidence, cit.date, note_handles
+                source_handle,
+                cit.page,
+                cit.confidence,
+                await self._parse_date(cit.date),
+                note_handles,
             ),
         )
         logger.info(
@@ -511,7 +619,7 @@ class GrampsService:
         )
         place_handle = await self.find_or_create_place(ev.place)
         payload = mapping.event_payload(
-            ev.type, ev.date, place_handle, ev.description, citation_handles
+            ev.type, await self._parse_date(ev.date), place_handle, ev.description, citation_handles
         )
         if extra_attrs:
             payload["attribute_list"] = extra_attrs
@@ -620,24 +728,27 @@ class GrampsService:
         NotFoundError
             If the person cannot be resolved.
         """
-        person = await self._resolve("person", person_ref)
+        # Resolved first, so a bad reference fails before an event exists.
+        person_handle = await self._resolve_handle("person", person_ref)
         handle, is_uns = await self._create_event(ev, require_citation)
-        person.setdefault("event_ref_list", []).append(mapping.event_ref(handle))
-        new_index = len(person["event_ref_list"]) - 1
-        if ev.type in _BIRTHLIKE and person.get("birth_ref_index", -1) < 0:
-            person["birth_ref_index"] = new_index
-        if ev.type in _DEATHLIKE and person.get("death_ref_index", -1) < 0:
-            person["death_ref_index"] = new_index
-        await self.client.update_object("person", person["handle"], person)
-        return {
-            "handle": person["handle"],
-            "gramps_id": person.get("gramps_id"),
-            "event_handle": handle,
-            "object_type": "event",
-            "unsourced": is_uns,
-            "message": f"Added {ev.type} event to person {person.get('gramps_id')}"
-            + (" (UNSOURCED)" if is_uns else ""),
-        }
+
+        def edit(person: dict) -> str:
+            _append_event_ref(person, mapping.event_ref(handle), ev.type)
+            return f"{ev.type} event added"
+
+        result = await self._mutate("person", person_handle, edit, label="added an event to")
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "event_handle": handle,
+                "object_type": "event",
+                "unsourced": is_uns,
+                "message": f"Added {ev.type} event to person {result.get('gramps_id')}"
+                + (" (UNSOURCED)" if is_uns else ""),
+            },
+            result,
+        )
 
     async def cite_event(self, event_ref: str, cit: CitationInput) -> dict:
         """Attach a citation to an existing event.
@@ -646,25 +757,38 @@ class GrampsService:
         (enforcing the evidence model via resolve_citation), appends it to the
         event's citation_list (avoiding duplicates), and PUTs the event back.
         """
-        event = await self._resolve("event", event_ref)
+        event_handle = await self._resolve_handle("event", event_ref)
         citation_handle = await self.resolve_citation(cit)
-        citation_list = event.setdefault("citation_list", [])
-        if citation_handle not in citation_list:
-            citation_list.append(citation_handle)
-        # The event now has a source, so drop any UNSOURCED audit tag on it.
-        attrs = event.get("attribute_list")
-        if attrs:
-            event["attribute_list"] = [
-                a for a in attrs if _type_string(a.get("type")) != self.config.unsourced_attribute
-            ]
-        await self.client.update_object("event", event["handle"], event)
-        logger.info("cited event %s with citation %s", event.get("gramps_id"), citation_handle)
-        return {
-            "handle": event["handle"],
-            "gramps_id": event.get("gramps_id"),
-            "object_type": "event",
-            "message": f"Cited event {event.get('gramps_id') or event['handle']}",
-        }
+        unsourced = self.config.unsourced_attribute
+
+        def edit(event: dict) -> str | bool:
+            changed = False
+            citation_list = event.setdefault("citation_list", [])
+            if citation_handle not in citation_list:
+                citation_list.append(citation_handle)
+                changed = True
+            # The event now has a source, so drop any UNSOURCED audit tag on it.
+            attrs = event.get("attribute_list") or []
+            kept = [a for a in attrs if _type_string(a.get("type")) != unsourced]
+            if len(kept) != len(attrs):
+                event["attribute_list"] = kept
+                changed = True
+            return "citation attached" if changed else False
+
+        result = await self._mutate("event", event_handle, edit, label="cited")
+        logger.info("cited event %s with citation %s", result.get("gramps_id"), citation_handle)
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "object_type": "event",
+                "citation_handle": citation_handle,
+                "message": f"Cited event {result.get('gramps_id') or result['handle']}"
+                if result["changed"]
+                else f"Event {result.get('gramps_id')} already carries that citation",
+            },
+            result,
+        )
 
     async def update_event(
         self,
@@ -673,43 +797,352 @@ class GrampsService:
         place: str | None = None,
         description: str | None = None,
         clear_place: bool = False,
+        *,
+        event_type: str | None = None,
+        clear_date: bool = False,
+        allow_new_type: bool = False,
     ) -> dict:
-        """Edit an existing event's date/place/description (only provided fields).
+        """Edit an existing event in place: type, date, place, description.
 
-        Does NOT touch citations -- use cite_event for that.
+        Only what is given changes. The event keeps its handle, gramps_id,
+        citations, notes, attributes, media, tags and every reference to it,
+        which is what replacing it with a new event of the right type loses.
+
+        Parameters
+        ----------
+        event_ref : str
+            Handle or gramps_id.
+        date : str, optional
+            New date, parsed by :func:`mapping.parse_date`.
+        place : str, optional
+            New place, resolved by :meth:`find_or_create_place`.
+        description : str, optional
+            New description.
+        clear_place, clear_date : bool, optional
+            Remove the place or the date. An empty ``place`` or ``date`` is
+            refused rather than taken to mean either: an empty place string
+            would otherwise reach place resolution, and an empty date would
+            clear the date without being asked to.
+        event_type : str, optional
+            New type, matched against the tree's event types. When the change
+            moves an event into or out of Birth or Death, gramps-webapi 3.21.1
+            recomputes the birth and death of every person referencing it
+            (``update_object`` in ``api/resources/util.py``).
+        allow_new_type : bool, optional
+            Accept a type the tree does not have yet, as a new custom type.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id and a message naming what changed, or an
+            ``error`` key.
+
+        Raises
+        ------
+        UnknownTypeError
+            If ``event_type`` is not in the tree's vocabulary and
+            ``allow_new_type`` is False.
         """
-        event = await self._resolve("event", event_ref)
-        if date is not None:
-            event["date"] = mapping.parse_date(date)
-        if clear_place:
-            event["place"] = ""
-        elif place is not None:
-            event["place"] = await self.find_or_create_place(place)
-        if description is not None:
-            event["description"] = description
-        await self.client.update_object("event", event["handle"], event)
-        logger.info("updated event %s", event.get("gramps_id"))
-        return {
-            "handle": event["handle"],
-            "gramps_id": event.get("gramps_id"),
-            "object_type": "event",
-            "message": f"Updated event {event.get('gramps_id') or event['handle']}",
-        }
+        if date is not None and clear_date:
+            return _conflict("date", "clear_date")
+        if place is not None and clear_place:
+            return _conflict("place", "clear_place")
+        for name, value, flag in (("date", date, "clear_date"), ("place", place, "clear_place")):
+            if value is not None and not value.strip():
+                return {
+                    "error": "empty_value",
+                    "message": f"An empty {name} is not a {name}. Pass {flag}=True to remove "
+                    f"it, or omit {name} to leave it unchanged.",
+                }
+        # The event and the type are checked before the place, whose
+        # resolution may create one: a refused edit must leave nothing behind.
+        event_handle = await self._resolve_handle("event", event_ref)
+        new_type = (
+            await self._canonical_type("event_types", event_type, allow_new_type)
+            if event_type is not None and event_type.strip()
+            else None
+        )
+        new_date = await self._parse_date(date) if date is not None else None
+        new_place = await self.find_or_create_place(place) if place is not None else None
 
-    async def delete_object(self, object_type: str, ref: str) -> dict:
-        """Delete an object by handle-or-gramps_id.
+        def edit(event: dict) -> str | bool:
+            changed: list[str] = []
+            if new_type is not None:
+                old = _type_string(event.get("type"))
+                if old != new_type:
+                    event["type"] = new_type
+                    changed.append(f"type {old} -> {new_type}")
+            if new_date is not None and not _same_date(event.get("date"), new_date):
+                event["date"] = new_date
+                changed.append(f"date={_date_string(new_date)}")
+            if clear_date and _date_string(event.get("date")):
+                event["date"] = mapping.parse_date(None)
+                changed.append("date cleared")
+            if new_place is not None and event.get("place") != new_place:
+                event["place"] = new_place
+                changed.append("place")
+            if clear_place and event.get("place"):
+                event["place"] = ""
+                changed.append("place cleared")
+            if description is not None and (event.get("description") or "") != description:
+                event["description"] = description
+                changed.append("description")
+            return ", ".join(changed) if changed else False
 
-        Destructive: can leave dangling references from other objects. Prefer
-        deleting leaf objects.
+        return await self._mutate("event", event_handle, edit, label="updated")
+
+    async def add_event_ref(self, person_ref: str, event_ref: str, role: str = "Primary") -> dict:
+        """Add an existing event to a person, in a role.
+
+        One census entry, burial or residence that several people took part
+        in is one event, referenced by each of them; a copy per person would
+        split its citations and let the copies drift apart.
+
+        Parameters
+        ----------
+        person_ref : str
+            Handle or gramps_id of the person.
+        event_ref : str
+            Handle or gramps_id of the existing event.
+        role : str, optional
+            The person's role, matched against the tree's role types.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id, the event and a message, or an ``error`` key
+            when the person already references the event.
+
+        Raises
+        ------
+        UnknownTypeError
+            If the role is not in the tree's vocabulary.
         """
-        handle = await self._resolve_handle(object_type, ref)
-        await self.client.delete_object(object_type, handle)
+        event = await self._resolve("event", event_ref, keys="handle,gramps_id,type")
+        role_name = await self._canonical_type("event_role_types", role)
+        event_type = _type_string(event.get("type"))
+        event_label = event.get("gramps_id") or event["handle"]
+        state = {"present": False}
+
+        def edit(person: dict) -> str | bool:
+            if any(r.get("ref") == event["handle"] for r in person.get("event_ref_list") or []):
+                state["present"] = True
+                return False
+            _append_event_ref(
+                person, mapping.event_ref(event["handle"], role=role_name), event_type
+            )
+            return f"{event_type} {event_label} added as {role_name}"
+
+        result = await self._mutate("person", person_ref, edit, label="shared an event with")
+        if state["present"]:
+            return {
+                "error": "already_referenced",
+                "message": f"Person {result.get('gramps_id')} already references event "
+                f"{event_label}; nothing was added.",
+                **({"repaired": result["repaired"]} if result.get("repaired") else {}),
+            }
+        result.update({"event_handle": event["handle"], "event": event_label, "role": role_name})
+        return result
+
+    async def delete_object(self, object_type: str, ref: str, carry_to: str | None = None) -> dict:
+        """Delete an object by handle-or-gramps_id, without stranding evidence.
+
+        gramps-webapi 3.21.1 deletes "the object and its references": every
+        object pointing at it loses that reference, in the same transaction
+        (``api/resources/delete.py``). What it holds is another matter. A
+        note or image reachable only through it -- a citation's transcription,
+        the page image -- is left attached to nothing and is lost in
+        practice, so that is refused unless ``carry_to`` names another object
+        of the same type to move them to first.
+
+        A source is refused while citations point at it: the server deletes
+        those citations with it, removing them from every fact they support.
+
+        Parameters
+        ----------
+        object_type : str
+            Gramps object type.
+        ref : str
+            Handle or gramps_id.
+        carry_to : str, optional
+            Handle or gramps_id of an object of the same type to receive the
+            notes and media only this one holds.
+
+        Returns
+        -------
+        dict
+            Handle, a message, what was carried, or an ``error`` key.
+        """
+        obj = await self._resolve(object_type, ref)
+        handle = obj["handle"]
+        label = obj.get("gramps_id") or handle
+        if object_type == "source":
+            cited = await self.get_backlinks("source", handle)
+            count = (cited["referenced_by"].get("citation") or {}).get("count", 0)
+            if count:
+                return {
+                    "error": "source_has_citations",
+                    "message": f"{count} citation(s) point at source {label}, and the server "
+                    "deletes them with it, removing them from every fact they support. "
+                    "Re-point them (update_citation source=...) or merge the source "
+                    "(merge_objects) instead.",
+                }
+        outcome = await self._delete_keeping_evidence(object_type, obj, carry_to)
+        if not outcome.pop("deleted"):
+            return {"error": "would_orphan", "handle": handle, **outcome}
         logger.info("deleted %s %s", object_type, handle)
+        suffix = outcome.pop("suffix", "")
         return {
             "handle": handle,
+            "gramps_id": obj.get("gramps_id"),
             "object_type": object_type,
-            "message": f"Deleted {object_type} {ref}",
+            **outcome,
+            "message": f"Deleted {object_type} {label}{suffix}",
         }
+
+    async def _delete_keeping_evidence(
+        self, object_type: str, obj: dict, carry_to: str | None
+    ) -> dict:
+        """Delete an object unless that would strand a note or image.
+
+        Returns
+        -------
+        dict
+            ``deleted``; when not deleted, ``would_orphan`` and a ``message``;
+            when deleted, ``carried`` if anything moved, the server's late
+            error if it answered one, and ``suffix`` for the caller's message.
+        """
+        orphans = await self._would_orphan(object_type, obj)
+        label = obj.get("gramps_id") or obj["handle"]
+        if orphans and not carry_to:
+            listing = ", ".join(
+                f"{typ} {e['gramps_id'] or e['handle']}" for typ, es in orphans.items() for e in es
+            )
+            return {
+                "deleted": False,
+                "would_orphan": {
+                    typ: [e["gramps_id"] or e["handle"] for e in es] for typ, es in orphans.items()
+                },
+                "message": f"Not deleted: {object_type} {label} is the only thing holding "
+                f"{listing}, which would be left attached to nothing. Pass carry_to=<another "
+                f"{object_type}> to move them there first, or attach them elsewhere yourself.",
+            }
+        out: dict[str, Any] = {"deleted": True, "suffix": ""}
+        if orphans:
+            out["carried"] = await self._carry(object_type, obj, carry_to, orphans)
+            out["suffix"] += f"; moved {_carried_listing(out['carried'])} to it first"
+        status = await self._delete(object_type, obj["handle"])
+        if status:
+            out["server_error_after_delete"] = status
+            out["suffix"] += (
+                f"; the server answered HTTP {status} after the delete had landed (re-read "
+                "confirms it is gone)"
+            )
+        if object_type == "media":
+            out["file_kept"] = True
+            out["suffix"] += "; its file stays in the media directory (the server never removes it)"
+        return out
+
+    async def _would_orphan(self, object_type: str, obj: dict) -> dict[str, list[dict]]:
+        """Notes and media that nothing but ``obj`` references.
+
+        Collected wherever ``obj`` holds them, including inside its own
+        references (a note on an event reference dies with the person).
+        """
+        held = {
+            "note": _collect_held(obj, "note_list", by_ref=False),
+            "media": _collect_held(obj, "media_list", by_ref=True),
+        }
+        out: dict[str, list[dict]] = {}
+        for typ, handles in held.items():
+            for handle in dict.fromkeys(handles):
+                try:
+                    target = await self.client.get_object(
+                        typ, handle, keys="handle,gramps_id,backlinks", backlinks=True
+                    )
+                except GrampsApiError as exc:
+                    if exc.status == 404:
+                        continue
+                    raise
+                links = target.get("backlinks") or {}
+                others = (
+                    [h for hs in links.values() if isinstance(hs, list) for h in hs]
+                    if isinstance(links, dict)
+                    else []
+                )
+                if all(h == obj["handle"] for h in others):
+                    out.setdefault(typ, []).append(
+                        {"handle": handle, "gramps_id": target.get("gramps_id")}
+                    )
+        return out
+
+    async def _carry(
+        self, object_type: str, obj: dict, carry_to: str | None, orphans: dict[str, list[dict]]
+    ) -> dict:
+        """Move the notes and media only ``obj`` holds onto another object."""
+        target = await self._resolve(object_type, carry_to or "", keys="handle,gramps_id")
+        if target["handle"] == obj["handle"]:
+            raise InvalidCarryTargetError("carry_to names the object being deleted.")
+        if orphans.get("media") and object_type not in _MEDIA_HOLDERS:
+            raise InvalidCarryTargetError(f"A {object_type} cannot hold media for carry_to.")
+        if orphans.get("note") and object_type not in _NOTE_HOLDERS:
+            raise InvalidCarryTargetError(f"A {object_type} cannot hold notes for carry_to.")
+        notes = [e["handle"] for e in orphans.get("note", [])]
+        moving = {e["handle"] for e in orphans.get("media", [])}
+        media_refs = [dict(m) for m in obj.get("media_list") or [] if m.get("ref") in moving]
+
+        def edit(other: dict) -> str | bool:
+            note_list = other.setdefault("note_list", []) if notes else []
+            for handle in notes:
+                if handle not in note_list:
+                    note_list.append(handle)
+            media_list = other.setdefault("media_list", []) if media_refs else []
+            for ref in media_refs:
+                if not any(m.get("ref") == ref["ref"] for m in media_list):
+                    media_list.append(ref)
+            return "received notes and media" if notes or media_refs else False
+
+        await self._mutate(object_type, target["handle"], edit, label="updated")
+        return {
+            "to": target.get("gramps_id") or target["handle"],
+            **{
+                typ: [e["gramps_id"] or e["handle"] for e in entries]
+                for typ, entries in orphans.items()
+            },
+        }
+
+    async def _delete(self, object_type: str, handle: str) -> int | None:
+        """DELETE, then believe the tree rather than a late error.
+
+        gramps-webapi 3.21.1 commits the delete before it updates its search
+        indices, and an error there answers HTTP 500 for a delete that has
+        landed. A caller trusting that would retry or think the tree
+        unchanged. So on a 5xx the object is looked up again: if it is gone
+        the delete is reported as done, with the status it came back with.
+
+        Returns
+        -------
+        int or None
+            The status of an error answered after a delete that landed.
+        """
+        try:
+            await self.client.delete_object(object_type, handle)
+            return None
+        except GrampsApiError as exc:
+            if exc.status < 500:
+                raise
+            try:
+                await self.client.get_object(object_type, handle, keys="handle")
+            except GrampsApiError as again:
+                if again.status == 404:
+                    logger.warning(
+                        "%s %s deleted although the server answered %s",
+                        object_type,
+                        handle,
+                        exc.status,
+                    )
+                    return exc.status
+            raise exc
 
     async def add_family(
         self,
@@ -750,7 +1183,9 @@ class GrampsService:
         """
         father_handle = await self._resolve_handle("person", father_ref) if father_ref else None
         mother_handle = await self._resolve_handle("person", mother_ref) if mother_ref else None
-        child_handles = [await self._resolve_handle("person", c) for c in (child_refs or [])]
+        child_handles = list(
+            dict.fromkeys([await self._resolve_handle("person", c) for c in (child_refs or [])])
+        )
 
         event_refs: list[dict] = []
         unsourced = False
@@ -791,6 +1226,7 @@ class GrampsService:
         abbrev: str | None,
         repository_ref: str | None,
         call_number: str | None,
+        media_type: str = "Unknown",
     ) -> dict:
         """Create a source, optionally held in a repository.
 
@@ -804,6 +1240,9 @@ class GrampsService:
             Handle or gramps_id of a repository holding this source.
         call_number : str or None
             Shelf mark within that repository.
+        media_type : str, optional
+            The source's medium in that repository, e.g. ``"Book"``; the same
+            field link_repository sets.
 
         Returns
         -------
@@ -815,14 +1254,7 @@ class GrampsService:
             payload["abbrev"] = abbrev
         if repository_ref:
             repo_handle = await self._resolve_handle("repository", repository_ref)
-            payload["reporef_list"] = [
-                {
-                    "_class": "RepoRef",
-                    "ref": repo_handle,
-                    "call_number": call_number or "",
-                    "media_type": "Unknown",
-                }
-            ]
+            payload["reporef_list"] = [_reporef(repo_handle, call_number, media_type)]
         created = await self.client.create_object("source", payload)
         return _write_result("source", created)
 
@@ -901,19 +1333,28 @@ class GrampsService:
             Handle, gramps_id, what it attached to, and ``verified`` -- False
             when the attachment could not be demonstrated by re-reading.
         """
+        # Resolved first, so a bad target fails before an orphan note exists.
+        target_handle = (
+            await self._resolve_handle(target_type, target_ref)
+            if target_ref and target_type
+            else None
+        )
         note = await self.client.create_object(
             "note", {"_class": "Note", "text": {"string": text}, "type": note_type}
         )
         note_handle = note["handle"]
         attached_to = None
         verified: bool | None = None
-        if target_ref and target_type:
-            obj = await self._resolve(target_type, target_ref)
-            obj.setdefault("note_list", []).append(note_handle)
-            await self.client.update_object(target_type, obj["handle"], obj)
-            attached_to = obj.get("gramps_id")
+        if target_handle:
+
+            def edit(obj: dict) -> str:
+                obj.setdefault("note_list", []).append(note_handle)
+                return "note attached"
+
+            result = await self._mutate(target_type, target_handle, edit, label="noted")
+            attached_to = result.get("gramps_id")
             verified = await self._verify_in_list(
-                target_type, obj["handle"], "note_list", note_handle
+                target_type, target_handle, "note_list", note_handle
             )
         message = f"Created {note_type} note"
         if attached_to:
@@ -1378,18 +1819,28 @@ class GrampsService:
             )
             tag_handle = created["handle"]
             logger.info("created tag %s", tag_handle)
-        obj = await self._resolve(object_type, ref)
-        tag_list = obj.setdefault("tag_list", [])
-        if tag_handle not in tag_list:
+
+        def edit(obj: dict) -> str | bool:
+            tag_list = obj.setdefault("tag_list", [])
+            if tag_handle in tag_list:
+                return False
             tag_list.append(tag_handle)
-        await self.client.update_object(object_type, obj["handle"], obj)
-        return {
-            "object_type": object_type,
-            "gramps_id": obj.get("gramps_id"),
-            "tag": tag_name,
-            "message": f"Tagged {object_type} "
-            f"{obj.get('gramps_id') or obj['handle']} with '{tag_name}'",
-        }
+            return f"tagged '{tag_name}'"
+
+        result = await self._mutate(object_type, ref, edit, label="tagged")
+        label = result.get("gramps_id") or result["handle"]
+        return _with_repairs(
+            {
+                "object_type": object_type,
+                "gramps_id": result.get("gramps_id"),
+                "tag": tag_name,
+                "tag_handle": tag_handle,
+                "message": f"Tagged {object_type} {label} with '{tag_name}'"
+                if result["changed"]
+                else f"{object_type} {label} already carries '{tag_name}'",
+            },
+            result,
+        )
 
     async def list_tags(self) -> list[dict]:
         """List every tag with its handle, name and colour.
@@ -1407,16 +1858,24 @@ class GrampsService:
 
     async def add_attribute(self, object_type: str, ref: str, name: str, value: str) -> dict:
         """Append an Attribute (or SrcAttribute for sources/citations) to an object."""
-        obj = await self._resolve(object_type, ref)
         cls = "SrcAttribute" if object_type in {"source", "citation"} else "Attribute"
-        obj.setdefault("attribute_list", []).append({"_class": cls, "type": name, "value": value})
-        await self.client.update_object(object_type, obj["handle"], obj)
-        return {
-            "object_type": object_type,
-            "gramps_id": obj.get("gramps_id"),
-            "message": f"Added attribute '{name}' to {object_type} "
-            f"{obj.get('gramps_id') or obj['handle']}",
-        }
+
+        def edit(obj: dict) -> str:
+            obj.setdefault("attribute_list", []).append(
+                {"_class": cls, "type": name, "value": value}
+            )
+            return f"attribute '{name}' added"
+
+        result = await self._mutate(object_type, ref, edit, label="updated")
+        return _with_repairs(
+            {
+                "object_type": object_type,
+                "gramps_id": result.get("gramps_id"),
+                "message": f"Added attribute '{name}' to {object_type} "
+                f"{result.get('gramps_id') or result['handle']}",
+            },
+            result,
+        )
 
     async def add_url(
         self,
@@ -1433,16 +1892,23 @@ class GrampsService:
                 "message": f"URLs are only supported on person, place, or "
                 f"repository, not {object_type}. Use an attribute instead.",
             }
-        obj = await self._resolve(object_type, ref)
-        obj.setdefault("urls", []).append(
-            {"_class": "Url", "path": url, "desc": description, "type": url_type}
+
+        def edit(obj: dict) -> str:
+            obj.setdefault("urls", []).append(
+                {"_class": "Url", "path": url, "desc": description, "type": url_type}
+            )
+            return "URL added"
+
+        result = await self._mutate(object_type, ref, edit, label="updated")
+        return _with_repairs(
+            {
+                "object_type": object_type,
+                "gramps_id": result.get("gramps_id"),
+                "message": f"Added URL to {object_type} "
+                f"{result.get('gramps_id') or result['handle']}",
+            },
+            result,
         )
-        await self.client.update_object(object_type, obj["handle"], obj)
-        return {
-            "object_type": object_type,
-            "gramps_id": obj.get("gramps_id"),
-            "message": f"Added URL to {object_type} {obj.get('gramps_id') or obj['handle']}",
-        }
 
     async def update_url(
         self,
@@ -1546,17 +2012,27 @@ class GrampsService:
         dict
             Handle, gramps_id and a message.
         """
-        obj = await self._resolve(object_type, ref)
-        obj["private"] = bool(private)
-        await self.client.update_object(object_type, obj["handle"], obj)
-        return {
-            "handle": obj["handle"],
-            "gramps_id": obj.get("gramps_id"),
-            "object_type": object_type,
-            "private": bool(private),
-            "message": f"Set {object_type} "
-            f"{obj.get('gramps_id') or obj['handle']} private={bool(private)}",
-        }
+        flag = bool(private)
+
+        def edit(obj: dict) -> str | bool:
+            if bool(obj.get("private")) == flag:
+                return False
+            obj["private"] = flag
+            return f"private={flag}"
+
+        result = await self._mutate(object_type, ref, edit, label="updated")
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "object_type": object_type,
+                "private": flag,
+                "changed": result["changed"],
+                "message": f"Set {object_type} "
+                f"{result.get('gramps_id') or result['handle']} private={flag}",
+            },
+            result,
+        )
 
     # ------------------------------------------------------------------ #
     # write: sources, repositories, families
@@ -1570,22 +2046,21 @@ class GrampsService:
         abbrev: str | None = None,
     ) -> dict:
         """Edit an existing source's title/author/pubinfo/abbrev (only provided)."""
-        source = await self._resolve("source", ref)
-        if title is not None:
-            source["title"] = title
-        if author is not None:
-            source["author"] = author
-        if pubinfo is not None:
-            source["pubinfo"] = pubinfo
-        if abbrev is not None:
-            source["abbrev"] = abbrev
-        await self.client.update_object("source", source["handle"], source)
-        return {
-            "handle": source["handle"],
-            "gramps_id": source.get("gramps_id"),
-            "object_type": "source",
-            "message": f"Updated source {source.get('gramps_id') or source['handle']}",
-        }
+
+        def edit(source: dict) -> str | bool:
+            changed = []
+            for key, value in (
+                ("title", title),
+                ("author", author),
+                ("pubinfo", pubinfo),
+                ("abbrev", abbrev),
+            ):
+                if value is not None and (source.get(key) or "") != value:
+                    source[key] = value
+                    changed.append(key)
+            return ", ".join(changed) if changed else False
+
+        return await self._mutate("source", ref, edit, label="updated")
 
     async def link_repository(
         self,
@@ -1596,26 +2071,117 @@ class GrampsService:
     ) -> dict:
         """Attach a RepoRef linking a repository to a source (dedup by repo handle)."""
         repo_handle = await self._resolve_handle("repository", repository_ref)
-        source = await self._resolve("source", source_ref)
-        reporef_list = source.setdefault("reporef_list", [])
-        if not any(r.get("ref") == repo_handle for r in reporef_list):
-            reporef_list.append(
-                {
-                    "_class": "RepoRef",
-                    "ref": repo_handle,
-                    "call_number": call_number or "",
-                    "media_type": media_type,
-                    "note_list": [],
-                    "private": False,
-                }
-            )
-        await self.client.update_object("source", source["handle"], source)
-        return {
-            "handle": source["handle"],
-            "gramps_id": source.get("gramps_id"),
-            "object_type": "source",
-            "message": f"Linked repository to source {source.get('gramps_id') or source['handle']}",
-        }
+
+        def edit(source: dict) -> str | bool:
+            reporef_list = source.setdefault("reporef_list", [])
+            if any(r.get("ref") == repo_handle for r in reporef_list):
+                return False
+            reporef_list.append(_reporef(repo_handle, call_number, media_type))
+            return "repository linked"
+
+        result = await self._mutate("source", source_ref, edit, label="updated")
+        label = result.get("gramps_id") or result["handle"]
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "object_type": "source",
+                "changed": result["changed"],
+                "message": f"Linked repository to source {label}"
+                if result["changed"]
+                else f"Source {label} is already linked to that repository; nothing changed. "
+                "To change the link, detach_object(child_kind='repository') and link again.",
+            },
+            result,
+        )
+
+    async def link_repositories(self, items: list[RepositoryLink]) -> dict:
+        """Link many sources to repositories in one call.
+
+        Each row is its own whole-object write, as with link_repository, so
+        each is its own transaction: gramps-webapi gives every PUT one. A row
+        that fails does not stop the rest, and each row says what happened.
+
+        Returns
+        -------
+        dict
+            Counts by outcome and one result per row: ``linked``,
+            ``already_linked``, ``missing`` or ``error``.
+        """
+        rows = []
+        for item in items:
+            row: dict[str, Any] = {"source": item.source, "repository": item.repository}
+            try:
+                out = await self.link_repository(
+                    item.source, item.repository, item.call_number, item.media_type
+                )
+                row["status"] = "linked" if out.get("changed") else "already_linked"
+            except NotFoundError as exc:
+                row.update(status="missing", message=str(exc))
+            except GrampsApiError as exc:
+                row.update(status="error", message=exc.detail)
+            except Exception as exc:  # noqa: BLE001 - one row must not end the sweep
+                row.update(status="error", message=str(exc))
+            rows.append(row)
+        return _batch_result(rows)
+
+    async def update_citations(self, items: list[CitationEdit]) -> dict:
+        """Edit many citations' pages and confidences in one call.
+
+        Each row goes through the same whole-object write as update_citation
+        and is its own transaction. ``expect_page_prefix`` refuses a row whose
+        page no longer starts as planned: a sweep planned from an earlier read
+        must not overwrite an edit made since.
+
+        Returns
+        -------
+        dict
+            Counts by outcome and one result per row: ``applied``,
+            ``unchanged``, ``drifted``, ``missing`` or ``error``.
+        """
+        rows = []
+        for item in items:
+            row: dict[str, Any] = {"citation": item.citation}
+            if item.page is None and item.confidence is None:
+                rows.append({**row, "status": "error", "message": "Nothing to set."})
+                continue
+            drift: dict[str, str] = {}
+
+            def edit(cit: dict, item: CitationEdit = item, drift: dict = drift) -> str | bool:
+                page = cit.get("page") or ""
+                if item.expect_page_prefix is not None and not page.startswith(
+                    item.expect_page_prefix
+                ):
+                    drift["page"] = page
+                    return False
+                changes = []
+                if item.page is not None and page != item.page:
+                    cit["page"] = item.page
+                    changes.append("page")
+                if item.confidence is not None:
+                    value = mapping.confidence_to_int(item.confidence)
+                    if cit.get("confidence") != value:
+                        cit["confidence"] = value
+                        changes.append(f"confidence={item.confidence.value}")
+                return ", ".join(changes) if changes else False
+
+            try:
+                out = await self._mutate("citation", item.citation, edit, label="updated")
+            except NotFoundError as exc:
+                rows.append({**row, "status": "missing", "message": str(exc)})
+                continue
+            except GrampsApiError as exc:
+                rows.append({**row, "status": "error", "message": exc.detail})
+                continue
+            except Exception as exc:  # noqa: BLE001 - one row must not end the sweep
+                rows.append({**row, "status": "error", "message": str(exc)})
+                continue
+            if drift:
+                row.update(status="drifted", live_page=drift["page"])
+            else:
+                row["status"] = "applied" if out.get("changed") else "unchanged"
+            rows.append(row)
+        return _batch_result(rows)
 
     async def add_event_to_family(
         self, family_ref: str, ev: EventInput, require_citation: bool = True
@@ -1641,19 +2207,27 @@ class GrampsService:
         CitationRequiredError
             If the event lacks a citation and ``require_citation`` is True.
         """
+        # Resolved first, so a bad reference fails before an event exists.
+        family_handle = await self._resolve_handle("family", family_ref)
         handle, is_uns = await self._create_event(ev, require_citation)
-        family = await self._resolve("family", family_ref)
-        family.setdefault("event_ref_list", []).append(mapping.event_ref(handle, role="Family"))
-        await self.client.update_object("family", family["handle"], family)
-        return {
-            "handle": family["handle"],
-            "gramps_id": family.get("gramps_id"),
-            "event_handle": handle,
-            "object_type": "event",
-            "unsourced": is_uns,
-            "message": f"Added {ev.type} event to family {family.get('gramps_id')}"
-            + (" (UNSOURCED)" if is_uns else ""),
-        }
+
+        def edit(family: dict) -> str:
+            family.setdefault("event_ref_list", []).append(mapping.event_ref(handle, role="Family"))
+            return f"{ev.type} event added"
+
+        result = await self._mutate("family", family_handle, edit, label="added an event to")
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "event_handle": handle,
+                "object_type": "event",
+                "unsourced": is_uns,
+                "message": f"Added {ev.type} event to family {result.get('gramps_id')}"
+                + (" (UNSOURCED)" if is_uns else ""),
+            },
+            result,
+        )
 
     async def add_child_to_family(
         self,
@@ -1677,12 +2251,15 @@ class GrampsService:
         Returns
         -------
         dict
-            Handle, gramps_id and a message.
+            Handle, gramps_id and a message. A child already in the family is
+            left as it is; :meth:`update_child_ref` changes its relationship.
         """
         child_handle = await self._resolve_handle("person", child_ref)
-        family = await self._resolve("family", family_ref)
-        child_ref_list = family.setdefault("child_ref_list", [])
-        if not any(c.get("ref") == child_handle for c in child_ref_list):
+
+        def add_child(family: dict) -> str | bool:
+            child_ref_list = family.setdefault("child_ref_list", [])
+            if any(c.get("ref") == child_handle for c in child_ref_list):
+                return False
             child_ref_list.append(
                 {
                     "_class": "ChildRef",
@@ -1693,24 +2270,295 @@ class GrampsService:
                     "note_list": [],
                 }
             )
-        await self.client.update_object("family", family["handle"], family)
-        child = await self._resolve("person", child_handle)
-        parent_family_list = child.setdefault("parent_family_list", [])
-        if family["handle"] not in parent_family_list:
-            parent_family_list.append(family["handle"])
-        await self.client.update_object("person", child["handle"], child)
-        return {
-            "handle": family["handle"],
-            "gramps_id": family.get("gramps_id"),
+            return "child added"
+
+        result = await self._mutate("family", family_ref, add_child, label="updated")
+        family_handle = result["handle"]
+
+        # The server links the child to the family when the family is written
+        # (add_parent_family_handle); this covers a server that does not.
+        def link_child(child: dict) -> str | bool:
+            parent_family_list = child.setdefault("parent_family_list", [])
+            if family_handle in parent_family_list:
+                return False
+            parent_family_list.append(family_handle)
+            return "parent family linked"
+
+        child_result = await self._mutate("person", child_handle, link_child, label="linked")
+        label = result.get("gramps_id") or family_handle
+        out = {
+            "handle": family_handle,
+            "gramps_id": result.get("gramps_id"),
             "child_handle": child_handle,
             "object_type": "family",
-            "message": f"Added child to family {family.get('gramps_id') or family['handle']}",
+            "changed": result["changed"],
+            "message": f"Added child to family {label}"
+            if result["changed"]
+            else f"Already a child of family {label}; nothing changed. To change the "
+            "relationship to either parent, use update_child_ref.",
+        }
+        return _with_repairs(out, child_result)
+
+    async def update_child_ref(
+        self,
+        family_ref: str,
+        child_ref: str,
+        frel: str | None = None,
+        mrel: str | None = None,
+    ) -> dict:
+        """Change a child's relationship to the father or mother, in place.
+
+        The ChildRef keeps its citations, notes, privacy and its position in
+        the family's birth order -- all of which detaching the child and
+        adding it back loses.
+
+        Parameters
+        ----------
+        family_ref : str
+            Handle or gramps_id of the family.
+        child_ref : str
+            Handle or gramps_id of the child.
+        frel, mrel : str, optional
+            Relationship to the father and to the mother, matched against the
+            tree's child reference types: Birth, Adopted, Stepchild, Foster,
+            Sponsored, None, Unknown, or a custom one the tree has.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id and a message, or an ``error`` key.
+        """
+        if frel is None and mrel is None:
+            return {"error": "nothing_to_do", "message": "Pass frel, mrel, or both."}
+        child_handle = await self._resolve_handle("person", child_ref)
+        vocabulary = await self.client.types()
+        wanted = {
+            key: await self._canonical_type("child_reference_types", value, types=vocabulary)
+            for key, value in (("frel", frel), ("mrel", mrel))
+            if value is not None
+        }
+        found = {"hit": False}
+
+        def edit(family: dict) -> str | bool:
+            changed = []
+            for cref in family.get("child_ref_list") or []:
+                if cref.get("ref") != child_handle:
+                    continue
+                found["hit"] = True
+                for key, value in wanted.items():
+                    old = _type_string(cref.get(key))
+                    if old != value:
+                        cref[key] = value
+                        changed.append(f"{key} {old or 'unset'} -> {value}")
+            return ", ".join(dict.fromkeys(changed)) if changed else False
+
+        result = await self._mutate("family", family_ref, edit, label="updated")
+        if not found["hit"]:
+            return {
+                "error": "not_a_child",
+                "message": f"Person {child_ref} is not a child of family {family_ref}; "
+                "add_child_to_family adds one.",
+            }
+        result["child"] = child_ref
+        return result
+
+    async def check_family_links(self, limit: int = 200) -> dict:
+        """Audit the links between people and families, in both directions.
+
+        A person and a family each record their link -- ``family_list`` and
+        ``parent_family_list`` on the person, ``father_handle``,
+        ``mother_handle`` and ``child_ref_list`` on the family -- and the two
+        sides can disagree. Two collection reads, whatever the tree's size.
+
+        Finds a family listed twice by one person (repaired by any edit of
+        the person), a child listed twice by one family, a link one side
+        holds and the other lacks, and a link to an object that does not
+        exist.
+
+        Unless ``expose_private`` is set, a finding about a private or
+        probably-living person is withheld and counted.
+
+        Parameters
+        ----------
+        limit : int, optional
+            Maximum findings to return.
+
+        Returns
+        -------
+        dict
+            ``problem_count``, ``by_kind``, the findings, each with a
+            ``repair``, and ``withheld_count``.
+        """
+        people = await self.client.list_objects(
+            "person", keys="handle,gramps_id,family_list,parent_family_list"
+        )
+        families = await self.client.list_objects(
+            "family", keys="handle,gramps_id,father_handle,mother_handle,child_ref_list"
+        )
+        person_by = {p["handle"]: p for p in people}
+        family_by = {f["handle"]: f for f in families}
+        pid = {h: p.get("gramps_id") or h for h, p in person_by.items()}
+        fid = {h: f.get("gramps_id") or h for h, f in family_by.items()}
+        found: list[dict] = []
+
+        def add(kind: str, person: str, family: str, repair: str, **extra: Any) -> None:
+            found.append(
+                {
+                    "kind": kind,
+                    "person": pid.get(person, person),
+                    "family": fid.get(family, family),
+                    **extra,
+                    "repair": repair,
+                    "_person": person,
+                }
+            )
+
+        for handle, person in person_by.items():
+            for key in ("family_list", "parent_family_list"):
+                entries = person.get(key) or []
+                for family in dict.fromkeys(entries):
+                    if entries.count(family) > 1:
+                        add(
+                            f"duplicate_{key}",
+                            handle,
+                            family,
+                            f"Any edit of the person removes it: update_person(person="
+                            f"'{pid[handle]}') with nothing else.",
+                            count=entries.count(family),
+                        )
+            for family in dict.fromkeys(person.get("family_list") or []):
+                fam = family_by.get(family)
+                if fam is None:
+                    add(
+                        "missing_family",
+                        handle,
+                        family,
+                        f"detach_object(parent_type='person', parent='{pid[handle]}', "
+                        f"child_kind='family', child='{family}')",
+                        side="family_list",
+                    )
+                elif handle not in (fam.get("father_handle"), fam.get("mother_handle")):
+                    add(
+                        "one_sided_spouse_link",
+                        handle,
+                        family,
+                        "The person lists the family as a spouse; the family names them as "
+                        "neither parent. If the person is not a parent here, detach_object("
+                        f"parent_type='person', parent='{pid[handle]}', child_kind='family', "
+                        f"child='{fid[family]}').",
+                    )
+            for family in dict.fromkeys(person.get("parent_family_list") or []):
+                fam = family_by.get(family)
+                if fam is None:
+                    add(
+                        "missing_family",
+                        handle,
+                        family,
+                        f"detach_object(parent_type='person', parent='{pid[handle]}', "
+                        f"child_kind='parent_family', child='{family}')",
+                        side="parent_family_list",
+                    )
+                elif not any(c.get("ref") == handle for c in fam.get("child_ref_list") or []):
+                    add(
+                        "one_sided_child_link",
+                        handle,
+                        family,
+                        "The person lists the family as parents; the family does not list "
+                        f"them as a child. If they are its child, add_child_to_family(family="
+                        f"'{fid[family]}', child='{pid[handle]}'); if not, detach_object("
+                        f"parent_type='person', parent='{pid[handle]}', "
+                        f"child_kind='parent_family', child='{fid[family]}').",
+                    )
+        for handle, fam in family_by.items():
+            for role in ("father_handle", "mother_handle"):
+                parent = fam.get(role)
+                if not parent:
+                    continue
+                if parent not in person_by:
+                    add(
+                        "missing_person",
+                        parent,
+                        handle,
+                        "The family names a parent who does not exist; set the parent in "
+                        "Gramps Web.",
+                        side=role,
+                    )
+                elif handle not in (person_by[parent].get("family_list") or []):
+                    add(
+                        "one_sided_spouse_link",
+                        parent,
+                        handle,
+                        "The family names this parent; the person does not list the family. "
+                        "Open the family in Gramps Web and save it, or correct the parent "
+                        "there.",
+                    )
+            children = [c.get("ref") for c in fam.get("child_ref_list") or []]
+            for child in dict.fromkeys(children):
+                if children.count(child) > 1:
+                    add(
+                        "duplicate_child_ref",
+                        child,
+                        handle,
+                        "The family lists the child twice. Compare the two entries' "
+                        "citations in get_object(family) before removing one in Gramps Web.",
+                        count=children.count(child),
+                    )
+                if child not in person_by:
+                    add(
+                        "missing_person",
+                        child,
+                        handle,
+                        f"detach_object(parent_type='family', parent='{fid[handle]}', "
+                        f"child_kind='child', child='{child}')",
+                        side="child_ref_list",
+                    )
+                elif handle not in (person_by[child].get("parent_family_list") or []):
+                    add(
+                        "one_sided_child_link",
+                        child,
+                        handle,
+                        "The family lists the child; the person does not list the family. "
+                        f"add_child_to_family(family='{fid[handle]}', child='{pid[child]}') "
+                        "restores the person's side.",
+                    )
+
+        withheld: set[str] = set()
+        if not self.exposing_private:
+            withheld = await self._restricted_people(
+                f["_person"] for f in found if f["_person"] in person_by
+            )
+        shown = [
+            {k: v for k, v in f.items() if k != "_person"}
+            for f in found
+            if f["_person"] not in withheld
+        ]
+        by_kind: dict[str, int] = {}
+        for f in shown:
+            by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
+        return {
+            "people_checked": len(people),
+            "families_checked": len(families),
+            "problem_count": len(shown),
+            "by_kind": by_kind,
+            "problems": shown[:limit],
+            "truncated": len(shown) > limit,
+            "withheld_count": len(found) - len(shown),
+            "message": (f"{len(shown)} link problem(s)." if shown else "No link problems.")
+            + (
+                f" {len(found) - len(shown)} more about private or living people withheld."
+                if len(found) > len(shown)
+                else ""
+            ),
         }
 
     async def add_alternate_name(
-        self, person_ref: str, name: NameParts, name_type: str = "Also Known As"
+        self,
+        person_ref: str,
+        name: NameParts,
+        name_type: str = "Also Known As",
+        citation: CitationInput | None = None,
     ) -> dict:
-        """Add a non-primary name to a person.
+        """Add a non-primary name to a person, optionally cited.
 
         Parameters
         ----------
@@ -1720,24 +2568,45 @@ class GrampsService:
             The alternate name.
         name_type : str, optional
             Gramps name type, e.g. ``"Married Name"``.
+        citation : CitationInput, optional
+            The record that gives this form of the name. Goes on the name
+            itself, not the person: "this record spells it so" is a claim
+            about the name.
 
         Returns
         -------
         dict
-            Handle, gramps_id and a message.
+            Handle, gramps_id, the citation handle if one was attached, and a
+            message.
         """
-        person = await self._resolve("person", person_ref)
+        person_handle = await self._resolve_handle("person", person_ref)
+        citation_handle = await self.resolve_citation(citation) if citation else None
         name_dict = mapping.name_payload(name)
         name_dict["type"] = name_type
-        person.setdefault("alternate_names", []).append(name_dict)
-        await self.client.update_object("person", person["handle"], person)
-        return {
-            "handle": person["handle"],
-            "gramps_id": person.get("gramps_id"),
-            "object_type": "person",
-            "message": f"Added alternate name to person "
-            f"{person.get('gramps_id') or person['handle']}",
-        }
+        if citation_handle:
+            name_dict["citation_list"] = [citation_handle]
+
+        def edit(person: dict) -> str:
+            person.setdefault("alternate_names", []).append(name_dict)
+            return f"{name_type} name added" + (", cited" if citation_handle else "")
+
+        try:
+            result = await self._mutate("person", person_handle, edit, label="updated")
+        except Exception:
+            await self._discard_minted_citation(citation, citation_handle)
+            raise
+        return _with_repairs(
+            {
+                "handle": result["handle"],
+                "gramps_id": result.get("gramps_id"),
+                "object_type": "person",
+                "citation_handle": citation_handle,
+                "message": f"Added alternate name to person "
+                f"{result.get('gramps_id') or result['handle']}"
+                + (" with its citation" if citation_handle else " (uncited)"),
+            },
+            result,
+        )
 
     # ------------------------------------------------------------------ #
     # read: source, repository, event detail
@@ -1862,12 +2731,12 @@ class GrampsService:
         """
         place = await self._resolve("place", ref, extend="all")
         enclosed_by = place.get("placeref_list") or []
-        return {
+        out = {
             "handle": place["handle"],
             "gramps_id": place.get("gramps_id"),
             "name": (place.get("name") or {}).get("value"),
             "title": place.get("title"),
-            "type": _type_string(place.get("type")),
+            "type": _type_string(place.get("place_type")),
             "code": place.get("code") or None,
             "latitude": place.get("lat") or None,
             "longitude": place.get("long") or None,
@@ -1882,6 +2751,15 @@ class GrampsService:
             ],
             "citation_count": len(place.get("citation_list") or []),
         }
+        if "type" in place:
+            # Written by 1.0.x add_place and never read by Gramps.
+            out["stray_type_key"] = _type_string(place.get("type"))
+            out["note"] = (
+                "This place carries a stray top-level 'type' key, which Gramps ignores. "
+                "Any edit of the place removes it -- update_place(place=...) with no other "
+                "argument does -- moving it into the type when the type is Unknown."
+            )
+        return out
 
     async def get_citation(self, ref: str) -> dict:
         """Fetch one citation: page, confidence, date and its source.
@@ -2019,7 +2897,9 @@ class GrampsService:
         if title:
             payload["title"] = title
         if place_type:
-            payload["type"] = place_type
+            # Gramps' field is place_type. 1.0.x wrote "type", which the server
+            # kept as a stray key while the place stayed Unknown.
+            payload["place_type"] = place_type
         for key, value in (("lat", latitude), ("long", longitude), ("code", code)):
             if value:
                 payload[key] = value
@@ -2147,7 +3027,10 @@ class GrampsService:
         Returns
         -------
         dict
-            Handle, gramps_id and a message.
+            Handle, gramps_id and a message. ``repaired`` lists defects
+            :func:`_normalize` removed on the way; a write that repairs one
+            happens even when ``fn`` changed nothing, which is how any edit
+            of an affected object -- or a bare one -- cleans it up.
         """
         obj = await self._resolve(object_type, ref)
         # profile/extended/backlinks are computed by the API on read, never
@@ -2155,26 +3038,36 @@ class GrampsService:
         for computed in ("profile", "extended", "backlinks"):
             obj.pop(computed, None)
         result = fn(obj)
-        if result is False:
+        repaired = _normalize(object_type, obj)
+        label_id = obj.get("gramps_id") or obj["handle"]
+        if result is False and not repaired:
             return {
                 "handle": obj["handle"],
                 "gramps_id": obj.get("gramps_id"),
                 "object_type": object_type,
                 "changed": False,
-                "message": f"No change needed on {object_type} "
-                f"{obj.get('gramps_id') or obj['handle']}",
+                "message": f"No change needed on {object_type} {label_id}",
             }
         await self.client.update_object(object_type, obj["handle"], obj)
         logger.info("%s %s %s", label, object_type, obj.get("gramps_id"))
-        return {
+        if result is False:
+            message = f"Repaired {object_type} {label_id}: {'; '.join(repaired)}"
+        else:
+            message = f"{label.capitalize()} {object_type} {label_id}" + (
+                f": {result}" if isinstance(result, str) else ""
+            )
+            if repaired:
+                message += f" (also repaired: {'; '.join(repaired)})"
+        out = {
             "handle": obj["handle"],
             "gramps_id": obj.get("gramps_id"),
             "object_type": object_type,
             "changed": True,
-            "message": f"{label.capitalize()} {object_type} "
-            f"{obj.get('gramps_id') or obj['handle']}"
-            + (f": {result}" if isinstance(result, str) else ""),
+            "message": message,
         }
+        if repaired:
+            out["repaired"] = repaired
+        return out
 
     async def _verify_in_list(
         self, object_type: str, handle: str, list_key: str, needle: str
@@ -2674,6 +3567,7 @@ class GrampsService:
             Handle, gramps_id and a message naming what changed.
         """
         source_handle = await self._resolve_handle("source", source_ref) if source_ref else None
+        new_date = await self._parse_date(date) if date is not None else None
 
         def edit(cit: dict) -> str | bool:
             changes = []
@@ -2685,8 +3579,8 @@ class GrampsService:
                 if cit.get("confidence") != value:
                     cit["confidence"] = value
                     changes.append(f"confidence={confidence.value}")
-            if date is not None:
-                cit["date"] = mapping.parse_date(date)
+            if new_date is not None and not _same_date(cit.get("date"), new_date):
+                cit["date"] = new_date
                 changes.append("date")
             if source_handle and cit.get("source_handle") != source_handle:
                 cit["source_handle"] = source_handle
@@ -2708,14 +3602,15 @@ class GrampsService:
         stored under checksum names, so nothing in the media list says what the
         document is.
         """
+        new_date = await self._parse_date(date) if date is not None else None
 
         def edit(media: dict) -> str | bool:
             changes = []
             if description is not None and media.get("desc") != description:
                 media["desc"] = description
                 changes.append("description")
-            if date is not None:
-                media["date"] = mapping.parse_date(date)
+            if new_date is not None and not _same_date(media.get("date"), new_date):
+                media["date"] = new_date
                 changes.append("date")
             if path is not None and media.get("path") != path:
                 media["path"] = path
@@ -2730,13 +3625,79 @@ class GrampsService:
         gender: Gender | None = None,
         name: NameParts | None = None,
         private: bool | None = None,
+        keep_old_as_alternate: bool = True,
+        reason: str | None = None,
     ) -> dict:
         """Edit a person's gender, primary name, or privacy flag.
 
-        Replacing the primary name keeps the old one as an alternate rather than
-        discarding it -- a name in the tree came from somewhere, and dropping it
-        loses the link to whatever record used it.
+        Replacing the primary name keeps the old one as an alternate by
+        default: a name in the tree came from some record, and dropping it
+        loses the link to whatever document used it.
+
+        That does not hold for a data-entry error in how the name was split
+        -- given "Joan", surname "M. Anderson" for Joan M. Anderson -- where
+        the old form is in no document and an alternate would invent a
+        variant. With ``keep_old_as_alternate`` False the primary name is
+        corrected in place instead, keeping its citations, notes, type and
+        date, and ``reason`` is recorded with the old form in a Research
+        note on the person. gramps-webapi's PUT takes no transaction
+        description, so the note is the record.
+
+        Parameters
+        ----------
+        ref : str
+            Handle or gramps_id.
+        gender : Gender, optional
+            New gender.
+        name : NameParts, optional
+            The new primary name. A name whose parts are unchanged is no
+            change.
+        private : bool, optional
+            New privacy flag.
+        keep_old_as_alternate : bool, optional
+            Keep the replaced primary name as an Also Known As.
+        reason : str, optional
+            Why the old form is not kept. Required when
+            ``keep_old_as_alternate`` is False.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id and a message, plus ``note_handle`` when a
+            correction was recorded, or an ``error`` key.
         """
+        if not keep_old_as_alternate and name is None:
+            return {
+                "error": "conflicting_arguments",
+                "message": "keep_old_as_alternate only applies when name is given.",
+            }
+        if not keep_old_as_alternate and not (reason or "").strip():
+            return {
+                "error": "reason_required",
+                "message": "Dropping the old primary name needs a reason, recorded in a "
+                "note on the person: e.g. 'entered with the middle initial in the "
+                "surname; no record uses that form'.",
+            }
+        new_name = mapping.name_payload(name) if name is not None else None
+        correction: dict[str, Any] = {}
+        if new_name is not None and not keep_old_as_alternate:
+            current = await self._resolve("person", ref, keys="handle,gramps_id,primary_name")
+            old = current.get("primary_name") or {}
+            if _name_parts(old) != _name_parts(new_name):
+                note = await self.client.create_object(
+                    "note",
+                    {
+                        "_class": "Note",
+                        "type": "Research",
+                        "text": {
+                            "_class": "StyledText",
+                            "string": f"Primary name corrected from {_name_label(old)} to "
+                            f"{_name_label({**old, **new_name})}; the old form was not kept "
+                            f"as an alternate name. Reason: {reason.strip()}",
+                        },
+                    },
+                )
+                correction["note"] = note
 
         def edit(person: dict) -> str | bool:
             changes = []
@@ -2745,21 +3706,154 @@ class GrampsService:
                 if person.get("gender") != value:
                     person["gender"] = value
                     changes.append(f"gender={gender.value}")
-            if name is not None:
-                old = person.get("primary_name")
-                new_name = mapping.name_payload(name)
-                if old and old != new_name:
-                    alt = dict(old)
-                    alt["type"] = "Also Known As"
-                    person.setdefault("alternate_names", []).append(alt)
-                    changes.append("name (previous kept as an alternate)")
-                person["primary_name"] = new_name
+            if new_name is not None:
+                old = person.get("primary_name") or {}
+                if _name_parts(old) != _name_parts(new_name):
+                    if keep_old_as_alternate:
+                        if old:
+                            alt = dict(old)
+                            alt["type"] = "Also Known As"
+                            person.setdefault("alternate_names", []).append(alt)
+                        person["primary_name"] = new_name
+                        changes.append("name (previous kept as an alternate)")
+                    else:
+                        # The same name, re-split: what supports it still does.
+                        kept = old.get("surname_list") or [{}]
+                        surname = dict(next((s for s in kept if s.get("primary")), kept[0]))
+                        surname.update(surname=name.surname, prefix=name.prefix or "", primary=True)
+                        person["primary_name"] = {
+                            **old,
+                            **new_name,
+                            "surname_list": [surname],
+                        }
+                        if correction.get("note"):
+                            person.setdefault("note_list", []).append(correction["note"]["handle"])
+                        changes.append("name corrected in place (reason recorded in a note)")
             if private is not None and person.get("private") != private:
                 person["private"] = bool(private)
                 changes.append(f"private={bool(private)}")
             return ", ".join(changes) if changes else False
 
-        return await self._mutate("person", ref, edit, label="updated")
+        try:
+            result = await self._mutate("person", ref, edit, label="updated")
+        except Exception:
+            if correction.get("note"):
+                await self._discard_note(correction["note"]["handle"])
+            raise
+        if correction.get("note"):
+            result["note_handle"] = correction["note"]["handle"]
+            result["note"] = correction["note"].get("gramps_id")
+        return result
+
+    async def update_alternate_name(
+        self,
+        person_ref: str,
+        match: NameMatch,
+        given: str | None = None,
+        surname: str | None = None,
+        prefix: str | None = None,
+        suffix: str | None = None,
+        nickname: str | None = None,
+        name_type: str | None = None,
+        remove: bool = False,
+    ) -> dict:
+        """Correct, retype or remove one alternate name, in place.
+
+        Edited in place, the name keeps its citations and notes. A name that
+        carries citations or notes is not removed: that would orphan them,
+        or delete the evidence for a form some record used. Uncite it first
+        (``uncite`` with ``object_type="name"``) if the name really is wrong.
+
+        Parameters
+        ----------
+        person_ref : str
+            Handle or gramps_id.
+        match : NameMatch
+            Which alternate name. Must select exactly one, except that of
+            several identical names, removal takes one.
+        given, surname, prefix, suffix, nickname : str, optional
+            New parts.
+        name_type : str, optional
+            New type, matched against the tree's name types.
+        remove : bool, optional
+            Remove the name instead.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id and a message, or an ``error`` key.
+        """
+        edits = {
+            "first_name": given,
+            "surname": surname,
+            "prefix": prefix,
+            "suffix": suffix,
+            "nick": nickname,
+        }
+        if remove and (name_type is not None or any(v is not None for v in edits.values())):
+            return {
+                "error": "conflicting_arguments",
+                "message": "Pass remove=True on its own, or the parts to change.",
+            }
+        if not remove and name_type is None and all(v is None for v in edits.values()):
+            return {
+                "error": "nothing_to_do",
+                "message": "Pass the parts or name_type to change, or remove=True.",
+            }
+        if match.primary:
+            return {
+                "error": "not_an_alternate",
+                "message": "This edits alternate names. The primary name is "
+                "update_person(name=...).",
+            }
+        new_type = (
+            await self._canonical_type("name_types", name_type) if name_type is not None else None
+        )
+        held: dict[str, list[str]] = {}
+
+        def edit(person: dict) -> str | bool:
+            key, target = _pick_name(person, match, alternates_only=True, allow_identical=remove)
+            label = _name_label(target)
+            if remove:
+                held.update(
+                    {
+                        k: list(target.get(k) or [])
+                        for k in ("citation_list", "note_list")
+                        if target.get(k)
+                    }
+                )
+                if held:
+                    return False
+                person["alternate_names"].pop(key)
+                return f"removed alternate name {label}"
+            changed = []
+            surnames = target.setdefault("surname_list", [])
+            if not surnames:
+                surnames.append({"_class": "Surname", "primary": True})
+            primary = next((s for s in surnames if s.get("primary")), surnames[0])
+            for field, value in edits.items():
+                if value is None:
+                    continue
+                holder = primary if field in ("surname", "prefix") else target
+                if (holder.get(field) or "") != value:
+                    holder[field] = value
+                    changed.append(field)
+            if new_type is not None and _type_string(target.get("type")) != new_type:
+                target["type"] = new_type
+                changed.append(f"type={new_type}")
+            if not changed:
+                return False
+            return f"{label} -> {_name_label(target)}"
+
+        result = await self._mutate("person", person_ref, edit, label="updated")
+        if held:
+            return {
+                "error": "name_is_cited",
+                "message": f"Not removed: the name holds {_held_listing(held)}. Uncite "
+                "them first (uncite with object_type='name') if the name is wrong, or "
+                "correct it in place instead of removing it.",
+            }
+        return result
 
     # Scalars only. Structural lists have dedicated tools, because setting
     # one wholesale drops references.
@@ -2823,19 +3917,65 @@ class GrampsService:
     # ------------------------------------------------------------------ #
     # citation plumbing
     # ------------------------------------------------------------------ #
-    async def cite_object(self, object_type: str, ref: str, cit: CitationInput) -> dict:
+    async def cite_object(
+        self,
+        object_type: str,
+        ref: str,
+        cit: CitationInput,
+        name: NameMatch | None = None,
+    ) -> dict:
         """Attach a citation to ANY object that carries a citation_list.
 
         cite_event covers facts; this covers everything else -- most importantly
         the FAMILY, whose citation supports a claim no event makes: that these
-        two people were a couple. Also person-level, media, place, and name-level
-        citations.
+        two people were a couple. Also person-level, media, place, and
+        name-level citations.
+
+        A name is cited with ``object_type="name"``, ``ref`` the person and
+        ``name`` saying which of their names: "this record gives this form of
+        the name" is a claim about the name, narrower than one about the
+        person. The person and the name are checked before an inline citation
+        is created, so a name that does not match leaves nothing behind.
         """
+        if object_type == "name":
+            if name is None:
+                return {
+                    "error": "name_required",
+                    "message": "object_type 'name' cites one of a person's names: pass "
+                    "ref (the person) and name (which name, e.g. {'surname': 'Bittner', "
+                    "'type': 'Birth Name'}).",
+                }
+            person = await self._resolve("person", ref)
+            _pick_name(person, name, alternates_only=False)
+            citation_handle = await self.resolve_citation(cit)
+            picked: dict[str, Any] = {}
+
+            def edit_name(obj: dict) -> str | bool:
+                key, target = _pick_name(obj, name, alternates_only=False)
+                picked.update(key=key, label=_name_label(target))
+                citation_list = target.setdefault("citation_list", [])
+                if citation_handle in citation_list:
+                    return False
+                citation_list.append(citation_handle)
+                return f"citation attached to the name {picked['label']}"
+
+            try:
+                result = await self._mutate("person", person["handle"], edit_name, label="cited")
+            except Exception:
+                await self._discard_minted_citation(cit, citation_handle)
+                raise
+            result.update(citation_handle=citation_handle, name=picked["label"])
+            if result.get("changed"):
+                fresh = await self._resolve("person", person["handle"])
+                _, landed = _pick_name(fresh, name, alternates_only=False)
+                result["verified"] = citation_handle in (landed.get("citation_list") or [])
+            return result
+
         if object_type not in _CITABLE_TYPES:
             return {
                 "error": "unsupported_type",
                 "message": f"{object_type} has no citation_list. Citable: "
-                f"{', '.join(sorted(_CITABLE_TYPES))}.",
+                f"{', '.join(sorted(_CITABLE_TYPES | {'name'}))}.",
             }
         citation_handle = await self.resolve_citation(cit)
 
@@ -2914,6 +4054,9 @@ class GrampsService:
         ref: str,
         citation_ref: str,
         delete_if_orphan: bool = True,
+        *,
+        name: NameMatch | None = None,
+        carry_to: str | None = None,
     ) -> dict:
         """Detach a citation from an object, and delete it if nothing else uses it.
 
@@ -2921,42 +4064,81 @@ class GrampsService:
         they supported is gone, but the citation stays in the database looking
         like evidence of something. The default cleans up after itself; pass
         delete_if_orphan=False to keep the object deliberately.
+
+        "Nothing else uses it" counts what points at the citation, but the
+        citation can also hold notes and images -- a transcription, the page
+        image -- that are reachable through nothing else. Deleting it would
+        strand them, so then it is kept unless ``carry_to`` names a citation
+        to move them to first.
+
+        A name's citation is detached with ``object_type="name"``, ``ref``
+        the person and ``name`` choosing the name.
         """
         citation_handle = await self._resolve_handle("citation", citation_ref)
+        if object_type == "name" and name is None:
+            return {
+                "error": "name_required",
+                "message": "object_type 'name' uncites one of a person's names: pass ref "
+                "(the person) and name (which name).",
+            }
+
+        detached = {"done": False}
 
         def edit(obj: dict) -> str | bool:
-            citation_list = obj.get("citation_list") or []
+            holder = obj
+            if object_type == "name":
+                _, holder = _pick_name(obj, name, alternates_only=False)
+            citation_list = holder.get("citation_list") or []
             if citation_handle not in citation_list:
                 return False
-            obj["citation_list"] = [c for c in citation_list if c != citation_handle]
+            holder["citation_list"] = [c for c in citation_list if c != citation_handle]
+            detached["done"] = True
             return "citation detached"
 
-        result = await self._mutate(object_type, ref, edit, label="uncited")
+        target_type = "person" if object_type == "name" else object_type
+        result = await self._mutate(target_type, ref, edit, label="uncited")
         result["citation"] = citation_ref
-        if not result.get("changed"):
+        if not detached["done"]:
             result["message"] = f"Citation {citation_ref} was not attached to that {object_type}."
             return result
 
         remaining = await self.get_backlinks("citation", citation_handle)
         result["remaining_references"] = remaining["total_references"]
-        if remaining["total_references"] == 0:
-            if delete_if_orphan:
-                await self.client.delete_object("citation", citation_handle)
-                result["citation_deleted"] = True
-                result["message"] += "; citation was orphaned and has been deleted"
-            else:
-                result["citation_deleted"] = False
-                result["message"] += (
-                    "; WARNING: this citation is now an orphan -- nothing "
-                    "references it. Delete it or re-attach it."
-                )
+        if remaining["total_references"]:
+            return result
+        if not delete_if_orphan:
+            result["citation_deleted"] = False
+            result["message"] += (
+                "; WARNING: this citation is now an orphan -- nothing "
+                "references it. Delete it or re-attach it."
+            )
+            return result
+        citation = await self._resolve("citation", citation_handle)
+        outcome = await self._delete_keeping_evidence("citation", citation, carry_to)
+        result["citation_deleted"] = outcome.pop("deleted")
+        if result["citation_deleted"]:
+            result.update({k: v for k, v in outcome.items() if k != "suffix"})
+            result["message"] += "; citation was orphaned and has been deleted" + outcome.get(
+                "suffix", ""
+            )
+        else:
+            result["would_orphan"] = outcome["would_orphan"]
+            result["message"] += (
+                f"; the citation was KEPT although nothing cites it any more. "
+                f"{outcome['message']} Pass carry_to=<citation> to move them and delete it."
+            )
         return result
 
     # ------------------------------------------------------------------ #
     # structure editing
     # ------------------------------------------------------------------ #
     async def merge_objects(
-        self, object_type: str, keep_ref: str, drop_ref: str, dry_run: bool = True
+        self,
+        object_type: str,
+        keep_ref: str,
+        drop_ref: str,
+        dry_run: bool = True,
+        enclosures: str = "auto",
     ) -> dict:
         """Merge two objects using the server's native merge.
 
@@ -2979,6 +4161,15 @@ class GrampsService:
             Handle or gramps_id of the object merged away.
         dry_run : bool, optional
             Report what the merge would carry across without performing it.
+        enclosures : {"auto", "keep_keeper", "keep_drop", "keep_both"}, optional
+            Places only. The server gives the survivor every enclosure of both
+            places, and two undated parents make the hierarchy ambiguous --
+            Gramps reads a second enclosure as a dated alternative, and the
+            first silently drives the title. ``auto`` drops an undated parent
+            that encloses another undated parent (a state beside its own
+            county), and refuses, before merging, if two unrelated undated
+            parents would remain. The others keep the survivor's, the dropped
+            place's, or both lists. Dated enclosures are kept in every case.
 
         Returns
         -------
@@ -3018,6 +4209,23 @@ class GrampsService:
                 if drop.get(key)
             },
         }
+        final_refs: list[dict] | None = None
+        if object_type == "place":
+            if enclosures not in _ENCLOSURE_CHOICES:
+                return {
+                    "error": "unsupported_choice",
+                    "message": f"enclosures must be one of: {', '.join(_ENCLOSURE_CHOICES)}.",
+                }
+            final_refs, report = await self._merged_enclosures(keep, drop, enclosures)
+            plan["enclosures"] = report
+            if report.get("ambiguous") and not dry_run:
+                return {
+                    "error": "ambiguous_enclosures",
+                    **plan,
+                    "message": "Not merged: the survivor would be enclosed by "
+                    f"{', '.join(report['result'])}, none of which encloses another. "
+                    "Choose with enclosures='keep_keeper', 'keep_drop' or 'keep_both'.",
+                }
         if dry_run:
             plan["dry_run"] = True
             plan["message"] = (
@@ -3025,6 +4233,11 @@ class GrampsService:
                 f"{keep.get('gramps_id')}, moving {drop_links['total_references']} "
                 f"reference(s). Re-run with dry_run=False to apply."
             )
+            if (plan.get("enclosures") or {}).get("ambiguous"):
+                plan["message"] += (
+                    " It would be refused as it stands: two unrelated undated parents "
+                    "would remain; choose with enclosures."
+                )
             return plan
 
         await self.client.merge(object_type, keep["handle"], drop["handle"])
@@ -3034,10 +4247,119 @@ class GrampsService:
             f"{keep.get('gramps_id')}. The merge is one transaction -- "
             f"list_transactions + undo_transaction can reverse it."
         )
+        if final_refs is not None:
+            wanted = [_placeref_key(r) for r in final_refs]
+
+            def settle(place: dict) -> str | bool:
+                current = place.get("placeref_list") or []
+                if [_placeref_key(r) for r in current] == wanted:
+                    return False
+                by_key = {_placeref_key(r): r for r in current}
+                place["placeref_list"] = [by_key.get(_placeref_key(r), r) for r in final_refs]
+                return "enclosures settled"
+
+            settled = await self._mutate("place", keep["handle"], settle, label="updated")
+            if settled.get("changed"):
+                plan["message"] += (
+                    " The survivor's enclosures were then set to "
+                    f"{', '.join(plan['enclosures']['result']) or 'none'} (a separate "
+                    "transaction)."
+                )
         logger.info(
             "merged %s %s into %s", object_type, drop.get("gramps_id"), keep.get("gramps_id")
         )
         return plan
+
+    async def _merged_enclosures(
+        self, keep: dict, drop: dict, choice: str
+    ) -> tuple[list[dict], dict]:
+        """The survivor's enclosures after a place merge, and a report of them.
+
+        gramps-webapi merges with Gramps' ``Place.merge``, whose
+        ``_merge_placeref_list`` appends every PlaceRef of the dropped place
+        not equal to one the survivor has (Gramps 6.0).
+        """
+        keep_refs = list(keep.get("placeref_list") or [])
+        drop_refs = list(drop.get("placeref_list") or [])
+        union = keep_refs + [
+            r
+            for r in drop_refs
+            if _placeref_key(r) not in {_placeref_key(k) for k in keep_refs}
+            and r.get("ref") != keep["handle"]
+        ]
+        pruned: list[dict] = []
+        if choice == "keep_keeper":
+            final = keep_refs
+        elif choice == "keep_drop":
+            final = [r for r in drop_refs if r.get("ref") != keep["handle"]]
+            final += [r for r in keep_refs if _date_string(r.get("date"))]
+        elif choice == "keep_both":
+            final = union
+        else:
+            undated = [r for r in union if not _date_string(r.get("date"))]
+            ancestors = {
+                r["ref"]: await self._place_ancestors(r["ref"]) for r in undated if r.get("ref")
+            }
+            coarser = {
+                r["ref"]
+                for r in undated
+                for other in undated
+                if other is not r and r.get("ref") in ancestors.get(other.get("ref"), set())
+            }
+            pruned = [
+                r for r in union if r.get("ref") in coarser and not _date_string(r.get("date"))
+            ]
+            final = [r for r in union if r not in pruned]
+        ids = await self._place_ids([r.get("ref") for r in keep_refs + drop_refs if r.get("ref")])
+
+        def named(refs: list[dict]) -> list[str]:
+            return [
+                ids.get(r.get("ref"), r.get("ref"))
+                + (f" ({_date_string(r.get('date'))})" if _date_string(r.get("date")) else "")
+                for r in refs
+            ]
+
+        undated_left = [r for r in final if not _date_string(r.get("date"))]
+        report = {
+            "keeper": named(keep_refs),
+            "dropped_place": named(drop_refs),
+            "result": named(final),
+            "ambiguous": choice == "auto" and len(undated_left) > 1,
+        }
+        if pruned:
+            report["pruned_as_coarser"] = named(pruned)
+        return final, report
+
+    async def _place_ancestors(self, handle: str) -> set[str]:
+        """Every place enclosing this one, through any enclosure, dated or not."""
+        seen: set[str] = set()
+        frontier = [handle]
+        for _ in range(50):
+            next_frontier = []
+            for current in frontier:
+                try:
+                    place = await self.client.get_object(
+                        "place", current, keys="handle,placeref_list"
+                    )
+                except GrampsApiError:
+                    continue
+                for ref in place.get("placeref_list") or []:
+                    up = ref.get("ref")
+                    if up and up not in seen:
+                        seen.add(up)
+                        next_frontier.append(up)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        return seen
+
+    async def _place_ids(self, handles: list[str]) -> dict[str, str]:
+        """gramps_ids for place handles, for a readable report."""
+        wanted = list(dict.fromkeys(handles))
+        if not wanted:
+            return {}
+        rows = await self.client.list_objects("place", handles=wanted, keys="handle,gramps_id")
+        return {r["handle"]: r.get("gramps_id") or r["handle"] for r in rows}
 
     async def detach_object(
         self,
@@ -3046,13 +4368,24 @@ class GrampsService:
         child_kind: str,
         child_ref: str,
         delete_if_orphan: bool = False,
+        *,
+        call_number: str | None = None,
     ) -> dict:
         """Remove a reference from an object's list (event, media, note, tag, child).
 
         The reference goes; the referenced object survives unless
         delete_if_orphan is set AND nothing else points at it. Deleting an
         object that other facts still reference leaves dangling handles, so the
-        check is not optional.
+        check is not optional; nor is the one for notes and images that only
+        the deleted object held, which keeps it instead.
+
+        A tag may be named rather than given by handle. A repository link can
+        be narrowed to one ``call_number``, for a source held twice in the
+        same repository. ``enclosure`` takes a parent off a place, which is
+        how an extra undated parent left by a merge comes off. Detaching a
+        child also removes every remaining link from the child to the family:
+        gramps-webapi removes only the first of two, which left a one-sided
+        link.
         """
         spec = _DETACH_SPECS.get(child_kind)
         if spec is None:
@@ -3060,40 +4393,159 @@ class GrampsService:
                 "error": "unknown_kind",
                 "message": f"child_kind must be one of: {', '.join(_DETACH_SPECS)}.",
             }
+        if call_number is not None and child_kind != "repository":
+            return {
+                "error": "conflicting_arguments",
+                "message": "call_number narrows a repository link; it means nothing for "
+                f"child_kind {child_kind!r}.",
+            }
         list_key, ref_type, by_ref = spec
-        child_handle = await self._resolve_handle(ref_type, child_ref) if ref_type else child_ref
+        if child_kind == "enclosure" and (parent_type != "place" or delete_if_orphan):
+            return {
+                "error": "conflicting_arguments",
+                "message": "child_kind 'enclosure' removes a parent from a place, and never "
+                "deletes the parent: pass parent_type='place' and no delete_if_orphan.",
+            }
+        if child_kind == "tag":
+            child_handle = await self._resolve_tag(child_ref)
+        elif child_kind in ("parent_family", "family"):
+            if delete_if_orphan:
+                return {
+                    "error": "conflicting_arguments",
+                    "message": "Removing a person's link never deletes the family.",
+                }
+            if parent_type != "person":
+                return {
+                    "error": "conflicting_arguments",
+                    "message": f"child_kind {child_kind!r} removes a link from a person; "
+                    "to take a child out of a family, use child_kind='child' on the family.",
+                }
+            refusal, child_handle = await self._one_sided_family(parent_ref, child_ref, child_kind)
+            if refusal:
+                return refusal
+        elif child_kind == "child":
+            try:
+                child_handle = await self._resolve_handle("person", child_ref)
+            except NotFoundError:
+                # A ChildRef to a person who no longer exists is detached by
+                # the handle it holds.
+                child_handle = child_ref
+        else:
+            child_handle = await self._resolve_handle(ref_type, child_ref)
+
+        def matches(entry: Any) -> bool:
+            if not by_ref:
+                return entry == child_handle
+            if entry.get("ref") != child_handle:
+                return False
+            return call_number is None or (entry.get("call_number") or "") == call_number
+
+        detached = {"done": False}
 
         def edit(obj: dict) -> str | bool:
             entries = obj.get(list_key) or []
-            if by_ref:
-                kept = [e for e in entries if e.get("ref") != child_handle]
-            else:
-                kept = [e for e in entries if e != child_handle]
+            kept = [e for e in entries if not matches(e)]
             if len(kept) == len(entries):
                 return False
             obj[list_key] = kept
-            return f"detached {child_kind}"
+            detached["done"] = True
+            return f"detached {child_kind}" + (
+                f" ({len(entries) - len(kept)} links)" if len(entries) - len(kept) > 1 else ""
+            )
 
         result = await self._mutate(parent_type, parent_ref, edit, label="detached from")
         result["detached"] = child_ref
-        if not result.get("changed"):
+        if not detached["done"]:
             result["message"] = f"{child_kind} {child_ref} was not attached to that {parent_type}."
             return result
 
-        if ref_type and delete_if_orphan:
+        if child_kind == "child" and parent_type == "family":
+            family_handle = result["handle"]
+
+            def unlink(person: dict) -> str | bool:
+                links = person.get("parent_family_list") or []
+                kept = [f for f in links if f != family_handle]
+                if len(kept) == len(links):
+                    return False
+                person["parent_family_list"] = kept
+                return "link to the family removed"
+
+            try:
+                unlinked = await self._mutate("person", child_handle, unlink, label="unlinked")
+            except NotFoundError:
+                unlinked = {}
+            if unlinked.get("changed"):
+                result["message"] += "; the child's remaining link back to the family removed"
+
+        if delete_if_orphan:
             remaining = await self.get_backlinks(ref_type, child_handle)
             result["remaining_references"] = remaining["total_references"]
-            if remaining["total_references"] == 0:
-                await self.client.delete_object(ref_type, child_handle)
-                result["deleted"] = True
-                result["message"] += f"; orphaned {ref_type} deleted"
-            else:
+            if remaining["total_references"]:
                 result["deleted"] = False
                 result["message"] += (
                     f"; kept the {ref_type}: {remaining['total_references']} other "
                     f"object(s) still reference it"
                 )
+                return result
+            target = await self._resolve(ref_type, child_handle)
+            outcome = await self._delete_keeping_evidence(ref_type, target, None)
+            result["deleted"] = outcome.pop("deleted")
+            if result["deleted"]:
+                result.update({k: v for k, v in outcome.items() if k != "suffix"})
+                result["message"] += f"; orphaned {ref_type} deleted" + outcome.get("suffix", "")
+            else:
+                result["would_orphan"] = outcome["would_orphan"]
+                result["message"] += (
+                    f"; kept the {ref_type}: {outcome['message']} Delete it with "
+                    "delete_object(carry_to=...) once they have a home."
+                )
         return result
+
+    async def _one_sided_family(
+        self, person_ref: str, family_ref: str, child_kind: str
+    ) -> tuple[dict | None, str]:
+        """Allow removing a person's link to a family only when it is one-sided.
+
+        Returns
+        -------
+        tuple
+            A refusal (or None) and the family handle to detach. A family that
+            no longer exists is detached by the handle the person holds.
+        """
+        try:
+            family = await self._resolve("family", family_ref)
+        except NotFoundError:
+            return None, family_ref
+        person_handle = await self._resolve_handle("person", person_ref)
+        if child_kind == "parent_family":
+            held = any(c.get("ref") == person_handle for c in family.get("child_ref_list") or [])
+            how = "detach_object(parent_type='family', child_kind='child')"
+        else:
+            held = person_handle in (family.get("father_handle"), family.get("mother_handle"))
+            how = "Gramps Web, where the family's parents are set"
+        if held:
+            return (
+                {
+                    "error": "two_sided_link",
+                    "message": f"Family {family.get('gramps_id')} still holds its side of this "
+                    "link, so removing only the person's side would leave it one-sided. "
+                    f"Take the person out of the family instead: {how}.",
+                },
+                family["handle"],
+            )
+        return None, family["handle"]
+
+    async def _resolve_tag(self, ref: str) -> str:
+        """A tag's handle, from its handle or its exact name."""
+        try:
+            return (await self.client.get_object("tag", ref, keys="handle"))["handle"]
+        except GrampsApiError as exc:
+            if exc.status != 404:
+                raise
+        for tag in await self.client.list_objects("tag", keys="handle,name"):
+            if (tag.get("name") or "") == ref:
+                return tag["handle"]
+        raise NotFoundError(f"No tag with handle or name '{ref}'.")
 
     async def add_media(
         self, file_path: str, description: str, dedup_by_checksum: bool = True
@@ -3947,6 +5399,35 @@ class GrampsService:
         )
         return result
 
+    async def _discard_minted_citation(
+        self, cit: CitationInput | None, citation_handle: str | None
+    ) -> None:
+        """Delete what :meth:`resolve_citation` created for a write that failed.
+
+        Only what it minted: a reused citation, or one on an existing source,
+        leaves the source alone, and a reused citation is not touched at all.
+        """
+        if cit is None or not citation_handle or cit.citation:
+            return
+        try:
+            minted = await self.client.get_object("citation", citation_handle)
+            doomed = [("citation", citation_handle)]
+            doomed += [("note", h) for h in minted.get("note_list") or []]
+            if not cit.source and cit.source_title:
+                doomed.append(("source", minted.get("source_handle")))
+            for object_type, handle in doomed:
+                if handle:
+                    await self.client.delete_object(object_type, handle)
+        except GrampsApiError:
+            logger.warning("could not remove unused citation %s", citation_handle)
+
+    async def _discard_note(self, note_handle: str) -> None:
+        """Delete a note minted for a write that did not land."""
+        try:
+            await self.client.delete_object("note", note_handle)
+        except GrampsApiError:
+            logger.warning("could not remove unused note %s", note_handle)
+
     async def _discard_new(self, note_handle: str, citation_handle: str) -> None:
         """Delete a note and citation minted for a write that did not land."""
         for object_type, handle in (("note", note_handle), ("citation", citation_handle)):
@@ -4548,6 +6029,13 @@ _DETACH_SPECS: dict[str, tuple[str, str | None, bool]] = {
     "child": ("child_ref_list", "person", True),
     "person": ("person_ref_list", "person", True),
     "repository": ("reporef_list", "repository", True),
+    # A person's side of a link only; refused while the family still holds
+    # the other side, since removing one side is how a one-sided link starts.
+    "parent_family": ("parent_family_list", "family", False),
+    "family": ("family_list", "family", False),
+    # A place's parent. update_place refuses a place with several, so this is
+    # how an extra one -- left by a merge -- comes off.
+    "enclosure": ("placeref_list", "place", True),
 }
 
 
@@ -4569,6 +6057,287 @@ def _iso_from_epoch(value: Any) -> str | None:
     if not isinstance(value, int | float):
         return None
     return datetime.fromtimestamp(value, UTC).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# write normalization
+# --------------------------------------------------------------------------- #
+def _normalize(object_type: str, obj: dict) -> list[str]:
+    """Remove defects no write should carry forward, in place.
+
+    Run by :meth:`GrampsService._mutate` on every object it writes, so an
+    affected object is repaired by its next edit and no edit can re-create
+    the defect.
+
+    - A person listing the same family twice in ``family_list`` or
+      ``parent_family_list``. gramps-webapi 3.21.1 appends a family to its
+      new father's or mother's ``family_list`` without checking for it, and
+      removes a child's link with ``list.remove``, which takes only the first
+      of two -- so a duplicate survives a detach as a one-sided link. The
+      lists hold bare handles, so dropping a repeat loses nothing; the order
+      is kept.
+    - A place carrying a top-level ``type`` key. Gramps calls the field
+      ``place_type``; 1.0.x ``add_place`` wrote ``type``, which the server
+      keeps without reading. Moved into ``place_type`` when that is unset,
+      dropped otherwise.
+
+    Parameters
+    ----------
+    object_type : str
+        Gramps object type.
+    obj : dict
+        The whole object, edited in place.
+
+    Returns
+    -------
+    list of str
+        What was repaired, for the result message. Empty when nothing was.
+    """
+    repaired: list[str] = []
+    if object_type == "person":
+        for key in ("family_list", "parent_family_list"):
+            entries = obj.get(key) or []
+            unique = list(dict.fromkeys(entries))
+            if len(unique) < len(entries):
+                obj[key] = unique
+                dropped = len(entries) - len(unique)
+                repaired.append(
+                    f"removed {dropped} duplicate {key} entr{'y' if dropped == 1 else 'ies'}"
+                )
+    elif object_type == "place" and "type" in obj:
+        stray = obj.pop("type")
+        shown = stray if isinstance(stray, str) else _type_string(stray)
+        if stray and not _is_unknown_type(stray) and _is_unknown_type(obj.get("place_type")):
+            obj["place_type"] = stray
+            repaired.append(f"moved the stray 'type' key ({shown}) into place_type")
+        else:
+            repaired.append(f"dropped a stray 'type' key ({shown or 'empty'})")
+    return repaired
+
+
+def _append_event_ref(person: dict, ref: dict, event_type: str | None) -> None:
+    """Append an event reference, as the primary birth or death if there is none.
+
+    gramps-webapi 3.21.1 recomputes ``birth_ref_index`` and
+    ``death_ref_index`` on every person write, from Birth and Death events
+    held in the Primary role, so what is set here is what a reader sees only
+    until the server's own rule applies; it is set for servers and readers
+    that do not recompute.
+    """
+    refs = person.setdefault("event_ref_list", [])
+    refs.append(ref)
+    if (_type_string(ref.get("role")) or "Primary") != "Primary":
+        return
+    index = len(refs) - 1
+    if event_type in _BIRTHLIKE and person.get("birth_ref_index", -1) < 0:
+        person["birth_ref_index"] = index
+    if event_type in _DEATHLIKE and person.get("death_ref_index", -1) < 0:
+        person["death_ref_index"] = index
+
+
+# --------------------------------------------------------------------------- #
+# names
+# --------------------------------------------------------------------------- #
+def _fold(text: Any) -> str:
+    """Compare-form of a name part: case-folded, whitespace collapsed."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _surname_of(name: dict) -> str:
+    """The surname a name is filed under: the primary one, else the first."""
+    surnames = name.get("surname_list") or []
+    primary = next((s for s in surnames if s.get("primary")), surnames[0] if surnames else {})
+    return primary.get("surname") or ""
+
+
+def _name_label(name: dict) -> str:
+    """``Type 'Given / Surname'``: the split between the parts stays visible."""
+    return (
+        f"{_type_string(name.get('type')) or 'name'} "
+        f"'{name.get('first_name') or ''} / {_surname_of(name)}'"
+    )
+
+
+def _name_parts(name: dict) -> tuple:
+    """What NameParts sets on a name, for telling a real change from a no-op."""
+    surnames = name.get("surname_list") or [{}]
+    return (
+        name.get("first_name") or "",
+        tuple((s.get("surname") or "", s.get("prefix") or "") for s in surnames),
+        name.get("suffix") or "",
+        name.get("title") or "",
+        name.get("call") or "",
+        name.get("nick") or "",
+    )
+
+
+def _names_listing(person: dict) -> str:
+    """Every name a person carries, keyed as NameMatch addresses them."""
+    lines = [f"primary: {_name_label(person.get('primary_name') or {})}"]
+    lines += [f"[{i}] {_name_label(n)}" for i, n in enumerate(person.get("alternate_names") or [])]
+    return "; ".join(lines)
+
+
+def _pick_name(
+    person: dict, match: NameMatch, *, alternates_only: bool, allow_identical: bool = False
+) -> tuple[str | int, dict]:
+    """Select exactly one of a person's names.
+
+    Parameters
+    ----------
+    person : dict
+        The whole person.
+    match : NameMatch
+        What to look for. Every field given must match.
+    alternates_only : bool
+        Leave the primary name out of the search.
+    allow_identical : bool, optional
+        When several names match and every one is identical, take the last
+        rather than refuse: removing either of two identical names has the
+        same result.
+
+    Returns
+    -------
+    tuple
+        ``("primary", name)`` or ``(index, name)``, the name being the dict
+        inside ``person``, so editing it edits the person.
+
+    Raises
+    ------
+    NotFoundError
+        If no name or several names match, listing what the person carries.
+    """
+    candidates: list[tuple[str | int, dict]] = []
+    if not alternates_only and match.primary is not False and match.index is None:
+        candidates.append(("primary", person.setdefault("primary_name", {})))
+    if match.primary is not True:
+        for i, name in enumerate(person.get("alternate_names") or []):
+            if match.index is None or match.index == i:
+                candidates.append((i, name))
+    hits = [
+        (key, name)
+        for key, name in candidates
+        if (match.given is None or _fold(match.given) == _fold(name.get("first_name")))
+        and (match.surname is None or _fold(match.surname) == _fold(_surname_of(name)))
+        and (match.type is None or _fold(match.type) == _fold(_type_string(name.get("type"))))
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    if hits and allow_identical and all(n == hits[0][1] for _, n in hits):
+        return hits[-1]
+    who = person.get("gramps_id") or person.get("handle")
+    if not hits:
+        raise NotFoundError(f"No name of {who} matches. Names: {_names_listing(person)}")
+    raise NotFoundError(
+        f"{len(hits)} names of {who} match; add type or index to choose one. "
+        f"Names: {_names_listing(person)}"
+    )
+
+
+#: How a place merge settles the survivor's enclosures.
+_ENCLOSURE_CHOICES = ("auto", "keep_keeper", "keep_drop", "keep_both")
+
+
+def _placeref_key(ref: dict) -> tuple:
+    """A PlaceRef's identity for a merge: where, and when."""
+    return (ref.get("ref"), _date_string(ref.get("date")))
+
+
+#: Object types with a media_list, and with a note_list.
+_MEDIA_HOLDERS = {"person", "family", "event", "place", "source", "citation"}
+_NOTE_HOLDERS = _MEDIA_HOLDERS | {"media", "repository"}
+
+
+def _collect_held(node: Any, key: str, *, by_ref: bool) -> list[str]:
+    """Every handle held under ``key`` anywhere in an object, in order."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for k, value in node.items():
+            if k == key and isinstance(value, list):
+                found += [
+                    (v.get("ref") if by_ref and isinstance(v, dict) else v)
+                    for v in value
+                    if (v.get("ref") if by_ref and isinstance(v, dict) else v)
+                ]
+            elif isinstance(value, dict | list):
+                found += _collect_held(value, key, by_ref=by_ref)
+    elif isinstance(node, list):
+        for value in node:
+            found += _collect_held(value, key, by_ref=by_ref)
+    return found
+
+
+def _carried_listing(carried: dict) -> str:
+    """``note N0001, media O0002``: what a carry moved."""
+    return ", ".join(
+        f"{typ} {', '.join(ids)}" for typ, ids in carried.items() if typ != "to" and ids
+    )
+
+
+def _held_listing(held: dict[str, list[str]]) -> str:
+    """Describe what a name or object holds, e.g. ``2 citation(s), 1 note(s)``."""
+    words = {"citation_list": "citation(s)", "note_list": "note(s)", "media_list": "media"}
+    return ", ".join(f"{len(v)} {words.get(k, k)}" for k, v in held.items())
+
+
+def _reporef(repo_handle: str, call_number: str | None, media_type: str) -> dict:
+    """A RepoRef in the shape both add_source and link_repository write."""
+    return {
+        "_class": "RepoRef",
+        "ref": repo_handle,
+        "call_number": call_number or "",
+        "media_type": media_type or "Unknown",
+        "note_list": [],
+        "private": False,
+    }
+
+
+def _batch_result(rows: list[dict]) -> dict:
+    """Counts by outcome, then every row, for a batch tool."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {
+        "rows_given": len(rows),
+        "outcomes": counts,
+        "rows": rows,
+        "message": ", ".join(f"{n} {status}" for status, n in counts.items()) or "No rows.",
+    }
+
+
+def _conflict(value: str, flag: str) -> dict:
+    """The refusal for a value passed together with the flag that clears it."""
+    return {
+        "error": "conflicting_arguments",
+        "message": f"Pass either {value} or {flag}, not both.",
+    }
+
+
+def _same_date(old: Any, new: dict) -> bool:
+    """Whether a stored Date dict already says what a parsed one says."""
+    if not isinstance(old, dict):
+        return False
+    keys = ("calendar", "modifier", "quality", "text")
+    return all((old.get(k) or 0) == (new.get(k) or 0) for k in keys) and list(
+        old.get("dateval") or []
+    ) == list(new.get("dateval") or [])
+
+
+def _is_unknown_type(value: Any) -> bool:
+    """Whether a Gramps type value, string or dict, is unset or Unknown."""
+    if value is None or value == "":
+        return True
+    if isinstance(value, dict):
+        return not value.get("string") and value.get("value") in (None, -1)
+    return str(value).strip().lower() == "unknown"
+
+
+def _with_repairs(out: dict, result: dict) -> dict:
+    """Carry what :meth:`GrampsService._mutate` repaired into a shaped result."""
+    if result.get("repaired"):
+        out["repaired"] = result["repaired"]
+        out["message"] += f" (also repaired: {'; '.join(result['repaired'])})"
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -4600,27 +6369,18 @@ def _type_string(t: Any) -> str:
 
 
 def _date_string(date: Any) -> str | None:
-    """Render a Gramps ``Date`` dict for display.
+    """Render a Gramps ``Date`` dict as Gramps displays it, in English.
 
-    Prefers the verbatim text of a text-only date, else joins the structured
-    year, month and day.
+    Delegates to :func:`mapping.date_display`, which keeps the modifier, the
+    quality and both ends of a range or span: ``"between 1882 and 1883"``,
+    never ``"1882"``.
 
     Returns
     -------
     str or None
         The formatted date, or None if there is nothing to show.
     """
-    if not isinstance(date, dict):
-        return None
-    if date.get("text"):
-        return date["text"]
-    year = mapping.year_from_date_dict(date)
-    dateval = date.get("dateval") or []
-    if isinstance(dateval, list) and len(dateval) >= 3 and any(dateval[:3]):
-        day, month, yr = dateval[0], dateval[1], dateval[2]
-        parts = [str(p) for p in (yr, month, day) if p]
-        return "-".join(parts) if parts else None
-    return str(year) if year else None
+    return mapping.date_display(date) if isinstance(date, dict) else None
 
 
 def _year_from_profile(entry: Any) -> int | None:
@@ -4711,6 +6471,10 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
         "handle": obj["handle"],
         "gramps_id": obj.get("gramps_id"),
         "name": profile.get("name") or _name_from_person(obj),
+        "primary_name": _name_entry(obj.get("primary_name") or {}),
+        "alternate_names": [
+            {"index": i, **_name_entry(n)} for i, n in enumerate(obj.get("alternate_names") or [])
+        ],
         "gender": mapping.gender_label(obj.get("gender")),
         "private": obj.get("private", False),
         "events": events,
@@ -4718,6 +6482,16 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
         "family_handles": obj.get("family_list", []),
         "parent_family_handles": obj.get("parent_family_list", []),
         "media_count": len(obj.get("media_list") or []),
+    }
+
+
+def _name_entry(name: dict) -> dict:
+    """One name as get_person shows it: the parts NameMatch selects on."""
+    return {
+        "type": _type_string(name.get("type")) or None,
+        "given": name.get("first_name") or "",
+        "surname": _surname_of(name),
+        "citation_count": len(name.get("citation_list") or []),
     }
 
 
