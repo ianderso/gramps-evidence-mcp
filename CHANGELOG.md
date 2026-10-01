@@ -118,6 +118,18 @@ other claim there -- is now checked against real gramps-webapi 3.21.1 and
   `query_records` and every privacy-filtered read failed there with HTTP 404
   partway through a call. *(live suite)*
 
+### Security
+
+- Requires PyJWT 2.15.0 or later. Before 2.15.0, a token with a deeply nested
+  payload made PyJWT raise a raw `RecursionError` instead of its
+  `DecodeError`. PyJWT reaches this server only as a dependency of the MCP
+  SDK: the server decodes no JWT itself — its Gramps Web tokens are opaque to
+  it — and does not use the SDK's own authentication, so no path from a
+  caller to the defect is known. The floor makes sure no install of this
+  release runs an affected version, which the lockfile update alone would not:
+  the lockfile pins this repository's development environment, not what an
+  installer resolves.
+
 ## [1.0.1] — 2026-09-29
 
 ### Fixed
