@@ -64,6 +64,46 @@ jobs:
       # Gramps Web instance or credentials are needed.
       - run: uv run pytest
 
+  live:
+    # The fake the test job runs against is only as right as our reading of
+    # the server. This runs the tools, every PITFALLS claim, and the fake
+    # itself against real gramps-webapi releases: the oldest supported, and
+    # the newest. tests/live/server-*.txt pins each one's whole dependency set.
+    name: Live (gramps-webapi ${{ matrix.webapi }})
+    # Pinned: the server compiles against these system libraries, and a new
+    # Ubuntu can rename them.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        webapi: ["3.21.1", "3.22.3"]
+    env:
+      # Fails the job if the server's settings do not arrive, rather than
+      # skipping every test and passing.
+      GRAMPS_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      # What gramps-webapi's own Dockerfile.base installs for PyICU, PyGObject
+      # and pycairo.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev pkg-config libcairo2-dev \
+            libgirepository1.0-dev gir1.2-gtk-3.0
+      # Installs the server from PyPI, starts it on loopback with an empty
+      # tree, and prints the GRAMPS_LIVE_* settings the suite reads.
+      - run: tests/live/start_server.sh "${{ matrix.webapi }}" 5555 "$RUNNER_TEMP/gramps" >> "$GITHUB_ENV"
+      - run: uv sync --locked --extra dev
+      - run: uv run pytest tests/live
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/gramps/server.log" || true
+
   lowest:
     # The declared minimum versions are a promise; this keeps them honest.
     name: Test at the lowest supported dependencies

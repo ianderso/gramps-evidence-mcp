@@ -53,7 +53,7 @@ async def test_place_created_by_an_event_has_no_parent(tools):
     await _cited_person(tools)
     out = await tools("get_place", place="P0001")
     assert out["enclosed_by"] == []
-    assert out["type"] == ""
+    assert out["type"] == "Unknown", "what the server stores for a place given no type"
 
 
 async def test_deliberately_created_place_is_typed_and_parented(tools):

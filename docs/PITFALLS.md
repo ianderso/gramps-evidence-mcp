@@ -3,11 +3,17 @@
 `gramps-webapi` behaviours that constrain this server's implementation. Read
 before adding a tool that mutates, or before calling the API directly.
 
-Found on gramps-webapi 3.20.1. Sections 2, 3, 7, 12 and 13 were re-verified
-against 3.21.1 on 2026-09-29, read-only, on a tree of about 850 people.
-Sections 15 to 22 come from research sessions against a live tree on
-2026-09-30, explained from the gramps-webapi 3.21.1 and Gramps 6.0 source on
-2026-10-01; each says which.
+**Every claim here about the server is checked on every CI run.** The live
+suite (`tests/live`, see CONTRIBUTING.md) starts a throwaway gramps-webapi
+3.21.1 and 3.22.3 and runs `test_pitfalls_live.py`, whose tests are named for
+these sections. Sections 4, 9, 10 and 11 describe this project's own code and
+are covered by the unit tests. Where the two versions differ, the section
+says so.
+
+The sections were first found on gramps-webapi 3.20.1 and 3.21.1, in research
+sessions against a live tree, and explained from the gramps-webapi and Gramps
+6.0 source; the dates below record that. 3.20 has no structured query
+endpoint, so this server requires 3.21 or later and refuses an older one.
 
 ## 1. `keys=` plus `PUT` destroys unfetched fields
 
@@ -57,6 +63,10 @@ Two sessions doing read-modify-write on the same object silently lose one edit,
 with nothing afterwards to show it happened. `_mutate()` makes an individual
 write whole-object safe; it cannot make two sessions safe from each other.
 
+The server could: a read carries an `ETag`, and a `PUT` sent with `If-Match`
+and an older one is refused with 412 (verified live). Nothing here sends
+`If-Match` yet, so a stale write still wins.
+
 Prolonged concurrent writing has also produced HTTP 500 on every write while
 reads stayed healthy. `list_transactions` shows recent write activity -- check
 it before starting a write session.
@@ -74,10 +84,11 @@ GrampsQL runs over raw object JSON, not the profile view.
   - Event `type` is not queryable *here*: `type = "Birth"` matches nothing on
     a tree full of births (744 of them, when first found). Use
     `query_records` instead; see section 12.
-  - Sources have no `citation_list`; citations point at sources. On 3.21.1
-    `citation_list.length = 0` matches no source, so every source looks cited;
-    on 3.20.1 it matched every source, so every source looked uncited. Neither
-    is an answer. Find uncited sources through `backlinks`.
+  - Sources have no `citation_list`; citations point at sources. With
+    gramps-ql 0.5.0 (what 3.21.1 and 3.22.3 install) `citation_list.length = 0`
+    matches no source, cited or not, so every source looks cited; on 3.20.1 it
+    matched every source. Neither is an answer. Find uncited sources through
+    `backlinks`.
 - Booleans compare as integers. `private = 1` finds private records;
   `private = true` matches nothing.
 
@@ -138,9 +149,11 @@ type as a plain string, `"Baptism"`. The *stored* object holds a dict:
 
 `string` is empty for every built-in type -- the identity is the integer. So:
 
-- `{"column": "type", ...}` is rejected: `type` is not an allowed column.
+- `{"column": "type", ...}` is rejected on 3.21 (not an allowed column). On
+  3.22 it is accepted and compared with the whole stored dict, so `eq 12` and
+  `eq "Birth"` both match nothing.
 - `{"json_path": ["type", "string"]}` matches nothing, because it is empty.
-- `{"json_path": ["type", "value"], "op": "eq", "value": 12}` works.
+- `{"json_path": ["type", "value"], "op": "eq", "value": 12}` works, on both.
 
 The integers come from `GET /api/types/default/event_types/map`, which is what
 `list_event_types` reads and what `query_records(event_type=...)` translates
@@ -151,8 +164,13 @@ Verified against 3.21.1 on a tree of 2,480 events: Birth 12 (744), Death 13
 
 ## 13. The query engine reads columns, not arbitrary fields
 
-`select` and `where` accept a plain column name only from a per-collection
-allowlist; anything else must be a `json_path`. The allowlists are narrow:
+On 3.21, `select` and `where` accept a plain column name only from a
+per-collection allowlist; anything else must be a `json_path`, and a path to a
+field the object lacks matches nothing, silently. On 3.22 a plain name may be
+any field of the stored object, and an unknown field or path is refused with
+422 naming the fields there are -- the better behaviour, but a query written
+against one version can fail or change meaning on the other. The 3.21
+allowlists are narrow:
 
 | Collection | Columns |
 | --- | --- |
@@ -172,9 +190,12 @@ Two more traps:
 - **Comparing a list raises HTTP 500.** `{"column": {"json_path":
   ["citation_list"]}, "op": "eq", "value": []}` crashes the server rather than
   returning uncited rows. Use `get_backlinks` or `list_unsourced_facts`.
-- **An unknown year is stored as `0`, not null.** A filter for
-  `birth.date.year < 1800` therefore matches every undated person. Add a
-  `gt 0` condition, or accept the noise knowingly.
+- **There is no stored `year`; the year is `dateval[2]`, and an unknown one
+  is `0`, not null.** `birth.date.year` matches nothing on 3.21 and is refused
+  on 3.22 -- except on records some client wrote a served year back to
+  (section 24), which makes it worse than useless. Filter on
+  `["birth", "date", "dateval", 2]`, and add a `gt 0` condition: `lt 1800`
+  alone matches every undated person.
 
 ## 14. A DNA match is an association
 
@@ -196,10 +217,14 @@ same person is a second match. Unreadable segment text parses to nothing,
 with HTTP 200 -- the same trap as the parser endpoint, which is why
 `add_dna_match` parses before it writes.
 
+The relationship and common ancestors a match reports are computed by Gramps'
+relationship calculator from the family links, so a parent of unknown gender
+is a "first ancestor", not a mother or father.
+
 Read from the gramps-webapi 3.21.1 source
 (`gramps_webapi/api/resources/dna.py` and its endpoint tests) and from the
-Gramps Web frontend, which writes the same shape, on 2026-09-29. Not yet
-exercised against a live instance.
+Gramps Web frontend, which writes the same shape, on 2026-09-29; verified live
+since 1.1.0.
 
 ## 15. A family write maintains its members' links -- imperfectly
 
@@ -268,14 +293,26 @@ on 2026-09-30 were found that way on a live tree. Read in `fix_object_dict`
 `_mutate()` removes a stray `type` from any place it writes, moving it into
 `place_type` when that is unset, and `get_place` reports one it finds.
 
-## 19. The server recomputes birth and death
+That is one case of a general rule: the server keeps any key a write carries
+that the object's class lacks, at any depth, and serves it back -- which is
+how section 24's `year` gets stored. It does check the types of the fields
+the class has: a null where the schema wants a string, list or object is
+refused with 400 (`$.description: None is not of type 'string'`), while a
+family's null parent handle is stored as `""` and an event's null place stays
+null. The fake in `tests/conftest.py` records which, field by field, from a
+real server.
 
-Every person write runs `set_birth_death_index`: the birth and death are the
-first Birth and Death events the person holds in the Primary role, whatever the
-payload said. An event write whose type moves into or out of Birth or Death
-recomputes it for every person referencing the event. So changing an event's
-type in place needs no work on the people sharing it. Read from the 3.21.1 and
-Gramps 6.0 source on 2026-10-01.
+## 19. The server recomputes birth and death -- on an update
+
+Every person update (`PUT`) runs `set_birth_death_index`: the birth and death
+are the first Birth and Death events the person holds in the Primary role,
+whatever the payload said. An event update whose type moves into or out of
+Birth or Death recomputes it for every person referencing the event. So
+changing an event's type in place needs no work on the people sharing it.
+
+A **create** (`POST`) keeps the indices it was sent, right or wrong, until the
+person's first update. `add_person` sets them itself. Read from the 3.21.1 and
+Gramps 6.0 source on 2026-10-01; the create case found by the live suite.
 
 ## 20. Dates: a span is not a range, and the server checks the shape
 
@@ -287,6 +324,9 @@ short for its modifier: 4 values for a simple or open-ended date, 8 for a
 range or span (`_validate_date`, 3.21.1). `GET /api/metadata/` names the Gramps
 version under `gramps.version`; the parser keeps "from X" as text on a server
 older than 5.2. Read on 2026-10-01.
+
+A date's `sortval` -- the day number of its start, which orders events -- is
+recomputed by the server on every write, whatever was sent.
 
 ## 21. A place merge unions the enclosures
 
@@ -304,3 +344,38 @@ A `PUT` is recorded as "Edit Person", "Edit Event" and so on (`put` in
 `api/resources/base.py`, 3.21.1): there is no way to attach a reason to the
 transaction. Where a correction needs one on record -- a primary name corrected
 without keeping the old form -- it goes in a note on the object.
+
+## 23. Tokens expire, and their endpoints take one request a second
+
+An access token lasts 15 minutes. An expired one is answered 401, which is
+what tells a client to renew it; a malformed one is answered 422, which does
+not. `POST /api/token/` and `POST /api/token/refresh/` each allow one request a
+second per address (`@limiter.limit("1/second")` in `api/resources/token.py`)
+and answer a second within the same second with 429 and no `Retry-After`.
+
+An MCP client runs tool calls in parallel, so after a quiet spell several
+requests find the token expired at once. Until 1.1.0 each renewed it: the
+first refresh succeeded, the second was refused and fell back to logging in,
+and from the third on both were refused and the tool call failed with 429.
+The client now renews once, under a lock, for every request that saw the old
+token, and waits out one 429 from a token endpoint (another client behind the
+same address can still cause one). Found by the live suite.
+
+## 24. A date's served `year` goes stale once written back
+
+Every date the server serves carries `year`, which is not a field of a Gramps
+date and is not stored. A client that writes back what it read stores it, and
+from then on the server serves the stored `year` instead of computing it,
+however the date changes:
+
+```text
+GET   date.dateval [0, 0, 1850, false]   year 1850   (computed)
+PUT   the same date with dateval[2] = 1860, year left as read
+GET   date.dateval [0, 0, 1860, false]   year 1850   (stored, stale)
+```
+
+On 3.21 a query on `date.year` then matches the records some client happened
+to write back, by a year that may be wrong (section 13). No tool reads `year`
+-- the year is `dateval[2]` -- but `_mutate()` drops it from every date it
+writes, which also repairs a stale one, and says so when it does. Found by the
+live suite, on 3.21.1 and 3.22.3.

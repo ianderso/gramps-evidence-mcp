@@ -11,9 +11,10 @@ adding one is a minor release.
 ## [1.1.0] — 2026-10-01
 
 Fixes for what a day of research sessions against a live tree found the tools
-could not do, or did wrong. Behaviour the fixes rely on was read from the
-gramps-webapi 3.21.1 and Gramps 6.0 source and is recorded, dated, in
-[docs/PITFALLS.md](docs/PITFALLS.md) sections 15 to 22.
+could not do, or did wrong. Behaviour the fixes rely on is recorded in
+[docs/PITFALLS.md](docs/PITFALLS.md) sections 15 to 24, and -- like every
+other claim there -- is now checked against real gramps-webapi 3.21.1 and
+3.22.3 servers on every CI run.
 
 ### Added
 
@@ -48,6 +49,12 @@ gramps-webapi 3.21.1 and Gramps 6.0 source and is recorded, dated, in
   parent off a place — which `update_place` refuses to touch.
 - `merge_objects` takes `enclosures` for places (see Fixed).
 - `uncite` and `delete_object` take `carry_to` (see Changed).
+- A live test suite, `tests/live`, run in CI against throwaway gramps-webapi
+  3.21.1 and 3.22.3 servers installed from PyPI. It checks each server
+  behaviour in PITFALLS, drives the tools end to end, and runs the same
+  scenarios against the unit tests' fake and the real server, requiring the
+  same answers. It found the three fixes below marked *(live suite)*, and
+  corrected PITFALLS sections 6, 7, 12, 13 and 19.
 
 ### Fixed
 
@@ -78,6 +85,15 @@ gramps-webapi 3.21.1 and Gramps 6.0 source and is recorded, dated, in
 - `add_event_to_person`, `add_event_to_family` and `add_note` created the event
   or note before resolving the target, so a bad reference left an orphan.
 - `add_family` given the same child twice listed them twice.
+- Parallel tool calls made after the access token expired -- the first calls
+  after a 15-minute pause -- could fail with HTTP 429: each renewed the token,
+  and the server takes one renewal a second. The token is renewed once for all
+  of them now, and a token request refused for its rate is retried once.
+  *(live suite)*
+- An edit wrote back the `year` the server adds to every date it serves; the
+  server stored it, and served it in place of the date's own year after the
+  date changed. Every write drops it now, which also repairs a stale one, and
+  says so. *(live suite)*
 
 ### Changed
 
@@ -96,6 +112,11 @@ gramps-webapi 3.21.1 and Gramps 6.0 source and is recorded, dated, in
   a place to resolve or a date to clear; `clear_place` and `clear_date` say so.
 - `add_child_to_family` and `link_repository` report a child or link already
   present as no change, and point at `update_child_ref` and `detach_object`.
+- gramps-webapi 3.21 or later is required, and on an older server every tool
+  answers with an `unsupported_server` error naming its version. 1.0 said it
+  was built against 3.20.1, but 3.20 has no structured query endpoint, so
+  `query_records` and every privacy-filtered read failed there with HTTP 404
+  partway through a call. *(live suite)*
 
 ## [1.0.1] — 2026-09-29
 

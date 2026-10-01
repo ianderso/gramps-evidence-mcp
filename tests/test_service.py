@@ -286,16 +286,19 @@ async def test_tag_object_no_duplicate_handle_on_reapply(service, fake):
 
 
 async def test_add_attribute_picks_attribute_vs_srcattribute(service, fake):
+    """What is sent decides the class; the server keeps no ``_class`` to read back."""
     p = await service.add_person(NameParts(given="Attr"), Gender.unknown)
     await service.add_attribute("person", p["handle"], "Occupation", "Blacksmith")
-    attrs = fake.store["person"][p["handle"]]["attribute_list"]
-    assert attrs[0]["_class"] == "Attribute"
-    assert attrs[0]["type"] == "Occupation"
+    method, typ, sent = fake.requests[-1]
+    assert (method, typ) == ("PUT", "person")
+    assert sent["attribute_list"][0]["_class"] == "Attribute"
+    assert fake.store["person"][p["handle"]]["attribute_list"][0]["type"] == "Occupation"
 
     src = await service.add_source("A book", None, None, None, None, None)
     await service.add_attribute("source", src["handle"], "URL", "https://example.com")
-    src_attrs = fake.store["source"][src["handle"]]["attribute_list"]
-    assert src_attrs[0]["_class"] == "SrcAttribute"
+    method, typ, sent = fake.requests[-1]
+    assert (method, typ) == ("PUT", "source")
+    assert sent["attribute_list"][0]["_class"] == "SrcAttribute"
 
 
 async def test_add_url_supported_and_unsupported(service, fake):

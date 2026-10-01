@@ -3,6 +3,11 @@
 Covers JWT auth with automatic refresh and a one-shot retry on 401, generic
 CRUD over the object endpoints, full-text search, transactions and exports.
 
+An expired token is renewed once however many requests found it expired at
+the same moment: the server allows each token endpoint one request a second
+per address (``docs/PITFALLS.md`` section 23), so parallel tool calls after a
+quiet spell must not each renew it.
+
 gramps-webapi wraps each write in its own ``DbTxn`` server-side, so Gramps'
 undo history stays coherent one object at a time.
 
@@ -12,8 +17,10 @@ contents.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -68,8 +75,18 @@ _CLASS_NAMES = {
 }
 
 
+#: The oldest gramps-webapi the tools work with. 3.21.0 added the
+#: ``/api/<collection>/query/`` endpoints that ``query_records`` and every
+#: privacy-filtered read use; 3.20 answers them 404.
+MIN_SERVER_VERSION = (3, 21)
+
+
 class InvalidIdentifierError(ValueError):
     """Raised when a value bound for a request path could leave its segment."""
+
+
+class UnsupportedServerError(RuntimeError):
+    """Raised when the gramps-webapi instance is older than the tools support."""
 
 
 def _seg(value: Any) -> str:
@@ -132,6 +149,7 @@ class GrampsWebClient:
         self._timeout = timeout
         self._access: str | None = None
         self._refresh: str | None = None
+        self._renewing = asyncio.Lock()
         self._http = httpx.AsyncClient(base_url=self._base, timeout=timeout)
 
     # ----- lifecycle -----
@@ -157,7 +175,7 @@ class GrampsWebClient:
         GrampsApiError
             If the server rejects the credentials.
         """
-        resp = await self._http.post(
+        resp = await self._post_token(
             "/api/token/",
             json={"username": self._username, "password": self._password},
         )
@@ -177,7 +195,7 @@ class GrampsWebClient:
         """Renew the access token. Returns False if no refresh token works."""
         if not self._refresh:
             return False
-        resp = await self._http.post(
+        resp = await self._post_token(
             "/api/token/refresh/",
             headers={"Authorization": f"Bearer {self._refresh}"},
         )
@@ -185,6 +203,35 @@ class GrampsWebClient:
             self._access = resp.json()["access_token"]
             return True
         return False
+
+    async def _post_token(self, path: str, **kwargs: Any) -> httpx.Response:
+        """POST to a token endpoint, waiting out its rate limit once.
+
+        gramps-webapi answers a second request within the same second with
+        429 and no ``Retry-After``; another client at the same address (a
+        browser behind the same proxy, a second session) can cause that.
+        """
+        resp = await self._http.post(path, **kwargs)
+        if resp.status_code == 429:
+            await asyncio.sleep(1.1)
+            resp = await self._http.post(path, **kwargs)
+        return resp
+
+    async def _renew(self, refused: str | None) -> None:
+        """Replace an access token the server refused, once for every request that saw it.
+
+        Parameters
+        ----------
+        refused : str or None
+            The token the failed request carried. If the client holds a
+            different one by the time the lock is free, another request has
+            already renewed it and there is nothing to do.
+        """
+        async with self._renewing:
+            if self._access != refused:
+                return
+            if not await self._refresh_token():
+                await self.login()
 
     def _auth_headers(self) -> dict[str, str]:
         """Bearer header for the current access token, empty if unauthenticated."""
@@ -226,15 +273,15 @@ class GrampsWebClient:
             On any status of 400 or above.
         """
         if self._access is None:
-            await self.login()
+            await self._renew(None)
         extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        sent = self._access
         resp = await self._http.request(
             method, path, params=params, json=json, headers=self._auth_headers(), **extra
         )
         if resp.status_code == 401:
             # Token probably expired; refresh or re-login, then retry once.
-            if not await self._refresh_token():
-                await self.login()
+            await self._renew(sent)
             resp = await self._http.request(
                 method, path, params=params, json=json, headers=self._auth_headers(), **extra
             )
@@ -506,6 +553,32 @@ class GrampsWebClient:
         """Return the instance's metadata, including object counts."""
         resp = await self._request("GET", "/api/metadata/")
         return resp.json()
+
+    async def require_supported_server(self) -> None:
+        """Refuse a gramps-webapi older than ``MIN_SERVER_VERSION``, naming its version.
+
+        A version the metadata does not state is let through: refusing on a
+        missing field would turn an unusual answer into an outage.
+
+        Raises
+        ------
+        UnsupportedServerError
+            If the server states a version older than the minimum.
+        GrampsApiError
+            If the metadata cannot be read.
+        """
+        meta = await self.metadata()
+        webapi = meta.get("gramps_webapi") if isinstance(meta, dict) else None
+        version = str((webapi or {}).get("version") or "")
+        parts = tuple(int(p) for p in re.findall(r"\d+", version)[:2])
+        if len(parts) == 2 and parts < MIN_SERVER_VERSION:
+            minimum = ".".join(map(str, MIN_SERVER_VERSION))
+            raise UnsupportedServerError(
+                f"This Gramps Web server runs gramps-webapi {version}. gramps-evidence-mcp "
+                f"needs gramps-webapi {minimum} or later: its searches and privacy filtering "
+                f"use the query endpoints added in {minimum}.0. Upgrade Gramps Web; the "
+                "tools will work on the next call, without restarting this server."
+            )
 
     async def count(self, object_type: str) -> int:
         """Count objects of a type.

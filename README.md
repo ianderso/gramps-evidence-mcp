@@ -545,8 +545,8 @@ unfiltered listing of the first 200 objects.
 ### Querying with GrampsQL
 
 `query_objects` filters in the database rather than pulling a collection and
-sifting it in Python. The syntax has traps, verified against gramps-webapi
-3.21.1:
+sifting it in Python. The syntax has traps, verified on every CI run against
+gramps-webapi 3.21.1 and 3.22.3:
 
 - Equality is a **single `=`**. `page == ""` is a parse error.
 - `~` is substring: `description ~ "1871"`.
@@ -558,7 +558,7 @@ sifting it in Python. The syntax has traps, verified against gramps-webapi
   `event_type` instead.
 - **A source has no `citation_list`** — citations point *at* sources. Use
   `get_backlinks` to find uncited sources. Querying `citation_list` on sources
-  matched every source on 3.20.1 and matches none on 3.21.1.
+  matches none, cited or not.
 - **Booleans compare as integers**: `private = 1`, not `private = true`.
 
 Useful ones:
@@ -649,16 +649,26 @@ unknown arguments, the whole-object write rule across every editing tool, the
 privacy filter on each bulk output, and the error envelope every tool returns
 instead of raising.
 
+A second suite, `tests/live`, runs against a real, throwaway gramps-webapi --
+3.21.1 and 3.22.3 in CI, installed from PyPI with no Docker needed. It checks
+every server behaviour [docs/PITFALLS.md](docs/PITFALLS.md) describes, drives
+the tools end to end, and runs the same scenarios against the fake and the
+server and requires the same answers, so the fake cannot drift from what it
+stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
+
 [CONTRIBUTING.md](CONTRIBUTING.md) says what a change is expected to carry.
 
 ---
 
 ## Limitations
 
-- **Built against gramps-webapi 3.20.1 and 3.21.1** (Gramps 6.0). Your
-  instance's `/api/openapi.json` is authoritative — check it if a call behaves
-  unexpectedly, and see [docs/PITFALLS.md](docs/PITFALLS.md) for where the API's
-  behaviour has surprised before.
+- **Requires gramps-webapi 3.21 or later** (Gramps 6.0); tested on every CI
+  run against 3.21.1 and 3.22.3. On an older server every tool answers with an
+  `unsupported_server` error naming its version: 3.20 lacks the query
+  endpoints the searches and privacy filter use. Your instance's
+  `/api/openapi.json` is authoritative — check it if a call behaves
+  unexpectedly, and see [docs/PITFALLS.md](docs/PITFALLS.md) for where the
+  API's behaviour has surprised before.
 - **No tree selector.** On gramps-webapi the tree is bound to the account you
   authenticate as; no data endpoint takes a tree parameter. To work against a
   different tree, use credentials belonging to it.
@@ -686,6 +696,7 @@ src/gramps_evidence_mcp/    the MCP server
   gedcom_ref.py             read-only reference layer over legacy GEDCOMs
   config.py                 env vars + TOML
 tests/                      against an in-memory fake; no live server needed
+  live/                     against a throwaway gramps-webapi (CI: 3.21.1, 3.22.3)
 docker/                     docker-compose for a local Gramps Web
 docs/
   ARCHITECTURE.md           how the server is put together
