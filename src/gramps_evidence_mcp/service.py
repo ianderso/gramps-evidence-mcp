@@ -6080,6 +6080,11 @@ def _normalize(object_type: str, obj: dict) -> list[str]:
       ``place_type``; 1.0.x ``add_place`` wrote ``type``, which the server
       keeps without reading. Moved into ``place_type`` when that is unset,
       dropped otherwise.
+    - A date carrying ``year``. The server adds it to every date it serves
+      but it is no field of a Gramps date: written back, it is stored, and
+      from then on served in place of the year the date holds, however the
+      date changes (``docs/PITFALLS.md`` section 24). Dropped from every
+      date; reported only when it disagreed with the date.
 
     Parameters
     ----------
@@ -6112,7 +6117,30 @@ def _normalize(object_type: str, obj: dict) -> list[str]:
             repaired.append(f"moved the stray 'type' key ({shown}) into place_type")
         else:
             repaired.append(f"dropped a stray 'type' key ({shown or 'empty'})")
+    stale = _drop_date_years(obj)
+    if stale:
+        repaired.append(
+            f"dropped {stale} stale date year{'' if stale == 1 else 's'} "
+            "the server would have shown instead of the date's own"
+        )
     return repaired
+
+
+def _drop_date_years(node: Any) -> int:
+    """Remove ``year`` from every date in an object; count those that were stale."""
+    stale = 0
+    if isinstance(node, dict):
+        dateval = node.get("dateval")
+        if "year" in node and isinstance(dateval, list):
+            year = node.pop("year")
+            if len(dateval) >= 3 and year != dateval[2]:
+                stale += 1
+        for value in node.values():
+            stale += _drop_date_years(value)
+    elif isinstance(node, list):
+        for value in node:
+            stale += _drop_date_years(value)
+    return stale
 
 
 def _append_event_ref(person: dict, ref: dict, event_type: str | None) -> None:

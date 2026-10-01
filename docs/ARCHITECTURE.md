@@ -57,9 +57,11 @@ fetched -- see [PITFALLS.md](PITFALLS.md).
 
 `_mutate()` also repairs, on every object it writes, the defects no write
 should carry forward: a family a person lists twice, which gramps-webapi's own
-family writes can create, and a stray `type` key on a place, which 1.0.x
-`add_place` wrote. So the next edit of an affected object repairs it, and no
-edit re-creates the defect. See [PITFALLS.md](PITFALLS.md) sections 15 and 18.
+family writes can create; a stray `type` key on a place, which 1.0.x
+`add_place` wrote; and a date's `year`, which the server serves, stores when
+it is written back, and then serves stale. So the next edit of an affected
+object repairs it, and no edit re-creates the defect. See
+[PITFALLS.md](PITFALLS.md) sections 15, 18 and 24.
 
 Writes are one object at a time. `POST /api/objects/` would bundle several into
 a single transaction, but per-object writes keep the Gramps undo history legible

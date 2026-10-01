@@ -1,0 +1,617 @@
+{
+  "_comment": "What gramps-webapi 3.21.1 stores for a field a request leaves out, by class, and which class each nested field holds. Written by tests/live/capture_defaults.py; checked by tests/live/test_contract_live.py.",
+  "defaults": {
+    "Address": {
+      "citation_list": [],
+      "city": "",
+      "country": "",
+      "county": "",
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "locality": "",
+      "note_list": [],
+      "phone": "",
+      "postal": "",
+      "private": false,
+      "state": "",
+      "street": ""
+    },
+    "Attribute": {
+      "citation_list": [],
+      "note_list": [],
+      "private": false,
+      "type": "Identification Number",
+      "value": ""
+    },
+    "ChildRef": {
+      "citation_list": [],
+      "frel": "Birth",
+      "mrel": "Birth",
+      "note_list": [],
+      "private": false
+    },
+    "Citation": {
+      "attribute_list": [],
+      "confidence": 2,
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "media_list": [],
+      "note_list": [],
+      "page": "",
+      "private": false,
+      "source_handle": null,
+      "tag_list": []
+    },
+    "Date": {
+      "calendar": 0,
+      "dateval": [
+        0,
+        0,
+        0,
+        false
+      ],
+      "format": null,
+      "modifier": 0,
+      "newyear": 0,
+      "quality": 0,
+      "sortval": 0,
+      "text": ""
+    },
+    "Event": {
+      "attribute_list": [],
+      "citation_list": [],
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "description": "",
+      "media_list": [],
+      "note_list": [],
+      "place": "",
+      "private": false,
+      "tag_list": [],
+      "type": "Birth"
+    },
+    "EventRef": {
+      "attribute_list": [],
+      "citation_list": [],
+      "note_list": [],
+      "private": false,
+      "role": "Primary"
+    },
+    "Family": {
+      "attribute_list": [],
+      "child_ref_list": [],
+      "citation_list": [],
+      "complete": 0,
+      "event_ref_list": [],
+      "father_handle": "",
+      "lds_ord_list": [],
+      "media_list": [],
+      "mother_handle": "",
+      "note_list": [],
+      "private": false,
+      "tag_list": [],
+      "type": "Unknown"
+    },
+    "LdsOrd": {
+      "citation_list": [],
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "famc": "",
+      "note_list": [],
+      "place": "",
+      "private": false,
+      "status": 0,
+      "temple": "",
+      "type": 0
+    },
+    "Name": {
+      "call": "",
+      "citation_list": [],
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "display_as": 0,
+      "famnick": "",
+      "first_name": "",
+      "group_as": "",
+      "nick": "",
+      "note_list": [],
+      "private": false,
+      "sort_as": 0,
+      "suffix": "",
+      "surname_list": [],
+      "title": "",
+      "type": "Birth Name"
+    },
+    "Note": {
+      "format": 0,
+      "private": false,
+      "tag_list": [],
+      "text": {
+        "string": "",
+        "tags": []
+      },
+      "type": "General"
+    },
+    "Person": {
+      "address_list": [],
+      "alternate_names": [],
+      "attribute_list": [],
+      "birth_ref_index": -1,
+      "citation_list": [],
+      "death_ref_index": -1,
+      "event_ref_list": [],
+      "family_list": [],
+      "gender": 2,
+      "lds_ord_list": [],
+      "media_list": [],
+      "note_list": [],
+      "parent_family_list": [],
+      "person_ref_list": [],
+      "primary_name": {
+        "call": "",
+        "citation_list": [],
+        "date": {
+          "calendar": 0,
+          "dateval": [
+            0,
+            0,
+            0,
+            false
+          ],
+          "format": null,
+          "modifier": 0,
+          "newyear": 0,
+          "quality": 0,
+          "sortval": 0,
+          "text": ""
+        },
+        "display_as": 0,
+        "famnick": "",
+        "first_name": "",
+        "group_as": "",
+        "nick": "",
+        "note_list": [],
+        "private": false,
+        "sort_as": 0,
+        "suffix": "",
+        "surname_list": [],
+        "title": "",
+        "type": "Birth Name"
+      },
+      "private": false,
+      "tag_list": [],
+      "urls": []
+    },
+    "PersonRef": {
+      "citation_list": [],
+      "note_list": [],
+      "private": false,
+      "rel": ""
+    },
+    "Place": {
+      "alt_loc": [],
+      "alt_names": [],
+      "citation_list": [],
+      "code": "",
+      "lat": "",
+      "long": "",
+      "media_list": [],
+      "name": {
+        "date": {
+          "calendar": 0,
+          "dateval": [
+            0,
+            0,
+            0,
+            false
+          ],
+          "format": null,
+          "modifier": 0,
+          "newyear": 0,
+          "quality": 0,
+          "sortval": 0,
+          "text": ""
+        },
+        "lang": "",
+        "value": ""
+      },
+      "note_list": [],
+      "place_type": "Unknown",
+      "placeref_list": [],
+      "private": false,
+      "tag_list": [],
+      "title": "",
+      "urls": []
+    },
+    "PlaceName": {
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "lang": "",
+      "value": ""
+    },
+    "PlaceRef": {
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      }
+    },
+    "RepoRef": {
+      "call_number": "",
+      "media_type": "Book",
+      "note_list": [],
+      "private": false
+    },
+    "Repository": {
+      "address_list": [],
+      "name": "",
+      "note_list": [],
+      "private": false,
+      "tag_list": [],
+      "type": "Library",
+      "urls": []
+    },
+    "Source": {
+      "abbrev": "",
+      "attribute_list": [],
+      "author": "",
+      "media_list": [],
+      "note_list": [],
+      "private": false,
+      "pubinfo": "",
+      "reporef_list": [],
+      "tag_list": [],
+      "title": ""
+    },
+    "SrcAttribute": {
+      "private": false,
+      "type": "Unknown",
+      "value": ""
+    },
+    "StyledText": {
+      "string": "",
+      "tags": []
+    },
+    "Surname": {
+      "connector": "",
+      "origintype": "",
+      "prefix": "",
+      "primary": true,
+      "surname": ""
+    },
+    "Tag": {
+      "color": "#000000000000",
+      "name": "",
+      "priority": 0
+    },
+    "Url": {
+      "desc": "",
+      "path": "",
+      "private": false,
+      "type": "Unknown"
+    }
+  },
+  "nested": {
+    "Address": {
+      "date": "Date"
+    },
+    "Citation": {
+      "attribute_list": [
+        "SrcAttribute"
+      ],
+      "date": "Date"
+    },
+    "Event": {
+      "attribute_list": [
+        "Attribute"
+      ],
+      "date": "Date"
+    },
+    "Family": {
+      "attribute_list": [
+        "Attribute"
+      ],
+      "child_ref_list": [
+        "ChildRef"
+      ],
+      "event_ref_list": [
+        "EventRef"
+      ]
+    },
+    "LdsOrd": {
+      "date": "Date"
+    },
+    "Name": {
+      "date": "Date",
+      "surname_list": [
+        "Surname"
+      ]
+    },
+    "Note": {
+      "text": "StyledText"
+    },
+    "Person": {
+      "address_list": [
+        "Address"
+      ],
+      "alternate_names": [
+        "Name"
+      ],
+      "attribute_list": [
+        "Attribute"
+      ],
+      "event_ref_list": [
+        "EventRef"
+      ],
+      "lds_ord_list": [
+        "LdsOrd"
+      ],
+      "person_ref_list": [
+        "PersonRef"
+      ],
+      "primary_name": "Name",
+      "urls": [
+        "Url"
+      ]
+    },
+    "Place": {
+      "alt_names": [
+        "PlaceName"
+      ],
+      "name": "PlaceName",
+      "placeref_list": [
+        "PlaceRef"
+      ],
+      "urls": [
+        "Url"
+      ]
+    },
+    "PlaceName": {
+      "date": "Date"
+    },
+    "PlaceRef": {
+      "date": "Date"
+    },
+    "Repository": {
+      "address_list": [
+        "Address"
+      ],
+      "urls": [
+        "Url"
+      ]
+    },
+    "Source": {
+      "attribute_list": [
+        "SrcAttribute"
+      ],
+      "reporef_list": [
+        "RepoRef"
+      ]
+    }
+  },
+  "nulls": {
+    "Person": {
+      "address_list": "refused",
+      "alternate_names": "refused",
+      "attribute_list": "refused",
+      "birth_ref_index": "refused",
+      "citation_list": "refused",
+      "death_ref_index": "refused",
+      "event_ref_list": "refused",
+      "family_list": "refused",
+      "gender": "refused",
+      "lds_ord_list": "refused",
+      "media_list": "refused",
+      "note_list": "refused",
+      "parent_family_list": "refused",
+      "person_ref_list": "refused",
+      "primary_name": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "urls": "refused"
+    },
+    "Family": {
+      "attribute_list": "refused",
+      "child_ref_list": "refused",
+      "citation_list": "refused",
+      "complete": 0,
+      "event_ref_list": "refused",
+      "father_handle": "",
+      "lds_ord_list": "refused",
+      "media_list": "refused",
+      "mother_handle": "",
+      "note_list": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "type": "refused"
+    },
+    "Event": {
+      "attribute_list": "refused",
+      "citation_list": "refused",
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "description": "refused",
+      "media_list": "refused",
+      "note_list": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "type": "refused"
+    },
+    "Place": {
+      "alt_loc": "refused",
+      "alt_names": "refused",
+      "citation_list": "refused",
+      "code": "refused",
+      "lat": "refused",
+      "long": "refused",
+      "media_list": "refused",
+      "name": "refused",
+      "note_list": "refused",
+      "place_type": "refused",
+      "placeref_list": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "title": "refused",
+      "urls": "refused"
+    },
+    "Source": {
+      "abbrev": "refused",
+      "attribute_list": "refused",
+      "author": "refused",
+      "media_list": "refused",
+      "note_list": "refused",
+      "private": "refused",
+      "pubinfo": "refused",
+      "reporef_list": "refused",
+      "tag_list": "refused",
+      "title": "refused"
+    },
+    "Citation": {
+      "attribute_list": "refused",
+      "confidence": "refused",
+      "date": {
+        "calendar": 0,
+        "dateval": [
+          0,
+          0,
+          0,
+          false
+        ],
+        "format": null,
+        "modifier": 0,
+        "newyear": 0,
+        "quality": 0,
+        "sortval": 0,
+        "text": ""
+      },
+      "media_list": "refused",
+      "note_list": "refused",
+      "page": "refused",
+      "private": "refused",
+      "source_handle": "refused",
+      "tag_list": "refused"
+    },
+    "Repository": {
+      "address_list": "refused",
+      "name": "refused",
+      "note_list": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "type": "refused",
+      "urls": "refused"
+    },
+    "Note": {
+      "format": "refused",
+      "private": "refused",
+      "tag_list": "refused",
+      "text": "refused",
+      "type": "refused"
+    },
+    "Tag": {
+      "color": "refused",
+      "name": "refused",
+      "priority": "refused"
+    }
+  }
+}

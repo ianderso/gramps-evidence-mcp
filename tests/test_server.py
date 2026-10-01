@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 from pathlib import Path
+
+import pytest
+import respx
 
 from gramps_evidence_mcp import server
 from gramps_evidence_mcp.client import GrampsApiError
 from gramps_evidence_mcp.config import Config, ConfigError, ReferenceFileConfig
 from gramps_evidence_mcp.gedcom_ref import ReferenceLibrary
 from gramps_evidence_mcp.service import CitationRequiredError, NotFoundError
+
+from .conftest import valid_args
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_ancestry.ged"
 
@@ -147,3 +154,72 @@ def test_a_reference_person_with_an_undated_death_is_not_withheld(tmp_path):
     entry = library.consult("Pembrook", None, withhold_living=True, current_year=2026)[0]
     assert [m["name"] for m in entry["matches"]] == ["Hattie Pembrook"]
     assert entry["withheld_count"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# The gramps-webapi version requirement
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+async def unstarted(fake, tmp_path):
+    """The tool surface as a fresh process has it: configured, not yet connected."""
+    saved = (server.state.config, server.state.client, server.state.service, server.state.library)
+    server.state.config = Config(
+        api_url="http://testserver", username="mcp", password="pw", cache_dir=tmp_path
+    )
+    server.state.client = server.state.service = server.state.library = None
+
+    async def call(tool_name: str, /, **arguments):
+        result = await server.mcp.call_tool(tool_name, arguments)
+        return json.loads(result.content[0].text)
+
+    with respx.mock(base_url="http://testserver") as router:
+        router.route().mock(side_effect=fake.handle)
+        try:
+            yield call
+        finally:
+            if server.state.client is not None:
+                await server.state.client.aclose()
+            (
+                server.state.config,
+                server.state.client,
+                server.state.service,
+                server.state.library,
+            ) = saved
+
+
+async def test_every_tool_refuses_a_server_older_than_3_21_naming_it(fake, unstarted):
+    fake.metadata["gramps_webapi"]["version"] = "3.20.1"
+    outcomes = {}
+    for tool in await server.mcp.list_tools():
+        result = await unstarted(tool.name, **valid_args(tool))
+        outcomes[tool.name] = result.get("error") if isinstance(result, dict) else None
+    refused = {name for name, error in outcomes.items() if error == "unsupported_server"}
+    needs_the_tree = {
+        name for name in outcomes if "service_()" in inspect.getsource(getattr(server, name))
+    }
+    assert refused == needs_the_tree
+    assert len(refused) >= len(outcomes) - 2
+    message = (await unstarted("list_tags"))["message"]
+    assert "3.20.1" in message and "3.21 or later" in message
+
+
+async def test_an_upgraded_server_is_used_on_the_next_call(fake, unstarted):
+    fake.metadata["gramps_webapi"]["version"] = "3.20.1"
+    assert (await unstarted("list_tags"))["error"] == "unsupported_server"
+    fake.metadata["gramps_webapi"]["version"] = "3.21.0"
+    assert "error" not in await unstarted("list_tags")
+
+
+@pytest.mark.parametrize("version", ["3.21.0", "3.22.3", "4.0.0.dev1", "", None])
+async def test_a_current_or_unstated_version_is_accepted(fake, unstarted, version):
+    if version is None:
+        del fake.metadata["gramps_webapi"]
+    else:
+        fake.metadata["gramps_webapi"]["version"] = version
+    assert "error" not in await unstarted("list_tags")
+
+
+async def test_an_unreadable_version_is_retried_rather_than_remembered(fake, unstarted):
+    fake.metadata_error = 503
+    assert (await unstarted("list_tags"))["error"] == "api"
+    assert "error" not in await unstarted("list_tags")
