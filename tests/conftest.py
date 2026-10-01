@@ -9,12 +9,15 @@ GrampsWebClient + GrampsService orchestration end-to-end.
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import itertools
 import json
 import os
 import re
 import socket
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -38,6 +41,120 @@ _GID_PREFIX = {
     "note": "N",
     "tag": "T",
 }
+
+
+#: What gramps-webapi stores for a field a request leaves out, by class, and
+#: which class each nested field holds. Recorded from a real server by
+#: tests/live/capture_defaults.py; tests/live/test_contract_live.py checks it
+#: against one.
+_SERVER_SHAPES = json.loads(
+    (Path(__file__).parent / "fixtures" / "server_defaults.json").read_text()
+)
+
+
+def _complete(cls: str | None, value: Any) -> Any:
+    """Store an object as the server does: every field its class has, no ``_class``.
+
+    The server builds a Gramps object from what it is sent, so a field the
+    request leaves out is stored with its default, inside nested objects too,
+    and a key the class does not have is kept as sent (docs/PITFALLS.md
+    section 18). A date's sort value is recomputed whatever was sent.
+    """
+    if not isinstance(value, dict):
+        return value
+    cls = value.get("_class") or cls
+    out = copy.deepcopy(_SERVER_SHAPES["defaults"].get(cls or "", {}))
+    nested = _SERVER_SHAPES["nested"].get(cls or "", {})
+    for key, item in value.items():
+        if key == "_class":
+            continue
+        kind = nested.get(key)
+        if isinstance(kind, list) and isinstance(item, list):
+            item = [_complete(kind[0], entry) for entry in item]
+        elif isinstance(kind, str):
+            item = _complete(kind, item)
+        out[key] = item
+    if cls == "Date":
+        out["sortval"] = _sortval(out)
+    return out
+
+
+def _admit(cls: str, payload: dict) -> httpx.Response | None:
+    """Refuse a null the server refuses; store what it stores for the rest.
+
+    The server validates a write against Gramps' schema: most top-level
+    fields sent as null are refused with 400, a family's parent handles are
+    stored as "", a date as the empty date. Edits ``payload`` in place;
+    returns the refusal, or None.
+    """
+    for key, value in list(payload.items()):
+        if value is not None:
+            continue
+        rule = _SERVER_SHAPES["nulls"].get(cls, {}).get(key)
+        if rule == "refused":
+            return httpx.Response(
+                400,
+                json={
+                    "code": 400,
+                    "message": f"Error while processing object: $.{key}: None is not of "
+                    "the type the schema requires",
+                },
+            )
+        if rule is not None:
+            payload[key] = copy.deepcopy(rule)
+    return None
+
+
+def _sortval(date: dict) -> int:
+    """Gramps' sort value for a Gregorian date: the day number of its start.
+
+    A zero day or month counts as the first (``Date._zero_adjust_ymd``); a
+    date with no year, month or day sorts as 0. Other calendars keep what was
+    sent, which no test relies on.
+    """
+    dateval = date.get("dateval") or []
+    if len(dateval) < 3 or not any(dateval[:3]):
+        return 0
+    if date.get("calendar", 0) != 0:
+        return date.get("sortval", 0)
+    day, month, year = (int(v or 0) for v in dateval[:3])
+    year, month, day = year or 1, max(month, 1), max(day, 1)
+    # gramps.gen.lib.gcalendar.gregorian_sdn
+    year += 4801 if year < 0 else 4800
+    if month > 2:
+        month -= 3
+    else:
+        month += 9
+        year -= 1
+    return (
+        ((year // 100) * 146097) // 4
+        + ((year % 100) * 1461) // 4
+        + (month * 153 + 2) // 5
+        + day
+        - 32045
+    )
+
+
+def _sort_key(value: Any) -> tuple:
+    """Order as SQL does: missing values first, then by value."""
+    return (value is not None, value if value is not None else 0)
+
+
+def _served(value: Any) -> Any:
+    """An object as the server serves it: no ``_class``, and a ``year`` on every date.
+
+    The year is added only where none is stored, so a year a client wrote
+    back is served even after the date changes (docs/PITFALLS.md section 24).
+    """
+    if isinstance(value, dict):
+        out = {k: _served(v) for k, v in value.items() if k != "_class"}
+        dateval = value.get("dateval")
+        if isinstance(dateval, list) and "year" not in out:
+            out["year"] = dateval[2] if len(dateval) >= 3 else 0
+        return out
+    if isinstance(value, list):
+        return [_served(v) for v in value]
+    return value
 
 
 class FakeGramps:
@@ -308,27 +425,18 @@ class FakeGramps:
                 return httpx.Response(404, json={"message": "unknown collection"})
             body = json.loads(request.content or b"{}")
             self.query_bodies.append((typ_q, body))
-            rows = list(self.query_rows.get(typ_q, []))
-            handle_in = next(
-                (
-                    w["value"]
-                    for w in body.get("where") or []
-                    if w.get("column") == "handle" and w.get("op") == "in"
-                ),
-                None,
-            )
-            if handle_in is not None and typ_q not in self.query_rows:
-                # Answered from the store, as the engine would: the privacy
-                # lookups select dates for a batch of handles this way.
-                rows = [
-                    self._project(typ_q, self.store[typ_q][h], body.get("select") or [])
-                    for h in handle_in
-                    if h in self.store[typ_q]
-                ]
+            if typ_q in self.query_rows:
+                # Canned, for tests of what the service does with an answer.
+                rows = list(self.query_rows[typ_q])
+                total = len(rows)
+            else:
+                matched = self._query(typ_q, body)
+                total = len(matched)
+                rows = matched[: body.get("limit") or None]
             return httpx.Response(
                 200,
                 json={"items": rows, "next_after": self.query_cursor},
-                headers={"X-Total-Count": str(len(rows))},
+                headers={"X-Total-Count": str(total)},
             )
         if path == "/api/reports/" and method == "GET":
             return httpx.Response(200, json=self.reports)
@@ -414,9 +522,14 @@ class FakeGramps:
             out = []
             for item in payloads:
                 typ = _CLASS_TO_TYPE.get(item.get("_class", ""), "note")
-                obj = dict(item)
+                admitted = dict(item)
+                refused = _admit(_TYPE_TO_CLASS[typ], admitted)
+                if refused is not None:
+                    return refused
+                obj = _complete(_TYPE_TO_CLASS[typ], admitted)
                 obj["handle"] = self._new_handle()
                 obj.setdefault("gramps_id", self._new_gid(typ))
+                obj["change"] = int(time.time())
                 self.store[typ][obj["handle"]] = obj
                 out.extend(self._change_record(typ, obj, "add"))
             return httpx.Response(201, json=out)
@@ -474,9 +587,15 @@ class FakeGramps:
         if self.write_forbidden:
             return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
         payload = json.loads(request.content or b"{}")
-        obj = dict(payload)
+        admitted = dict(payload)
+        refused = _admit(_TYPE_TO_CLASS[typ], admitted)
+        if refused is not None:
+            return refused
+        obj = _complete(_TYPE_TO_CLASS[typ], admitted)
         obj["handle"] = self._new_handle()
-        obj.setdefault("gramps_id", self._new_gid(typ))
+        if typ != "tag":  # a tag has a name and a handle, no gramps_id
+            obj.setdefault("gramps_id", self._new_gid(typ))
+        obj["change"] = int(time.time())
         self.store[typ][obj["handle"]] = obj
         self.requests.append(("POST", typ, payload))
         if typ == "family":
@@ -489,12 +608,17 @@ class FakeGramps:
         if self.put_error:
             return httpx.Response(self.put_error, json={"message": "write failed"})
         payload = json.loads(request.content or b"{}")
-        obj = {k: v for k, v in payload.items() if k not in _COMPUTED_KEYS}
-        obj["handle"] = handle
+        sent = {k: v for k, v in payload.items() if k not in _COMPUTED_KEYS}
+        refused = _admit(_TYPE_TO_CLASS[typ], sent)
+        if refused is not None:
+            return refused
         previous = self.store[typ].get(handle) or {}
-        dropped = sorted(set(previous) - set(obj) - _COMPUTED_KEYS)
+        dropped = sorted(set(previous) - set(sent) - _COMPUTED_KEYS - {"handle", "change"})
         if dropped:
             self.partial_writes.append((typ, handle, dropped))
+        obj = _complete(_TYPE_TO_CLASS[typ], sent)
+        obj["handle"] = handle
+        obj["change"] = int(time.time())
         self.store[typ][handle] = obj
         self.requests.append(("PUT", typ, payload))
         if typ == "family":
@@ -620,7 +744,7 @@ class FakeGramps:
         obj = self.store[typ].get(handle)
         if obj is None:
             return httpx.Response(404, json={"message": "not found"})
-        out = self._with_profile(typ, obj)
+        out = _served(self._with_profile(typ, obj, params))
         if params is not None and params.get("backlinks"):
             out = dict(out)
             out["backlinks"] = self._backlinks_for(handle)
@@ -638,7 +762,7 @@ class FakeGramps:
             gid = params["gramps_id"]
             for obj in self.store[typ].values():
                 if obj.get("gramps_id") == gid:
-                    out = self._with_profile(typ, obj)
+                    out = _served(self._with_profile(typ, obj, params))
                     if params.get("backlinks"):
                         out = dict(out, backlinks=self._backlinks_for(obj["handle"]))
                     if params.get("keys"):
@@ -646,7 +770,7 @@ class FakeGramps:
                         out = {k: v for k, v in out.items() if k in wanted}
                     return httpx.Response(200, json=[out])
             return httpx.Response(404, json={"message": "not found"})
-        objs = [self._with_profile(typ, o) for o in self.store[typ].values()]
+        objs = [_served(self._with_profile(typ, o, params)) for o in self.store[typ].values()]
         if "handles" in params:
             wanted = set(params["handles"].split(","))
             objs = [o for o in objs if o["handle"] in wanted]
@@ -696,16 +820,95 @@ class FakeGramps:
             )
         return matches
 
+    def _query(self, typ: str, body: dict) -> list[dict]:
+        """Answer a structured query from the store: where, order_by, select.
+
+        The engine's operators over named columns and json_paths, with SQL's
+        answer for a missing value (it matches no comparison). Named columns
+        are the object's own top-level fields plus a person's ``surname`` and
+        ``given_name``; the server has more, which no test uses.
+        """
+        found = list(self.store[typ].values())
+        for cond in body.get("where") or []:
+            found = [o for o in found if self._holds(typ, o, cond)]
+        for key in reversed(body.get("order_by") or []):
+            found.sort(
+                key=lambda o, k=key: _sort_key(self._column(typ, o, k["column"])),
+                reverse=key.get("direction") == "desc",
+            )
+        select = body.get("select") or ["handle", "gramps_id"]
+        return [self._project(typ, o, select) for o in found]
+
+    def _column(self, typ: str, obj: dict, column: Any) -> Any:
+        """A named column or a json_path, as the engine reads it from storage."""
+        if isinstance(column, dict):
+            return self._walk(typ, obj, list(column["json_path"]))
+        if typ == "person" and column in ("surname", "given_name"):
+            name = obj.get("primary_name") or {}
+            if column == "given_name":
+                return name.get("first_name")
+            surnames = name.get("surname_list") or []
+            primary = next(
+                (s for s in surnames if s.get("primary")), surnames[0] if surnames else {}
+            )
+            return primary.get("surname")
+        return obj.get(column)
+
+    def _holds(self, typ: str, obj: dict, cond: dict) -> bool:
+        value = self._column(typ, obj, cond["column"])
+        if "value_column" in cond:
+            target = self._column(typ, obj, cond["value_column"])
+        else:
+            target = cond.get("value")
+        op = cond.get("op", "eq")
+        if value is None or (target is None and op not in ("eq", "ne")):
+            return False
+        if op == "eq":
+            return value == target
+        if op == "ne":
+            return value != target
+        if op in ("lt", "lte", "gt", "gte"):
+            try:
+                return {
+                    "lt": value < target,
+                    "lte": value <= target,
+                    "gt": value > target,
+                    "gte": value >= target,
+                }[op]
+            except TypeError:
+                return False
+        if op == "in":
+            return value in (target or [])
+        if op == "contains":
+            return isinstance(value, (str, list)) and target in value
+        if op == "like":
+            pattern = re.escape(str(target)).replace("%", ".*").replace("_", ".")
+            return re.fullmatch(pattern, str(value), re.IGNORECASE | re.DOTALL) is not None
+        if op == "regex":
+            return re.search(str(target), str(value)) is not None
+        raise AssertionError(f"the fake's query engine has no operator {op!r}")
+
     def _project(self, typ: str, obj: dict, select: list) -> dict:
         """Answer a structured-query ``select`` for one stored object."""
         row: dict = {}
         for entry in select:
             if isinstance(entry, str):
-                row[entry] = obj.get(entry)
+                row[entry] = self._column(typ, obj, entry)
                 continue
             path = list(entry["json_path"])
             row[entry.get("as") or ".".join(map(str, path))] = self._walk(typ, obj, path)
         return row
+
+    def _stored_event_type(self, label: str) -> dict:
+        """An event type as stored: a standard one by number, a custom one by name.
+
+        The API serves ``"Birth"``; the engine reads ``{"string": "", "value": 12}``
+        (docs/PITFALLS.md section 12).
+        """
+        for value, name in self.event_type_map.items():
+            if name == label and value != "0":
+                return {"string": "", "value": int(value)}
+        return {"string": label, "value": 0}
 
     def _walk(self, typ: str, obj: dict, path: list) -> Any:
         """Follow a json_path, crossing the relationships the engine crosses.
@@ -716,7 +919,9 @@ class FakeGramps:
         node: Any = obj
         kind = typ
         for step in path:
-            if not isinstance(node, dict):
+            if not isinstance(node, (dict, list)) or (
+                isinstance(node, list) != isinstance(step, int)
+            ):
                 return None
             if kind == "person" and step in ("birth", "death"):
                 index = node.get(f"{step}_ref_index", -1)
@@ -728,14 +933,29 @@ class FakeGramps:
             elif kind == "family" and step in ("father", "mother"):
                 node = self.store["person"].get(node.get(f"{step}_handle") or "")
                 kind = "person"
+            elif isinstance(step, int):
+                node = (
+                    node[step]
+                    if isinstance(node, list) and -len(node) <= step < len(node)
+                    else None
+                )
             else:
                 node = node.get(step)
+                if kind == "event" and step == "type" and isinstance(node, str):
+                    node = self._stored_event_type(node)
         return node
 
-    def _with_profile(self, typ: str, obj: dict) -> dict:
-        """Attach the computed profile/extended blocks the real API would add."""
+    def _with_profile(self, typ: str, obj: dict, params: Any = None) -> dict:
+        """Attach the computed profile/extended blocks, when asked for as the API requires.
+
+        The server adds ``profile`` only for a ``profile=`` request and
+        ``extended`` only for an ``extend=`` one; a tool reading either
+        without asking gets nothing from a real server, so it gets nothing
+        here either.
+        """
         out = dict(obj)
-        if typ == "person":
+        params = params or {}
+        if typ == "person" and (params.get("profile") or params.get("extend")):
             profile = {"name": _display_name(obj)}
             events = []
             for ev_ref in obj.get("event_ref_list", []):
@@ -749,8 +969,10 @@ class FakeGramps:
                     profile["birth"] = {"date": str(year) if year else ""}
                 if etype == "Death":
                     profile["death"] = {"date": str(year) if year else ""}
-            out["profile"] = profile
-            out["extended"] = {"events": events}
+            if params.get("profile"):
+                out["profile"] = profile
+            if params.get("extend"):
+                out["extended"] = {"events": events}
         return out
 
 
@@ -770,6 +992,7 @@ _CLASS_TO_TYPE = {
     "Note": "note",
     "Tag": "tag",
 }
+_TYPE_TO_CLASS = {typ: cls for cls, typ in _CLASS_TO_TYPE.items()}
 
 
 def _references(node: Any, handle: str) -> bool:

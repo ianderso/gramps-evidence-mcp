@@ -9,6 +9,10 @@ Two were found in a research session against a live tree:
   so the place stayed Unknown while ``get_place`` reported the type it was
   asked for.
 
+A third was found by the live suite: a date's ``year``, which the server adds
+to what it serves, stores when it is written back, and from then on serves in
+place of the date's own year.
+
 Each is repaired by the next write of the object, and no write re-creates it.
 """
 
@@ -247,3 +251,44 @@ async def test_a_bad_row_does_not_end_a_sweep(tools):
         items=[{"citation": ".", "page": "x"}, {"citation": good["gramps_id"], "page": "p. 2"}],
     )
     assert [r["status"] for r in out["rows"]] == ["error", "applied"]
+
+
+# --------------------------------------------------------------------------- #
+# a date's served year, written back
+# --------------------------------------------------------------------------- #
+async def test_a_stale_date_year_is_dropped_and_reported(service, fake):
+    person = await _person(service)
+    added = await service.add_event_to_person(
+        person["gramps_id"], EventInput(type="Residence", date="1860"), require_citation=False
+    )
+    event = fake.store["event"][added["event_handle"]]
+    event["date"]["year"] = 1850  # written back by a client before the date changed
+
+    result = await service.update_event(added["event_handle"], description="Census")
+
+    assert "year" not in fake.store["event"][added["event_handle"]]["date"]
+    assert result["repaired"] == [
+        "dropped 1 stale date year the server would have shown instead of the date's own"
+    ]
+
+
+async def test_a_current_date_year_is_dropped_without_a_word(service, fake):
+    person = await _person(service)
+    stored = fake.store["person"][person["handle"]]
+    stored["primary_name"]["date"] = {"dateval": [0, 0, 1850, False], "year": 1850}
+
+    result = await service.update_person(person["gramps_id"], gender=Gender.female)
+
+    assert "year" not in fake.store["person"][person["handle"]]["primary_name"]["date"]
+    assert "repaired" not in result
+
+
+async def test_a_current_date_year_alone_does_not_cause_a_write(service, fake):
+    person = await _person(service)
+    fake.store["person"][person["handle"]]["primary_name"]["date"] = {
+        "dateval": [0, 0, 1850, False],
+        "year": 1850,
+    }
+    before = _puts(fake, "person")
+    assert (await service.update_person(person["gramps_id"]))["changed"] is False
+    assert _puts(fake, "person") == before

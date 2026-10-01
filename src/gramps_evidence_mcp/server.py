@@ -23,7 +23,13 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import __version__
-from .client import ENDPOINTS, GrampsApiError, GrampsWebClient, InvalidIdentifierError
+from .client import (
+    ENDPOINTS,
+    GrampsApiError,
+    GrampsWebClient,
+    InvalidIdentifierError,
+    UnsupportedServerError,
+)
 from .config import Config, ConfigError, load_config, transport_settings
 from .gedcom_ref import ReferenceLibrary
 from .models import (
@@ -115,15 +121,18 @@ class _State:
             if self.service is None:
                 cfg = self.config or load_config()
                 self.config = cfg
-                client = GrampsWebClient(
-                    cfg.api_url,
-                    cfg.username,
-                    cfg.password,
-                    timeout=cfg.request_timeout,
-                )
-                await client.login()
-                self.client = client
-                self.service = GrampsService(client, cfg)
+                if self.client is None:
+                    client = GrampsWebClient(
+                        cfg.api_url,
+                        cfg.username,
+                        cfg.password,
+                        timeout=cfg.request_timeout,
+                    )
+                    await client.login()
+                    self.client = client
+                # Checked until it passes, so an upgrade needs no restart.
+                await self.client.require_supported_server()
+                self.service = GrampsService(self.client, cfg)
             return self.service
 
     def library_(self) -> ReferenceLibrary:
@@ -155,6 +164,8 @@ def _error(exc: Exception) -> dict:
         return {"error": "unknown_type", "message": str(exc)}
     if isinstance(exc, InvalidCarryTargetError):
         return {"error": "invalid_carry_to", "message": str(exc)}
+    if isinstance(exc, UnsupportedServerError):
+        return {"error": "unsupported_server", "message": str(exc)}
     if isinstance(exc, GrampsApiError):
         hint = ""
         if exc.status in (401, 403):
