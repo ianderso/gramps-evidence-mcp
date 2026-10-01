@@ -76,6 +76,42 @@ class NameParts(_StrictInput):
     call: str = Field(default="", description="Call name (the given name actually used).")
 
 
+class NameMatch(_StrictInput):
+    """Which of a person's names. Every field given must match, ignoring case.
+
+    get_person lists the names: the primary, and each alternate with its index.
+    """
+
+    given: str | None = Field(default=None, description="Given name(s) as stored.")
+    surname: str | None = Field(default=None, description="Surname as stored.")
+    type: str | None = Field(
+        default=None,
+        description="Name type: 'Birth Name', 'Also Known As', 'Married Name', ...",
+    )
+    primary: bool | None = Field(
+        default=None,
+        description="True: the primary name only. False: alternate names only.",
+    )
+    index: int | None = Field(
+        default=None,
+        ge=0,
+        description="Position among the alternate names, as get_person lists them. "
+        "Only needed to tell identical duplicates apart.",
+    )
+
+    @model_validator(mode="after")
+    def _says_something(self) -> NameMatch:
+        if (
+            self.primary is None
+            and self.index is None
+            and not any((self.given, self.surname, self.type))
+        ):
+            raise ValueError(
+                "NameMatch needs at least one of: given, surname, type, primary, index."
+            )
+        return self
+
+
 class CitationInput(_StrictInput):
     """How to cite a fact. Either reference an existing citation, or create one.
 
@@ -138,8 +174,10 @@ class EventInput(_StrictInput):
     )
     date: str | None = Field(
         default=None,
-        description="Date, free text in Gramps style: '1899', '12 JAN 1899', "
-        "'ABT 1900', 'BET 1898 AND 1901', 'BEF 1950'.",
+        description="Date, Gramps style: '1899', '12 JAN 1899', 'ABT 1900', "
+        "'BEF 1950'; 'BET 1898 AND 1901' happened once within the range; "
+        "'FROM 1864 TO 1865' lasted the whole span; 'FROM 1880' or 'TO 1890' is "
+        "open at one end.",
     )
     place: str | None = Field(
         default=None,
@@ -152,6 +190,31 @@ class EventInput(_StrictInput):
     description: str | None = Field(default=None, description="Free-text description.")
     citation: CitationInput | None = Field(
         default=None, description="Citation supporting this event (see require_citation)."
+    )
+
+
+class CitationEdit(_StrictInput):
+    """One row of update_citations: which citation, and what to set on it."""
+
+    citation: str = Field(description="Citation handle or gramps_id, e.g. 'C0001'.")
+    page: str | None = Field(default=None, description="New locator. Omit to keep.")
+    confidence: Confidence | None = Field(default=None, description="New grading. Omit to keep.")
+    expect_page_prefix: str | None = Field(
+        default=None,
+        description="Refuse this row unless the live page still starts with this, so a "
+        "page edited since the sweep was planned is reported, not overwritten.",
+    )
+
+
+class RepositoryLink(_StrictInput):
+    """One row of link_repositories."""
+
+    source: str = Field(description="Source handle or gramps_id, e.g. 'S0001'.")
+    repository: str = Field(description="Repository handle or gramps_id, e.g. 'R0001'.")
+    call_number: str | None = Field(default=None, description="Call number in that repository.")
+    media_type: str = Field(
+        default="Unknown",
+        description="Medium of the source there: 'Book', 'Microfilm', 'Electronic', ...",
     )
 
 

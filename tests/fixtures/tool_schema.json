@@ -1,5 +1,6 @@
 {
   "add_alternate_name": [
+    "citation",
     "given",
     "name_prefix",
     "name_suffix",
@@ -28,6 +29,11 @@
     "match",
     "person",
     "segments"
+  ],
+  "add_event_ref": [
+    "event",
+    "person",
+    "role"
   ],
   "add_event_to_family": [
     "event",
@@ -86,6 +92,7 @@
     "abbreviation",
     "author",
     "call_number",
+    "media_type",
     "publication_info",
     "repository",
     "title"
@@ -110,6 +117,10 @@
     "target",
     "target_type"
   ],
+  "check_family_links": [
+    "include_private",
+    "limit"
+  ],
   "cite_child_link": [
     "child",
     "citation",
@@ -121,6 +132,7 @@
   ],
   "cite_object": [
     "citation",
+    "name",
     "object_type",
     "ref"
   ],
@@ -152,10 +164,12 @@
     "namespace"
   ],
   "delete_object": [
+    "carry_to",
     "object_type",
     "target"
   ],
   "detach_object": [
+    "call_number",
     "child",
     "child_kind",
     "delete_if_orphan",
@@ -261,6 +275,9 @@
     "include_raw",
     "person"
   ],
+  "link_repositories": [
+    "items"
+  ],
   "link_repository": [
     "call_number",
     "media_type",
@@ -290,6 +307,7 @@
   "merge_objects": [
     "drop",
     "dry_run",
+    "enclosures",
     "keep",
     "object_type"
   ],
@@ -349,8 +367,10 @@
     "target"
   ],
   "uncite": [
+    "carry_to",
     "citation",
     "delete_if_orphan",
+    "name",
     "object_type",
     "ref"
   ],
@@ -359,6 +379,23 @@
     "force",
     "transaction_id"
   ],
+  "update_alternate_name": [
+    "given",
+    "match",
+    "name_prefix",
+    "name_suffix",
+    "name_type",
+    "nickname",
+    "person",
+    "remove",
+    "surname"
+  ],
+  "update_child_ref": [
+    "child",
+    "family",
+    "frel",
+    "mrel"
+  ],
   "update_citation": [
     "citation",
     "confidence",
@@ -366,10 +403,17 @@
     "page",
     "source"
   ],
+  "update_citations": [
+    "items"
+  ],
   "update_event": [
+    "allow_new_type",
+    "clear_date",
+    "clear_place",
     "date",
     "description",
     "event",
+    "event_type",
     "place"
   ],
   "update_media": [
@@ -385,9 +429,11 @@
   ],
   "update_person": [
     "gender",
+    "keep_old_as_alternate",
     "name",
     "person",
-    "private"
+    "private",
+    "reason"
   ],
   "update_place": [
     "code",

@@ -51,9 +51,21 @@ def confidence_label(value: int | None) -> str:
 
 
 # ---- Date parsing -----------------------------------------------------------
-# Gramps Date constants (see gramps.gen.lib.date).
+# Gramps Date constants (see gramps.gen.lib.date). MOD_FROM and MOD_TO arrived
+# in Gramps 5.2: an open-ended "from 1880" or "to 1890". gramps-webapi 3.21.1
+# requires 4 dateval entries for them and 8 for a range or span.
 CAL_GREGORIAN = 0
-MOD_NONE, MOD_BEFORE, MOD_AFTER, MOD_ABOUT, MOD_RANGE, MOD_SPAN, MOD_TEXTONLY = range(7)
+(
+    MOD_NONE,
+    MOD_BEFORE,
+    MOD_AFTER,
+    MOD_ABOUT,
+    MOD_RANGE,
+    MOD_SPAN,
+    MOD_TEXTONLY,
+    MOD_FROM,
+    MOD_TO,
+) = range(9)
 QUAL_NONE, QUAL_ESTIMATED, QUAL_CALCULATED = 0, 1, 2
 
 _MONTHS = {
@@ -88,8 +100,8 @@ _MODIFIER_WORDS = {
     "circa": MOD_ABOUT,
     "ca": MOD_ABOUT,
     "c": MOD_ABOUT,
-    "from": MOD_NONE,
-    "to": MOD_NONE,
+    "from": MOD_FROM,
+    "to": MOD_TO,
 }
 
 
@@ -166,18 +178,27 @@ def _parse_ymd(token_str: str) -> tuple[int, int, int] | None:
     return day, month, year
 
 
-def parse_date(text: str | None) -> dict:
+def parse_date(text: str | None, *, open_spans: bool = True) -> dict:
     """Build a Gramps ``Date`` dict from free text.
 
-    Recognises exact dates (``"12 Jan 1899"``, ``"Jan 1899"``, ``"1899"``),
-    qualifiers (``"ABT 1900"``, ``"BEF 1950"``, ``"AFT 1850"``), ranges
-    (``"BET 1898 AND 1901"``) and estimated or calculated quality
-    (``"EST 1900"``, ``"CAL 1900"``).
+    Recognises exact dates (``"12 Jan 1899"``, ``"Jan 1899"``, ``"1899"``,
+    ``"1899-01-12"``), qualifiers (``"ABT 1900"``, ``"BEF 1950"``,
+    ``"AFT 1850"``), estimated or calculated quality (``"EST 1900"``,
+    ``"CAL 1900"``), and the two kinds of interval Gramps distinguishes:
+
+    - a range, ``"BET 1898 AND 1901"``: it happened once, somewhere in it;
+    - a span, ``"FROM 1864 TO 1865"``: it lasted the whole of it.
+
+    A lone ``"FROM 1880"`` or ``"TO 1890"`` is a span open at one end.
 
     Parameters
     ----------
     text : str or None
         The date as written. None or empty yields an empty Date.
+    open_spans : bool, optional
+        Whether the server stores a lone "from" or "to" (Gramps 5.2 and
+        later). When False such a date is kept as text, never as a plain
+        date with the word dropped.
 
     Returns
     -------
@@ -193,31 +214,43 @@ def parse_date(text: str | None) -> dict:
     quality = QUAL_NONE
     if work.startswith(("est ", "estimated ")):
         quality = QUAL_ESTIMATED
-        work = work.split(" ", 1)[1]
+        work = work.split(" ", 1)[1].strip()
     elif work.startswith(("cal ", "calculated ")):
         quality = QUAL_CALCULATED
-        work = work.split(" ", 1)[1]
+        work = work.split(" ", 1)[1].strip()
 
-    # Range: "BET x AND y" or "x - y".
-    m = re.match(r"(?:bet|between)\s+(.*?)\s+and\s+(.*)", work)
-    if not m:
-        m = re.match(r"(?:from)\s+(.*?)\s+to\s+(.*)", work)
-    if m:
-        start = _parse_ymd(m.group(1))
-        stop = _parse_ymd(m.group(2))
-        if start and stop:
-            d = _empty_date()
-            d["modifier"] = MOD_RANGE
-            d["quality"] = quality
-            d["dateval"] = [start[0], start[1], start[2], False, stop[0], stop[1], stop[2], False]
-            return d
-        return _text_date(raw)
+    for pattern, compound in (
+        (r"(?:bet|between)\.?\s+(.*?)\s+and\s+(.*)", MOD_RANGE),
+        (r"from\s+(.*?)\s+to\s+(.*)", MOD_SPAN),
+    ):
+        m = re.fullmatch(pattern, work)
+        if m:
+            start = _parse_ymd(m.group(1))
+            stop = _parse_ymd(m.group(2))
+            if start and stop:
+                d = _empty_date()
+                d["modifier"] = compound
+                d["quality"] = quality
+                d["dateval"] = [
+                    start[0],
+                    start[1],
+                    start[2],
+                    False,
+                    stop[0],
+                    stop[1],
+                    stop[2],
+                    False,
+                ]
+                return d
+            return _text_date(raw)
 
     modifier = MOD_NONE
     first = work.split(" ", 1)[0].strip(".")
     if first in _MODIFIER_WORDS:
         modifier = _MODIFIER_WORDS[first]
-        work = work[len(first) :].strip()
+        work = work[len(first) :].strip().lstrip(".").strip()
+        if modifier in (MOD_FROM, MOD_TO) and not open_spans:
+            return _text_date(raw)
 
     parsed = _parse_ymd(work)
     if parsed is None:
@@ -228,6 +261,81 @@ def parse_date(text: str | None) -> dict:
     d["quality"] = quality
     d["dateval"] = [day, month, year, False]
     return d
+
+
+def is_open_span(text: str | None) -> bool:
+    """Whether ``text`` parses as a span open at one end ("from X", "to X")."""
+    return parse_date(text)["modifier"] in (MOD_FROM, MOD_TO)
+
+
+#: Gramps' English date displayer, with the ISO date format.
+_MODIFIER_TEXT = {
+    MOD_BEFORE: "before ",
+    MOD_AFTER: "after ",
+    MOD_ABOUT: "about ",
+    MOD_FROM: "from ",
+    MOD_TO: "to ",
+}
+_QUALITY_TEXT = {QUAL_ESTIMATED: "estimated ", QUAL_CALCULATED: "calculated "}
+_CALENDARS = {
+    1: "Julian",
+    2: "Hebrew",
+    3: "French Republican",
+    4: "Persian",
+    5: "Islamic",
+    6: "Swedish",
+}
+
+
+def _iso(day: Any, month: Any, year: Any) -> str:
+    """One date in Gramps' ISO display format: ``1899``, ``1899-01``, ``1899-01-12``."""
+    out = f"{int(year):04d}" if year else "????"
+    if month:
+        out += f"-{int(month):02d}"
+        if day:
+            out += f"-{int(day):02d}"
+    elif day:
+        out += f"-??-{int(day):02d}"
+    return out
+
+
+def date_display(date: dict | None) -> str | None:
+    """Render a Gramps ``Date`` dict as Gramps displays it, in English.
+
+    Every part of the date that carries meaning is shown: the modifier
+    (``"about 1900"``), the quality (``"estimated 1900"``), both ends of a
+    range or span (``"between 1882 and 1883"``, ``"from 1864-05-04 to
+    1864-09-16"``), and a calendar other than Gregorian. Showing only the
+    first year of a range would state a precision the tree does not hold.
+
+    Parameters
+    ----------
+    date : dict or None
+        A Gramps ``Date`` dict.
+
+    Returns
+    -------
+    str or None
+        The rendering, or None for an empty date.
+    """
+    if not isinstance(date, dict):
+        return None
+    modifier = date.get("modifier") or MOD_NONE
+    text = (date.get("text") or "").strip()
+    dateval = date.get("dateval") or []
+    if modifier == MOD_TEXTONLY:
+        return text or None
+    if not isinstance(dateval, list) or len(dateval) < 3 or not any(dateval[:3]):
+        return text or None
+    start = _iso(*dateval[:3])
+    if modifier in (MOD_RANGE, MOD_SPAN) and len(dateval) >= 7:
+        stop = _iso(*dateval[4:7])
+        body = f"between {start} and {stop}" if modifier == MOD_RANGE else f"from {start} to {stop}"
+    else:
+        body = _MODIFIER_TEXT.get(modifier, "") + start
+    out = _QUALITY_TEXT.get(date.get("quality") or QUAL_NONE, "") + body
+    calendar = _CALENDARS.get(date.get("calendar") or CAL_GREGORIAN)
+    return f"{out} ({calendar})" if calendar else out
 
 
 def year_from_date_dict(date: dict | None) -> int | None:
@@ -317,7 +425,7 @@ def person_payload(name: NameParts, gender: Gender) -> dict:
 
 def event_payload(
     event_type: str,
-    date: str | None,
+    date: str | dict | None,
     place_handle: str | None,
     description: str | None,
     citation_handles: list[str],
@@ -328,8 +436,9 @@ def event_payload(
     ----------
     event_type : str
         Plain English event type, e.g. ``"Birth"``. Coerced server-side.
-    date : str or None
-        Date as free text; parsed by :func:`parse_date`.
+    date : str, dict or None
+        Date as free text, parsed by :func:`parse_date`, or a Date dict
+        already parsed.
     place_handle : str or None
         Handle of an existing place. Omitted from the payload when None.
     description : str or None
@@ -345,7 +454,7 @@ def event_payload(
     payload: dict[str, Any] = {
         "_class": "Event",
         "type": event_type,  # string; server coerces to EventType
-        "date": parse_date(date),
+        "date": date if isinstance(date, dict) else parse_date(date),
         "citation_list": list(citation_handles),
     }
     if place_handle:
@@ -370,7 +479,7 @@ def citation_payload(
     source_handle: str,
     page: str,
     confidence: Confidence,
-    date: str | None,
+    date: str | dict | None,
     note_handles: list[str] | None = None,
 ) -> dict:
     """Build a Gramps ``Citation`` payload.
@@ -383,8 +492,8 @@ def citation_payload(
         Where in the source the fact appears.
     confidence : Confidence
         How strongly the source supports the fact.
-    date : str or None
-        Date the source was recorded or accessed.
+    date : str, dict or None
+        Date the source was recorded or accessed, as text or a parsed Date.
     note_handles : list of str, optional
         Notes to attach.
 
@@ -398,7 +507,7 @@ def citation_payload(
         "source_handle": source_handle,
         "page": page,
         "confidence": confidence_to_int(confidence),
-        "date": parse_date(date),
+        "date": date if isinstance(date, dict) else parse_date(date),
         "note_list": note_handles or [],
     }
 

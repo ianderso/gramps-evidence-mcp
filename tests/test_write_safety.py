@@ -139,6 +139,55 @@ async def test_no_editing_tool_ever_sends_a_partial_object(tools):
     )
     assert out["changed"] is True, out
 
+    # Added in 1.1.0. Each must reach its write, or the sweep proves nothing.
+    child = fake.store["person"][
+        next(h for h, p in fake.store["person"].items() if p["gramps_id"] == ids["child"])
+    ]
+    death = child["event_ref_list"][0]["ref"]
+    edits = [
+        await tools("update_event", event=death, event_type="Burial", clear_date=True),
+        await tools("add_event_ref", person=ids["father"], event=death, role="Informant"),
+        await tools("update_child_ref", family=ids["family"], child=ids["child"], mrel="Adopted"),
+        await tools(
+            "update_alternate_name",
+            person=ids["child"],
+            match={"surname": "Ashbey"},
+            name_type="Married Name",
+        ),
+        await tools(
+            "cite_object",
+            object_type="name",
+            ref=ids["child"],
+            name={"surname": "Ashbey"},
+            citation={"source": ids["source"], "page": "img 52"},
+        ),
+        await tools(
+            "update_person",
+            person=ids["father"],
+            name={"given": "Elias J.", "surname": "Ashbee"},
+            keep_old_as_alternate=False,
+            reason="Initial entered in the surname.",
+        ),
+        await tools(
+            "detach_object",
+            parent_type="person",
+            parent=ids["child"],
+            child_kind="tag",
+            child="Reviewed",
+        ),
+    ]
+    assert all(e.get("changed") is True for e in edits), edits
+    citation = next(iter(fake.store["citation"].values()))["gramps_id"]
+    batch = await tools(
+        "update_citations", items=[{"citation": citation, "page": "img 53, entry 2"}]
+    )
+    assert batch["outcomes"] == {"applied": 1}, batch
+    repo = await tools("add_repository", name="Probate Court")
+    linked = await tools(
+        "link_repositories", items=[{"source": ids["source"], "repository": repo["gramps_id"]}]
+    )
+    assert linked["outcomes"] == {"linked": 1}, linked
+
     assert fake.partial_writes == [], (
         f"a tool sent a partial object; every write must go through _mutate: {fake.partial_writes}"
     )

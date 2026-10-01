@@ -8,6 +8,95 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-10-01
+
+Fixes for what a day of research sessions against a live tree found the tools
+could not do, or did wrong. Behaviour the fixes rely on was read from the
+gramps-webapi 3.21.1 and Gramps 6.0 source and is recorded, dated, in
+[docs/PITFALLS.md](docs/PITFALLS.md) sections 15 to 22.
+
+### Added
+
+- `update_child_ref`: change a child's relationship to the father or mother —
+  a stepson held as a birth child — in place, keeping the link's citations,
+  notes and place in the birth order.
+- `check_family_links`: audit person↔family links in both directions — a family
+  listed twice, a child listed twice, a link one side lacks, a link to nothing
+  — with a repair for each finding. Privacy-filtered.
+- `add_event_ref`: share an existing event with another person, in a role,
+  instead of copying it.
+- `update_alternate_name`: correct, retype or remove one alternate name in
+  place. A cited name is not removed.
+- `update_citations` and `link_repositories`: the sweeps that needed REST
+  scripts, as one call each. Each row is its own write and reports its own
+  outcome; `expect_page_prefix` refuses a row whose page changed since the
+  sweep was planned.
+- `update_event` takes `event_type`, checked against the tree's vocabulary
+  (`allow_new_type` for a deliberate new custom type), and `clear_place` and
+  `clear_date`.
+- Names can be cited: `cite_object(object_type="name", name=...)` on the
+  primary or an alternate name, `uncite` likewise, and `add_alternate_name`
+  takes a `citation`. `get_person` lists every name with its citation count.
+- `update_person` takes `keep_old_as_alternate=False` with a required
+  `reason`, for a name split wrongly at entry: the name is corrected in place,
+  keeping its citations, and the reason and old form go in a Research note.
+- `add_source` takes the repository link's `media_type`, as `link_repository`
+  does.
+- `detach_object` takes a tag by name, narrows a repository link to one
+  `call_number`, and gains `parent_family` and `family` kinds that remove a
+  link only the person holds, and an `enclosure` kind that takes an extra
+  parent off a place — which `update_place` refuses to touch.
+- `merge_objects` takes `enclosures` for places (see Fixed).
+- `uncite` and `delete_object` take `carry_to` (see Changed).
+
+### Fixed
+
+- `add_place` wrote the place type to a stray `type` key, leaving the place
+  Unknown; `get_place` read the same stray key, so the defect did not show. It
+  writes `place_type` now, `get_place` reports `place_type` and flags a stray
+  key, and any edit of the place repairs one.
+- "from 4 May 1864 to 16 Sep 1864" was stored as a range ("between"); it is a
+  span now. A lone "from 1880" or "to 1890" was stored as a plain year, the
+  word dropped; it is an open-ended date now on Gramps 5.2 and later, and kept
+  as text on an older server.
+- `get_event` and every other output showed a range as its first year, and
+  dropped "about", "before", "estimated" and the like. Dates are rendered as
+  Gramps' English displayer renders them, in ISO form.
+- Detaching a child listed twice in its `parent_family_list` left a link only
+  the person held. Every remaining link is removed now, and every person write
+  removes a repeated family from either list, so the next edit of an affected
+  person repairs it.
+- A delete answered HTTP 500 after it had landed (the server's search-index
+  step) was reported as a failure. It is reported as the delete it was, with
+  the late status.
+- A place merge left the survivor enclosed by both places' parents. With
+  `enclosures="auto"`, the default, an undated parent that encloses another is
+  dropped, and a merge that would leave two unrelated undated parents is
+  refused before it runs.
+- `update_person(name=...)` filed an alternate name even when the name was
+  unchanged, because it compared whole stored names with a fresh one.
+- `add_event_to_person`, `add_event_to_family` and `add_note` created the event
+  or note before resolving the target, so a bad reference left an orphan.
+- `add_family` given the same child twice listed them twice.
+
+### Changed
+
+- Every write goes through `_mutate()`, as CONTRIBUTING has said it does. A
+  write that changes nothing is skipped, so tagging an already-tagged object or
+  setting a flag to its current value no longer lands in the transaction log.
+- `uncite(delete_if_orphan=True)` no longer deletes a citation that is the only
+  holder of a note or image; it keeps it, says what it holds, and deletes it
+  once `carry_to` names a citation to move them to. `detach_object` keeps an
+  orphaned object for the same reason.
+- `delete_object` refuses to strand a note or image only the object holds
+  (`carry_to` moves them first), and refuses a source with citations, which the
+  server would delete with it. Its description no longer says a delete leaves
+  dangling references: the server removes them.
+- `update_event` refuses an empty `place` or `date` rather than treating it as
+  a place to resolve or a date to clear; `clear_place` and `clear_date` say so.
+- `add_child_to_family` and `link_repository` report a child or link already
+  present as no change, and point at `update_child_ref` and `detach_object`.
+
 ## [1.0.1] — 2026-09-29
 
 ### Fixed
@@ -77,6 +166,7 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/ianderso/gramps-evidence-mcp/releases/tag/v1.0.0
