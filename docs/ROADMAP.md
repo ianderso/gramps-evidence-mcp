@@ -4,13 +4,22 @@ Everything this project set out to build is built: cited writes for every kind
 of genealogical claim, the edit and merge tools that keep a tree correctable,
 the audit set that finds where the evidence thins out, server-side queries,
 reports and verification, DNA matches recorded as cited evidence, and the
-read-only reference layer over legacy GEDCOMs. That is 89 tools; the
+read-only reference layer over legacy GEDCOMs. That is 90 tools; the
 [README](../README.md#tool-reference) is the reference for what exists, and the
 [changelog](../CHANGELOG.md) for what changed.
 
-Nothing is queued. New work starts from a research task the tools cannot do —
-open an issue saying what you were trying to record or find, and where the
-tools stopped you.
+Nothing is queued here. New work starts from a research task the tools
+cannot do — open an issue saying what you were trying to record or find, and
+where the tools stopped you.
+
+## Waiting on gramps-webapi
+
+- **Optimistic locking.** `_mutate()` should send the ETag of its read as
+  `If-Match`, so a write from a stale read is refused and the edit re-applied
+  to the current record instead of undoing someone else's. The server checks
+  `If-Match` against a different hash than the ETag it hands out, so no tag a
+  client can obtain is ever accepted ([PITFALLS.md](PITFALLS.md) section 6). A
+  tripwire test in the live suite fails the day a release fixes it.
 
 ## How a new tool is judged
 

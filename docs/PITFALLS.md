@@ -3,12 +3,20 @@
 `gramps-webapi` behaviours that constrain this server's implementation. Read
 before adding a tool that mutates, or before calling the API directly.
 
-**Every claim here about the server is checked on every CI run.** The live
-suite (`tests/live`, see CONTRIBUTING.md) starts a throwaway gramps-webapi
-3.21.1 and 3.22.3 and runs `test_pitfalls_live.py`, whose tests are named for
-these sections. Sections 4, 9, 10 and 11 describe this project's own code and
-are covered by the unit tests. Where the two versions differ, the section
-says so.
+**The claims here about the server are checked on every CI run**, with the
+exceptions below. The live suite (`tests/live`, see CONTRIBUTING.md) starts a
+throwaway gramps-webapi 3.21.1 and 3.22.3 and runs `test_pitfalls_live.py`,
+whose tests are named for these sections. Where the two versions differ, the
+section says so. Sections 4, 9, 10 and 11 describe this project's own code and
+are covered by the unit tests.
+
+Not checked, because a healthy throwaway server cannot show them: the HTTP 500
+answered to a delete that has landed (section 17), which needs a failing
+search index; that the server never removes a media file (section 16), which
+needs an upload; the 500s on every write under prolonged concurrent writing
+(section 6); and how a server on Gramps older than 5.2 stores "from X"
+(section 20), since no supported server runs one. Each says where it came
+from.
 
 The sections were first found on gramps-webapi 3.20.1 and 3.21.1, in research
 sessions against a live tree, and explained from the gramps-webapi and Gramps
@@ -63,9 +71,16 @@ Two sessions doing read-modify-write on the same object silently lose one edit,
 with nothing afterwards to show it happened. `_mutate()` makes an individual
 write whole-object safe; it cannot make two sessions safe from each other.
 
-The server could: a read carries an `ETag`, and a `PUT` sent with `If-Match`
-and an older one is refused with 412 (verified live). Nothing here sends
-`If-Match` yet, so a stale write still wins.
+The server has `If-Match` support that no client can use. A `PUT` with
+`If-Match` is refused with 412 unless the tag equals a hash of the *stored*
+object (`hash_object` in `api/resources/util.py`), but a read's `ETag` is a
+hash of the *response body*, suffixed `:gzip` when compressed (`emit.py`).
+No tag the API hands out ever matches, fresh or stale; only `If-Match: *`
+passes, which checks nothing. Verified on 3.21.1 and 3.22.3, where a test in
+the live suite holds it as a tripwire: when gramps-webapi fixes this, the test
+fails, and `_mutate()` should start sending the tag of its read. Until then,
+`_mutate()` narrows the race to one round trip -- it reads and writes back to
+back -- and that is the most a client can do.
 
 Prolonged concurrent writing has also produced HTTP 500 on every write while
 reads stayed healthy. `list_transactions` shows recent write activity -- check
@@ -157,7 +172,9 @@ type as a plain string, `"Baptism"`. The *stored* object holds a dict:
 
 The integers come from `GET /api/types/default/event_types/map`, which is what
 `list_event_types` reads and what `query_records(event_type=...)` translates
-through. Do not hard-code them.
+through. Do not hard-code them. `query_records` refuses `type` as a plain
+column, pointing at `event_type` (or, on another collection, at
+`["type", "value"]`).
 
 Verified against 3.21.1 on a tree of 2,480 events: Birth 12 (744), Death 13
 (411), Burial 19 (332), Marriage 1 (172), Census 21 (113).
@@ -185,11 +202,14 @@ allowlists are narrow:
 | tag | `handle`, `name`, `color`, `priority`, `change` |
 | repository | `gramps_id`, `handle`, `name`, `private`, `change` |
 
-Two more traps:
+Two more traps, both refused by `query_records` with the form that works:
 
-- **Comparing a list raises HTTP 500.** `{"column": {"json_path":
-  ["citation_list"]}, "op": "eq", "value": []}` crashes the server rather than
-  returning uncited rows. Use `get_backlinks` or `list_unsourced_facts`.
+- **A list as the value of any operator but `in` is an HTTP 500**, on both
+  versions: `citation_list eq []`, `ne []`, `eq ["x"]`, and a whole `dateval`
+  compared with a list all crash the server rather than answering. `contains`
+  finds one value in a list field. The engine cannot test a list for
+  emptiness -- comparing an element with null is a 422 -- so uncited facts are
+  `list_unsourced_facts`'s job, and what cites an object `get_backlinks`'.
 - **There is no stored `year`; the year is `dateval[2]`, and an unknown one
   is `0`, not null.** `birth.date.year` matches nothing on 3.21 and is refused
   on 3.22 -- except on records some client wrote a served year back to
@@ -311,8 +331,10 @@ Birth or Death recomputes it for every person referencing the event. So
 changing an event's type in place needs no work on the people sharing it.
 
 A **create** (`POST`) keeps the indices it was sent, right or wrong, until the
-person's first update. `add_person` sets them itself. Read from the 3.21.1 and
-Gramps 6.0 source on 2026-10-01; the create case found by the live suite.
+person's first update. `add_person` sets them as that update would: a birth
+given as a Baptism is kept as an event, but is not made the birth only to be
+unset by the next edit. Read from the 3.21.1 and Gramps 6.0 source on
+2026-10-01; the create case found by the live suite.
 
 ## 20. Dates: a span is not a range, and the server checks the shape
 
@@ -379,3 +401,48 @@ to write back, by a year that may be wrong (section 13). No tool reads `year`
 -- the year is `dateval[2]` -- but `_mutate()` drops it from every date it
 writes, which also repairs a stale one, and says so when it does. Found by the
 live suite, on 3.21.1 and 3.22.3.
+
+## 25. A merge merges more than it names
+
+The server merges with Gramps' own merge queries (`gramps/gen/merge`), which
+go further than the two objects asked about:
+
+- **A person merge merges families.** After the merge, the first two of the
+  survivor's families that have the same parents -- one each record had with
+  the same spouse -- are merged too: children, events and citations combined,
+  the second family deleted. That is the server's default (`family_merger`).
+- **A family merge merges parents.** The survivor keeps its father and
+  mother; a different father or mother in the other family is merged into
+  them, as a person merge.
+- **Some merges are refused with 409:** two spouses, and a parent with their
+  own child.
+- **The survivor keeps a trace of the other.** A person merge files the
+  other's primary name as the first alternate name and adds a "Merged Gramps
+  ID" attribute holding the other's id; every list is combined, equivalent
+  entries merged rather than repeated (the same event in the same role, the
+  same attribute type and value), and birth and death are recomputed.
+
+`merge_objects` reports the families or people a merge would also merge, as
+`also_merges` in its dry run and its result, and refuses a merge Gramps would
+refuse before sending it. Verified on 3.21.1 and 3.22.3, where the contract
+tests hold the unit tests' fake to every one of these.
+
+## 26. Type names are matched exactly
+
+The server converts a type given as a string -- an event's type, a name's,
+a child's relationship -- by exact, case-sensitive lookup among the English
+names, then the localized ones (`_set_type_from_string`,
+`api/resources/util.py`). Anything else becomes a new custom type with that
+string. So `"birth"` is not Birth: it is a custom type beside it, which
+filters and Gramps' own birth logic never see.
+
+These are spelt as the tree spells them: an event's type wherever an event is
+created or retyped (an event created with `"census"` is stored as Census, and
+a type the tree has never seen is still created, as a custom one), the role in
+`add_event_ref`, a child's relationships in `update_child_ref`, and a name's
+type in `update_alternate_name`. `update_event` goes further and refuses an
+unknown event type unless `allow_new_type` says it is meant. Everywhere else
+the string is sent as given, so its case matters: `add_alternate_name`'s name
+type, `add_child_to_family`'s relationships, and a place's, note's,
+repository's, family relationship's, repository medium's, attribute's or
+URL's type.

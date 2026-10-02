@@ -95,29 +95,44 @@ async def test_5_detaching_a_citation_does_not_delete_it(live):
     assert (await client.get_object("citation", citation["handle"]))["handle"]
 
 
-async def test_6_a_stale_write_wins_silently_unless_if_match_is_sent(live):
-    """No locking by default. The server honours If-Match, which no client here sends."""
+async def test_6_a_stale_write_wins_silently(live):
+    """No locking: a write from an old read undoes a newer one without a word."""
     client = live.client
     person = await _person(client)
-    path = f"/api/people/{person['handle']}"
-    first = await client._request("GET", path)
-    etag = first.headers.get("ETag")
-    stale = first.json()
+    stale = await client.get_object("person", person["handle"])
 
     fresh = await client.get_object("person", person["handle"])
     fresh["gender"] = 1
     await client.update_object("person", person["handle"], fresh)
 
     stale["private"] = True
-    await client.update_object("person", person["handle"], stale)  # no If-Match: accepted
+    await client.update_object("person", person["handle"], stale)
     after = await client.get_object("person", person["handle"])
     assert after["gender"] == 0, "the stale write silently undid the other one"
 
-    assert etag, "the server sends an ETag on a read"
-    resp = await client._http.put(
-        path, json=stale, headers={**client._auth_headers(), "If-Match": etag}
-    )
-    assert resp.status_code == 412
+
+async def test_6_if_match_refuses_even_a_fresh_etag(live):
+    """A tripwire. The PUT checks If-Match against a hash of the stored object;
+    the GET's ETag is a hash of the response body (plus ":gzip" when
+    compressed), so no tag a client can obtain ever matches, and only the
+    wildcard passes -- checking nothing.
+
+    If this fails, gramps-webapi has fixed it: make ``_mutate()`` send the
+    ETag of its read, re-applying the edit once on 412, and update
+    docs/PITFALLS.md section 6.
+    """
+    client = live.client
+    person = await _person(client)
+    path = f"/api/people/{person['handle']}"
+    headers = client._auth_headers()
+    for encoding in ("gzip", "identity"):
+        read = await client._http.get(path, headers={**headers, "Accept-Encoding": encoding})
+        etag = read.headers.get("ETag")
+        assert etag, "the server sends an ETag on a read"
+        resp = await client._http.put(path, json=read.json(), headers={**headers, "If-Match": etag})
+        assert resp.status_code == 412, (encoding, resp.status_code)
+    resp = await client._http.put(path, json=read.json(), headers={**headers, "If-Match": "*"})
+    assert resp.status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +312,17 @@ async def test_13_a_path_the_object_lacks(live):
         assert rows == []
 
 
-async def test_13_comparing_a_list_is_a_server_error(live):
+@pytest.mark.parametrize(
+    ("path", "op", "value"),
+    [
+        (["citation_list"], "eq", []),
+        (["citation_list"], "ne", []),
+        (["citation_list"], "eq", ["x"]),
+        (["date", "dateval"], "eq", [0, 0, 1850, False]),
+    ],
+)
+async def test_13_a_list_value_is_a_server_error_except_with_in(live, path, op, value):
+    """What ``query_records`` refuses as ``list_comparison``."""
     client = live.client
     await _event(client)
     with pytest.raises(GrampsApiError) as exc:
@@ -305,10 +330,30 @@ async def test_13_comparing_a_list_is_a_server_error(live):
             "event",
             {
                 "select": ["handle"],
-                "where": [{"column": {"json_path": ["citation_list"]}, "op": "eq", "value": []}],
+                "where": [{"column": {"json_path": path}, "op": op, "value": value}],
             },
         )
     assert exc.value.status == 500
+
+
+async def test_13_contains_finds_a_value_in_a_list_and_in_takes_a_list(live):
+    client = live.client
+    _, citation = await _source_with_citation(client)
+    cited = await _event(client, citation_list=[citation["handle"]])
+    await _event(client, "Death")
+
+    async def handles(where):
+        rows, _, _ = await client.structured_query(
+            "event", {"select": ["handle"], "where": [where]}
+        )
+        return [r["handle"] for r in rows]
+
+    assert await handles(
+        {"column": {"json_path": ["citation_list"]}, "op": "contains", "value": citation["handle"]}
+    ) == [cited["handle"]]
+    assert await handles({"column": "gramps_id", "op": "in", "value": [cited["gramps_id"]]}) == [
+        cited["handle"]
+    ]
 
 
 async def test_13_there_is_no_stored_year_and_an_unknown_one_is_zero(live):
@@ -526,6 +571,83 @@ async def test_24_a_served_year_written_back_is_kept_and_served_stale(live):
     ], out
     fixed = (await client.get_object("event", event["handle"]))["date"]
     assert (fixed["dateval"][2], fixed["year"]) == (1860, 1860)
+
+
+# --------------------------------------------------------------------------- #
+# 25: a merge merges more than it names
+# --------------------------------------------------------------------------- #
+async def _family(client, father=None, mother=None) -> dict:
+    payload = {"_class": "Family", "father_handle": father or "", "mother_handle": mother or ""}
+    return await client.create_object("family", payload)
+
+
+async def test_25_a_person_merge_merges_families_left_with_the_same_parents(live):
+    client = live.client
+    elias, copy = await _person(client, "Elias"), await _person(client, "Elias", "Wrenn")
+    hannah = await _person(client, "Hannah", "Ashbee", gender=0)
+    first = await _family(client, elias["handle"], hannah["handle"])
+    second = await _family(client, copy["handle"], hannah["handle"])
+    await client.merge("person", elias["handle"], copy["handle"])
+    with pytest.raises(GrampsApiError) as exc:
+        await client.get_object("family", second["handle"])
+    assert exc.value.status == 404, "merged into the first"
+    assert (await client.get_object("person", hannah["handle"]))["family_list"] == [first["handle"]]
+
+    merged = await client.get_object("person", elias["handle"])
+    assert {"type": "Merged Gramps ID", "value": copy["gramps_id"]}.items() <= merged[
+        "attribute_list"
+    ][0].items()
+    assert merged["alternate_names"][0]["surname_list"][0]["surname"] == "Wrenn"
+
+
+async def test_25_a_family_merge_merges_a_differing_father(live):
+    client = live.client
+    elias, copy = await _person(client, "Elias"), await _person(client, "Elias")
+    first = await _family(client, elias["handle"])
+    second = await _family(client, copy["handle"])
+    await client.merge("family", first["handle"], second["handle"])
+    with pytest.raises(GrampsApiError) as exc:
+        await client.get_object("person", copy["handle"])
+    assert exc.value.status == 404, "the second father was merged into the first"
+
+
+async def test_25_spouses_and_a_parent_with_their_child_are_refused_409(live):
+    client = live.client
+    elias, hannah, mercy = (
+        await _person(client, "Elias"),
+        await _person(client, "Hannah", gender=0),
+        await _person(client, "Mercy", gender=0),
+    )
+    await client.create_object(
+        "family",
+        {
+            "_class": "Family",
+            "father_handle": elias["handle"],
+            "mother_handle": hannah["handle"],
+            "child_ref_list": [{"_class": "ChildRef", "ref": mercy["handle"]}],
+        },
+    )
+    for keep, drop in ((elias, hannah), (mercy, elias)):
+        with pytest.raises(GrampsApiError) as exc:
+            await client.merge("person", keep["handle"], drop["handle"])
+        assert exc.value.status == 409
+
+
+async def test_25_a_family_merge_that_would_merge_a_father_and_son_is_refused_409(live):
+    client = live.client
+    elias, son = await _person(client, "Elias"), await _person(client, "Elias")
+    await client.create_object(
+        "family",
+        {
+            "_class": "Family",
+            "father_handle": elias["handle"],
+            "child_ref_list": [{"_class": "ChildRef", "ref": son["handle"]}],
+        },
+    )
+    first, second = await _family(client, elias["handle"]), await _family(client, son["handle"])
+    with pytest.raises(GrampsApiError) as exc:
+        await client.merge("family", first["handle"], second["handle"])
+    assert exc.value.status == 409
 
 
 # --------------------------------------------------------------------------- #

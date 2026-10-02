@@ -41,6 +41,7 @@ from .models import (
     NameMatch,
     NameParts,
     RepositoryLink,
+    VitalEventInput,
 )
 from .service import (
     AmbiguousPlaceError,
@@ -203,12 +204,12 @@ async def add_person(
     gender: Gender = Field(default=Gender.unknown, description="female, male, or unknown."),
     name_prefix: str = Field(default="", description="Surname prefix, e.g. 'van', 'de'."),
     name_suffix: str = Field(default="", description="Suffix, e.g. 'Jr.', 'III'."),
-    birth: EventInput | None = Field(
+    birth: VitalEventInput | None = Field(
         default=None,
         description="Optional birth event. Include a citation unless recording "
         "as unsourced. The event type defaults to 'Birth'.",
     ),
-    death: EventInput | None = Field(
+    death: VitalEventInput | None = Field(
         default=None, description="Optional death event; type defaults to 'Death'."
     ),
     require_citation: bool = Field(
@@ -264,7 +265,7 @@ async def add_family(
     father: str | None = Field(default=None, description="Father: handle or gramps_id."),
     mother: str | None = Field(default=None, description="Mother: handle or gramps_id."),
     children: list[str] | None = Field(default=None, description="Child handles or gramps_ids."),
-    marriage: EventInput | None = Field(
+    marriage: VitalEventInput | None = Field(
         default=None,
         description="Optional marriage event; type defaults to 'Marriage'. Cite it.",
     ),
@@ -2056,6 +2057,27 @@ async def get_transaction(
 
 
 @mcp.tool(annotations=READS)
+async def get_record_history(
+    object_type: str = Field(
+        description="person, family, event, place, source, citation, repository, media, "
+        "note, or tag."
+    ),
+    ref: str = Field(description="Handle or gramps_id. A deleted record by its handle."),
+    limit: int = Field(default=20, ge=1, le=200, description="Most recent changes to return."),
+) -> dict:
+    """Who added, edited or deleted one record, and when, newest first.
+
+    Each change names its transaction: get_transaction shows what it changed.
+    Needs gramps-webapi 3.22 or later.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.record_history(object_type, ref, limit)
+    except Exception as exc:  # noqa: BLE001 - surfaced as structured error
+        return _error(exc)
+
+
+@mcp.tool(annotations=READS)
 async def get_place(
     place: str = Field(description="Handle or gramps_id of the place."),
 ) -> dict:
@@ -2229,7 +2251,9 @@ async def query_records(
         description="Conditions combined with AND. Each is "
         '{"column": <name or json_path>, "op": <op>, "value": ...}. '
         "Operators: eq, ne, lt, lte, gt, gte, like, regex, contains, in. Use "
-        '"value_column" instead of "value" to compare two columns.',
+        '"value_column" instead of "value" to compare two columns. A list value '
+        "is for 'in' only; 'contains' finds one value in a list field. A date's "
+        "year is dateval[2], 0 when unknown.",
     ),
     where_expr: str | None = Field(
         default=None,
