@@ -193,6 +193,19 @@ class EventInput(_StrictInput):
     )
 
 
+class VitalEventInput(EventInput):
+    """A birth, death or marriage given with the person or family it belongs to.
+
+    The parameter already names the event, so its type may be left out;
+    ``add_person`` and ``add_family`` fill it in.
+    """
+
+    type: str | None = Field(
+        default=None,
+        description="Leave out: the parameter names the event (Birth, Death or Marriage).",
+    )
+
+
 class CitationEdit(_StrictInput):
     """One row of update_citations: which citation, and what to set on it."""
 

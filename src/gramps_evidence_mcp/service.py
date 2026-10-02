@@ -613,7 +613,14 @@ class GrampsService:
     # write: events
     # ------------------------------------------------------------------ #
     async def _create_event(self, ev: EventInput, require_citation: bool) -> tuple[str, bool]:
-        """Create an Event object. Returns (event_handle, is_unsourced)."""
+        """Create an Event object. Returns (event_handle, is_unsourced).
+
+        The type is spelt as the tree spells it: the server matches type
+        names case-sensitively, so "birth" would otherwise be stored as a new
+        custom type beside Birth. A name the tree does not know is still
+        created, as a custom type. ``ev.type`` is updated to what was stored.
+        """
+        ev.type = await self._canonical_type("event_types", ev.type, allow_new=True)
         citation_handles, extra_attrs = await self._citation_list_for_fact(
             ev.citation, require_citation
         )
@@ -670,17 +677,23 @@ class GrampsService:
         death_index = -1
         unsourced: list[str] = []
 
+        # The indices are what the server computes on the person's first
+        # update -- the first Birth and Death events -- so a birth given as,
+        # say, a Baptism is kept as an event but never set as the birth only
+        # to be unset by the next edit (docs/PITFALLS.md section 19).
         if birth is not None:
             birth.type = birth.type or "Birth"
             handle, is_uns = await self._create_event(birth, require_citation)
-            birth_index = len(event_refs)
+            if birth.type == "Birth":
+                birth_index = len(event_refs)
             event_refs.append(mapping.event_ref(handle))
             if is_uns:
                 unsourced.append("birth")
         if death is not None:
             death.type = death.type or "Death"
             handle, is_uns = await self._create_event(death, require_citation)
-            death_index = len(event_refs)
+            if death.type == "Death":
+                death_index = len(event_refs)
             event_refs.append(mapping.event_ref(handle))
             if is_uns:
                 unsourced.append("death")
@@ -4209,6 +4222,11 @@ class GrampsService:
                 if drop.get(key)
             },
         }
+        also, refusal = await self._merge_side_effects(object_type, keep, drop)
+        if also:
+            plan["also_merges"] = also
+        if refusal:
+            plan["refused"] = refusal
         final_refs: list[dict] | None = None
         if object_type == "place":
             if enclosures not in _ENCLOSURE_CHOICES:
@@ -4233,6 +4251,10 @@ class GrampsService:
                 f"{keep.get('gramps_id')}, moving {drop_links['total_references']} "
                 f"reference(s). Re-run with dry_run=False to apply."
             )
+            if also:
+                plan["message"] += " It would also merge " + _describe_cascade(also) + "."
+            if refusal:
+                plan["message"] += f" It would be refused: {refusal}"
             if (plan.get("enclosures") or {}).get("ambiguous"):
                 plan["message"] += (
                     " It would be refused as it stands: two unrelated undated parents "
@@ -4240,6 +4262,8 @@ class GrampsService:
                 )
             return plan
 
+        if refusal:
+            return {"error": "merge_refused", **plan, "message": f"Not merged: {refusal}"}
         await self.client.merge(object_type, keep["handle"], drop["handle"])
         plan["dry_run"] = False
         plan["message"] = (
@@ -4247,6 +4271,8 @@ class GrampsService:
             f"{keep.get('gramps_id')}. The merge is one transaction -- "
             f"list_transactions + undo_transaction can reverse it."
         )
+        if also:
+            plan["message"] += " It also merged " + _describe_cascade(also) + "."
         if final_refs is not None:
             wanted = [_placeref_key(r) for r in final_refs]
 
@@ -4269,6 +4295,72 @@ class GrampsService:
             "merged %s %s into %s", object_type, drop.get("gramps_id"), keep.get("gramps_id")
         )
         return plan
+
+    async def _merge_side_effects(
+        self, object_type: str, keep: dict, drop: dict
+    ) -> tuple[list[dict], str | None]:
+        """What else Gramps' merge would merge, and whether it refuses (PITFALLS 25).
+
+        A person merge (``MergePersonQuery``, with the ``family_merger`` the
+        server uses by default) then merges the first two of the survivor's
+        families that have the same parents -- a family each record had with
+        the same spouse. It refuses spouses, and a parent and their child.
+        A family merge (``MergeFamilyQuery``) keeps the survivor's father and
+        mother and merges a different one into each.
+
+        Returns
+        -------
+        tuple
+            The merges that would follow, each ``{"family"|"person": <kept id>,
+            "absorbs": <dropped id>, "because": ...}``, and the reason Gramps
+            would refuse, or None.
+        """
+        also: list[dict] = []
+        if object_type == "person":
+            refusal = _person_merge_refusal(keep, drop)
+            if refusal:
+                return also, refusal
+            keep_fams = list(keep.get("family_list") or [])
+            drop_fams = list(drop.get("family_list") or [])
+            seen: dict[tuple, str | None] = {}
+            for handle in keep_fams + [h for h in drop_fams if h not in keep_fams]:
+                family = await self.client.get_object("family", handle)
+                parents = tuple(
+                    keep["handle"] if h == drop["handle"] else h
+                    for h in (family.get("father_handle"), family.get("mother_handle"))
+                )
+                if parents in seen and handle in drop_fams:
+                    also.append(
+                        {
+                            "family": seen[parents],
+                            "absorbs": family.get("gramps_id"),
+                            "because": "the two families would have the same parents",
+                        }
+                    )
+                    break
+                seen.setdefault(parents, family.get("gramps_id"))
+        elif object_type == "family":
+            for role in ("father", "mother"):
+                mine, theirs = keep.get(f"{role}_handle"), drop.get(f"{role}_handle")
+                if mine and theirs and mine != theirs:
+                    kept = await self._resolve("person", mine)
+                    dropped = await self._resolve("person", theirs)
+                    refusal = _person_merge_refusal(kept, dropped)
+                    if refusal:
+                        return also, (
+                            f"merging the families would merge their {role}s, "
+                            f"{kept.get('gramps_id')} and {dropped.get('gramps_id')}, and "
+                            + refusal[0].lower()
+                            + refusal[1:]
+                        )
+                    also.append(
+                        {
+                            "person": kept.get("gramps_id"),
+                            "absorbs": dropped.get("gramps_id"),
+                            "because": f"the families have different {role}s",
+                        }
+                    )
+        return also, None
 
     async def _merged_enclosures(
         self, keep: dict, drop: dict, choice: str
@@ -4698,6 +4790,75 @@ class GrampsService:
                 }
             )
         return {"count": len(rows), "transactions": rows}
+
+    async def record_history(self, object_type: str, ref: str, limit: int = 20) -> dict:
+        """Who added, edited or deleted one record, and when, newest first.
+
+        Parameters
+        ----------
+        object_type : str
+            Gramps object type.
+        ref : str
+            Handle or gramps_id. A deleted record has no gramps_id to look up,
+            so its history is reached by handle.
+        limit : int, optional
+            The most recent changes to return.
+
+        Returns
+        -------
+        dict
+            The record, its total number of changes, and the latest ones,
+            each with its transaction, user and time.
+
+        Raises
+        ------
+        NotFoundError
+            If the record neither exists nor has any history.
+        UnsupportedServerError
+            On a gramps-webapi older than 3.22.
+        """
+        if object_type not in ENDPOINTS:
+            return {
+                "error": "unsupported_type",
+                "message": f"Unknown object type {object_type!r}. "
+                f"Known: {', '.join(sorted(ENDPOINTS))}.",
+            }
+        try:
+            obj = await self._resolve(object_type, ref)
+            handle, gramps_id = obj["handle"], obj.get("gramps_id")
+        except NotFoundError:
+            handle, gramps_id = ref, None
+        changes, total = await self.client.object_history(
+            object_type, handle, pagesize=max(1, min(limit, 200))
+        )
+        if gramps_id is None and not changes:
+            raise NotFoundError(
+                f"No {object_type} '{ref}' exists, and no history is recorded under that "
+                "handle. A deleted record's history is found by its handle, not its gramps_id."
+            )
+        kinds = {0: "added", 1: "edited", 2: "deleted"}
+        rows = [
+            {
+                "change": kinds.get(c.get("trans_type"), str(c.get("trans_type"))),
+                "transaction_id": c.get("transaction_id"),
+                "user": ((c.get("connection") or {}).get("user") or {}).get("name"),
+                "timestamp": _iso_from_epoch(c.get("timestamp")),
+            }
+            for c in changes
+        ]
+        label = gramps_id or handle
+        return {
+            "object_type": object_type,
+            "gramps_id": gramps_id,
+            "handle": handle,
+            "deleted": gramps_id is None,
+            "total_changes": total,
+            "returned": len(rows),
+            "changes": rows,
+            "message": f"{total} change(s) to {object_type} {label}"
+            + (", which has since been deleted" if gramps_id is None else "")
+            + ". get_transaction shows what a transaction changed.",
+        }
 
     async def undo_transaction(
         self,
@@ -5130,6 +5291,10 @@ class GrampsService:
                 "message": f"Unknown object type {object_type!r}. "
                 f"Known: {', '.join(sorted(ENDPOINTS))}.",
             }
+
+        trap = _query_trap(object_type, select, where, order_by)
+        if trap:
+            return trap
 
         conditions = list(where or [])
         if event_type:
@@ -6124,6 +6289,101 @@ def _normalize(object_type: str, obj: dict) -> list[str]:
             "the server would have shown instead of the date's own"
         )
     return repaired
+
+
+def _query_trap(
+    object_type: str, select: list | None, where: list | None, order_by: list | None
+) -> dict | None:
+    """Refuse the structured-query forms the server answers wrongly, saying what works.
+
+    Each was verified against gramps-webapi 3.21.1 and 3.22.3 and is in
+    ``docs/PITFALLS.md``:
+
+    - a date's ``year`` (sections 13 and 24): never stored by the server, so
+      3.21 matches nothing on it -- or only records some client wrote a
+      served year back to -- and 3.22 refuses it. The year is ``dateval[2]``.
+    - ``type`` as a plain column (section 12): the stored type is
+      ``{"string": "", "value": <number>}``; 3.21 refuses the column and
+      3.22 compares the whole object, so nothing ever matches.
+    - a list as the value of any operator but ``in`` (section 13): the
+      server answers HTTP 500.
+
+    Returns
+    -------
+    dict or None
+        An error envelope, or None when the query has none of these.
+    """
+    clauses = [c for c in [*(where or []), *(order_by or [])] if isinstance(c, dict)]
+    paths = [e["json_path"] for e in select or [] if isinstance(e, dict) and "json_path" in e]
+    for clause in clauses:
+        for key in ("column", "value_column"):
+            column = clause.get(key)
+            if isinstance(column, dict) and "json_path" in column:
+                paths.append(column["json_path"])
+    for path in paths:
+        path = list(path) if isinstance(path, (list, tuple)) else []
+        for i in range(1, len(path)):
+            if path[i] == "year" and path[i - 1] == "date":
+                fixed = [*path[:i], "dateval", 2]
+                return {
+                    "error": "date_year",
+                    "message": f"{path} reads a year the server does not store, so it matches "
+                    "nothing, or only the records some client wrote a served year back to. "
+                    f"The year is {fixed}; it is 0 when unknown, so add a condition that "
+                    "it is greater than 0 to leave undated records out.",
+                }
+    for clause in clauses:
+        if clause.get("column") == "type":
+            hint = (
+                "Pass event_type='Birth' (or any event type's name) instead."
+                if object_type == "event"
+                else 'Compare {"json_path": ["type", "value"]} with the type\'s number, '
+                'or {"json_path": ["type", "string"]} with a custom type\'s name.'
+            )
+            return {
+                "error": "type_column",
+                "message": 'A type is stored as {"string": "", "value": <number>}, so '
+                f"'type' as a plain column matches nothing. {hint}",
+            }
+    for clause in where or []:
+        if (
+            isinstance(clause, dict)
+            and isinstance(clause.get("value"), list)
+            and clause.get("op", "eq") != "in"
+        ):
+            return {
+                "error": "list_comparison",
+                "message": f"Op {clause.get('op', 'eq')!r} with a list value makes the server "
+                "fail with HTTP 500; only 'in' takes a list. To find a handle in a list field "
+                "use op 'contains' with that one value. The engine cannot test a list for "
+                "emptiness: for uncited facts use list_unsourced_facts, for what cites or "
+                "holds an object use get_backlinks.",
+            }
+    return None
+
+
+def _person_merge_refusal(keep: dict, drop: dict) -> str | None:
+    """Why Gramps' MergePersonQuery would refuse to merge two people, or None."""
+    keep_fams, drop_fams = set(keep.get("family_list") or []), set(drop.get("family_list") or [])
+    if keep_fams & drop_fams:
+        return "Gramps does not merge spouses. Detach one from the family they share first."
+    if keep_fams & set(drop.get("parent_family_list") or []) or drop_fams & set(
+        keep.get("parent_family_list") or []
+    ):
+        return (
+            "Gramps does not merge a parent with their own child. Detach the child from "
+            "the family first."
+        )
+    return None
+
+
+def _describe_cascade(also: list[dict]) -> str:
+    """'family F0002 into F0001 (the two families would have the same parents)'."""
+    parts = []
+    for entry in also:
+        kind = "family" if "family" in entry else "person"
+        parts.append(f"{kind} {entry['absorbs']} into {entry[kind]} ({entry['because']})")
+    return "; ".join(parts)
 
 
 def _drop_date_years(node: Any) -> int:

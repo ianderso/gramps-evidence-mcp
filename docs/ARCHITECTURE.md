@@ -7,7 +7,7 @@ How the server is put together. [PITFALLS.md](PITFALLS.md) covers
 ## Layers
 
 ```
-server.py     89 MCP tool functions, their annotations, and the entry point.
+server.py     90 MCP tool functions, their annotations, and the entry point.
               Parameter validation, no business logic.
 service.py    Genealogy operations. Enforces the evidence model, resolves
               references, shapes results.
@@ -124,7 +124,9 @@ can run alongside this one.
 
 ### API coverage
 
-Swept against the full `/api/openapi.json` of gramps-webapi 3.21.1 (137 paths).
+Swept against the full `/api/openapi.json` of gramps-webapi 3.21.1 (137 paths)
+and 3.22.3 (138: it adds one record's change history, which
+`get_record_history` reads and which answers with a version error on 3.21).
 Everything genealogically useful is covered. What is left out, and why:
 
 **Deliberately excluded — destructive.**

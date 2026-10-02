@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 **read/write access to a Gramps genealogy tree**, plus a **read-only
 "reference layer"** over legacy GEDCOM exports.
 
-**89 tools, built around evidence discipline.** The premise is that an assistant
+**90 tools, built around evidence discipline.** The premise is that an assistant
 turned loose on a family tree will happily invent a plausible ancestor, so the
 write paths here are shaped to make every claim carry its source: facts are
 created with citations attached, `uncite` deletes what it orphans, parent-child
@@ -289,7 +289,7 @@ server does not authenticate callers itself; see
 ### 5. Add the connector in claude.ai
 
 **Settings → Connectors → Add custom connector →** paste
-`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 89 tools
+`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 90 tools
 appear in chat. (Custom connectors require a paid Claude plan; on
 Team/Enterprise an admin may need to enable them.)
 
@@ -406,13 +406,13 @@ Request URLs are kept out of the log too, because a query filter travels in one.
 
 ## Tool reference
 
-**89 tools.** Every tool that mutates the tree re-fetches the *whole* object
+**90 tools.** Every tool that mutates the tree re-fetches the *whole* object
 before PUTting it back — edits through `service._mutate()` — see
 [the `keys=` trap](docs/PITFALLS.md#1-keys-plus-put-destroys-unfetched-fields).
 
 **Every tool declares MCP annotations** saying whether it only reads, adds, or
 changes and removes, so a client can approve reads automatically and ask before
-the rest. 44 tools only read.
+the rest. 45 tools only read.
 
 **Unknown parameters are refused.** A misspelt or invented argument is an error
 that lists the parameters the tool does take. It is not silently dropped, which
@@ -423,7 +423,7 @@ unfiltered listing of the first 200 objects.
 
 | Tool | Purpose |
 | --- | --- |
-| `add_person` | Create a person, optionally with cited birth/death events. |
+| `add_person` | Create a person, optionally with cited birth/death events; each event's type may be left out. |
 | `add_family` | Link parents + children with an optional cited marriage. |
 | `add_event_to_person` | Add a cited event (residence, census, occupation…) to a person. |
 | `add_event_to_family` | Add a dated/placed event (marriage, divorce…) to a family. |
@@ -469,7 +469,7 @@ unfiltered listing of the first 200 objects.
 | `link_repositories` | The same for many sources in one call, each row reported. |
 | `tag_object` | Attach a named Tag to an object, creating the tag if it doesn't exist. |
 | `set_private` | Set or clear the Gramps private flag on an object. |
-| `merge_objects` | Merge duplicates via the server's own merge, inside one transaction. Dry-run by default. For places, settles the survivor's enclosures rather than keeping both places' parents. |
+| `merge_objects` | Merge duplicates via the server's own merge, inside one transaction. Dry-run by default, and the dry run names what else Gramps would merge — a person merge can merge two families, a family merge two fathers — and what it refuses. For places, settles the survivor's enclosures rather than keeping both places' parents. |
 | `detach_object` | Remove an event/media/note/tag/child/repository reference, or a place's extra parent; optionally delete if orphaned. A tag can be named; a repository link narrowed to one call number. |
 | `delete_object` | Permanently delete an object by handle or Gramps ID. Refused when it would strand a note or image only it holds, and for a source that still has citations. |
 
@@ -515,7 +515,7 @@ unfiltered listing of the first 200 objects.
 | `list_unsourced_facts` | Events with no citation, or tagged `UNSOURCED`. |
 | `check_family_links` | Person↔family links checked in both directions: a family listed twice, a link one side lacks, a link to nothing. Each finding says how to repair it. |
 | `db_stats` | Counts of people/families/events/citations/etc. |
-| `query_records` | **The structured query engine.** Indexed columns, `json_path` into the stored object, relationship traversal, regex/like/in, ordering, keyset paging. The only way to filter events by type. |
+| `query_records` | **The structured query engine.** Indexed columns, `json_path` into the stored object, relationship traversal, regex/like/in, ordering, keyset paging. The only way to filter events by type. Refuses the forms the server answers wrongly — `type` as a column, a date's `year`, a list compared with anything but `in` — and says what works. |
 | `list_event_types` | The tree's event type vocabulary with the integers it stores. An unexpected name here is usually a typo Gramps accepted as a custom type. |
 | `list_filter_rules` | Gramps' filter-rule vocabulary — "is a descendant of", "has a common ancestor with" — which neither GrampsQL nor `query_records` can express. |
 | `list_custom_filters` | Saved filters on this instance, reusable by name. |
@@ -533,6 +533,7 @@ unfiltered listing of the first 200 objects.
 | `undo_transaction` | Undo a transaction, after a conflict check. Dry-run by default. Returns a `task_id`. |
 | `list_tasks` | Recent background jobs for this tree, newest first. |
 | `get_transaction` | One transaction in full, including the objects it changed. Read before undoing. |
+| `get_record_history` | Who added, edited or deleted one record, and when — each change with its transaction. A deleted record by its handle. Needs gramps-webapi 3.22 or later. |
 | `get_task` | Whether a background job finished, and whether it worked. Undo, verification and reindex all dispatch to a worker. |
 | `reindex_search` | Rebuild the full-text index. Nothing refreshes it after writes, so `search_text` silently misses anything added since. |
 
@@ -687,7 +688,7 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
 
 ```
 src/gramps_evidence_mcp/    the MCP server
-  server.py                 tool definitions (the 89 tools) and the entry point
+  server.py                 tool definitions (the 90 tools) and the entry point
   service.py                genealogy operations; edits go through _mutate()
   client.py                 gramps-webapi REST client
   mapping.py                Gramps object <-> JSON shapes

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .harness import live_version
+
 
 def _t(value: Any) -> str:
     """A Gramps type as read back: a string, or a dict with string/value."""
@@ -395,3 +397,56 @@ async def test_a_dna_match_with_a_parent_is_placed_by_the_server(live):
     assert match["estimated_relationship"] == "mother"
     assert match["segments"][0]["side"] == "maternal"
     assert [a["handle"] for a in match["common_ancestors"]] == [mother["handle"]]
+
+
+# --------------------------------------------------------------------------- #
+# Vital events and event types
+# --------------------------------------------------------------------------- #
+async def test_vital_events_are_typed_and_indexed_as_the_server_keeps_them(live):
+    """The birth and death references survive the server's recomputation (PITFALLS 19)."""
+    out = await live(
+        "add_person",
+        given="Elias",
+        surname="Wren",
+        birth={"date": "1801", "citation": {"source_title": "Register", "page": "p. 1"}},
+        death={
+            "type": "burial",
+            "date": "1866",
+            "citation": {"source_title": "Register", "page": "p. 2"},
+        },
+    )
+    assert "error" not in out, out
+
+    async def shape():
+        person = await live.client.get_object("person", out["handle"])
+        types = [
+            (await live.client.get_object("event", r["ref"]))["type"]
+            for r in person["event_ref_list"]
+        ]
+        return types, person["birth_ref_index"], person["death_ref_index"]
+
+    assert await shape() == (["Birth", "Burial"], 0, -1)
+    await live("update_person", person=out["gramps_id"], gender="male")
+    assert await shape() == (["Birth", "Burial"], 0, -1), "unchanged by the server's recompute"
+
+
+# --------------------------------------------------------------------------- #
+# A record's history (gramps-webapi 3.22 and later)
+# --------------------------------------------------------------------------- #
+async def test_record_history_or_the_version_it_needs(live):
+    person = await live("add_person", given="Elias", surname="Wren")
+    if live_version() < (3, 22):
+        out = await live("get_record_history", object_type="person", ref=person["gramps_id"])
+        assert out["error"] == "unsupported_server", out
+        assert "3.22 or later" in out["message"]
+        return
+    await live("update_person", person=person["gramps_id"], gender="male")
+    await live("add_family", father=person["gramps_id"])
+    out = await live("get_record_history", object_type="person", ref=person["gramps_id"])
+    assert [c["change"] for c in out["changes"]] == ["edited", "edited", "added"], out
+    assert all(c["user"] == "mcp" for c in out["changes"])
+
+    await live("delete_object", object_type="person", target=person["gramps_id"])
+    gone = await live("get_record_history", object_type="person", ref=person["handle"])
+    assert gone["deleted"] is True
+    assert gone["changes"][0]["change"] == "deleted"

@@ -8,6 +8,55 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-10-02
+
+What an audit of the documentation and the live suite found open after 1.1.0.
+
+### Added
+
+- `get_record_history`: who added, edited or deleted one record, and when,
+  newest first, each change with the transaction `get_transaction` reads. A
+  deleted record is found by its handle. It reads the per-record history
+  gramps-webapi added in 3.22; on 3.21 it answers `unsupported_server`.
+- `merge_objects` says what else a merge merges. Gramps' person merge goes on
+  to merge two families left with the same parents, and its family merge
+  merges a differing father or mother; the dry run and the result list these
+  as `also_merges`. A merge Gramps refuses -- two spouses, a parent and their
+  own child -- is reported by the dry run and refused, as `merge_refused`,
+  before anything is sent.
+- Contract tests for merges of every kind against a real server. The unit
+  tests' fake now merges as Gramps does, and records each record's history.
+
+### Fixed
+
+- `add_person`'s birth and death, and `add_family`'s marriage, take no type
+  when it is the obvious one, as their descriptions always said; the schema
+  required it, so a call that believed the description was refused.
+- `add_person` given a birth of another type, a Baptism say, made it the
+  person's birth until the server unset it on the next edit. It is kept as an
+  event and not made the birth, as the server itself computes it.
+- An event created with its type in another case -- "census" -- was stored as
+  a new custom type beside Census, which type filters and Gramps' own birth
+  logic never see. A created event's type is spelt as the tree spells it; a
+  type the tree lacks is still created, as a custom one.
+- `query_records` refuses the forms gramps-webapi answers wrongly, and says
+  what works instead: `type` as a plain column, which matches nothing; a
+  date's `year`, which is not stored; and a list compared with anything but
+  `in`, which crashes the server.
+
+### Changed
+
+- `docs/PITFALLS.md` section 6 is corrected: the server's `If-Match` support
+  cannot be used by any client, since a read's ETag never matches what a write
+  checks. 1.1.0 said a stale tag is refused, implying a fresh one is accepted.
+  A live test now fails the day gramps-webapi fixes it, so `_mutate()` can
+  start sending it.
+- PITFALLS no longer says every server claim is checked live, and names the
+  four that are not. Section 13 states the list-comparison rule in full, and
+  sections 25 (what a merge also merges) and 26 (type names are matched
+  exactly) are new.
+- `SECURITY.md` counted 43 read-only tools; there are 45.
+
 ## [1.1.0] — 2026-10-01
 
 Fixes for what a day of research sessions against a live tree found the tools
