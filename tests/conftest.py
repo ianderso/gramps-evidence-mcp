@@ -165,6 +165,9 @@ class FakeGramps:
         self.requests: list[tuple[str, str, Any]] = []  # (method, type, payload)
         self.write_forbidden = False  # simulate read-only/locked DB (HTTP 403)
         self.merges: list[tuple[str, str, str]] = []  # (type, keep, drop)
+        #: The undo log's per-object changes, as GET .../history/objects/ reads it.
+        self.history: list[dict] = []
+        self._history_txn = 0
         self.undos: list[int] = []
         self.transactions: list[dict] = []
         #: PUTs that sent fewer fields than the stored object carried. The real
@@ -356,6 +359,70 @@ class FakeGramps:
 
     # ---- request handlers ----
     def handle(self, request: httpx.Request) -> httpx.Response:
+        """Answer a request; record every object a write changed, as the undo log does.
+
+        The server's history holds a change for each object a transaction
+        touched -- the person a new family names, the event a delete removes
+        a reference from -- not only the one the request named. Diffing the
+        store across the write records exactly that.
+        """
+        before = None
+        if request.method in ("POST", "PUT", "DELETE") and "/token/" not in request.url.path:
+            before = copy.deepcopy(self.store)
+        response = self._dispatch(request)
+        if before is not None and response.status_code < 400:
+            self._record_history(before)
+        return response
+
+    def _record_history(self, before: dict) -> None:
+        changes = []
+        for typ, objects in self.store.items():
+            old = before[typ]
+            changes += [(typ, h, 0) for h in objects if h not in old]
+            changes += [(typ, h, 1) for h in objects if h in old and old[h] != objects[h]]
+            changes += [(typ, h, 2) for h in old if h not in objects]
+        if not changes:
+            return
+        self._history_txn += 1
+        now = time.time()
+        for typ, handle, kind in changes:
+            self.history.append(
+                {
+                    "id": len(self.history) + 1,
+                    "obj_class": _TYPE_TO_CLASS[typ],
+                    "trans_type": kind,
+                    "obj_handle": handle,
+                    "ref_handle": None,
+                    "timestamp": now,
+                    "connection": {
+                        "id": self._history_txn,
+                        "timestamp": now,
+                        "user": {"name": "mcp", "full_name": ""},
+                    },
+                    "transaction_id": self._history_txn,
+                }
+            )
+
+    def _object_history(self, request: httpx.Request, cls: str, handle: str) -> httpx.Response:
+        """GET /api/transactions/history/objects/{class}/{handle}, added in 3.22."""
+        version = str((self.metadata.get("gramps_webapi") or {}).get("version") or "")
+        if tuple(int(v) for v in re.findall(r"\d+", version)[:2]) < (3, 22):
+            return httpx.Response(404, json={"message": "not found"})
+        if cls not in _CLASS_TO_TYPE:
+            return httpx.Response(422, json={"message": f"Unknown object class: {cls}"})
+        found = [c for c in self.history if c["obj_class"] == cls and c["obj_handle"] == handle]
+        params = request.url.params
+        if params.get("sort") == "-id":
+            found.reverse()
+        if params.get("page"):
+            size = int(params.get("pagesize") or 20)
+            start = (int(params["page"]) - 1) * size
+            page = found[start : start + size]
+        else:
+            page = found
+        return httpx.Response(200, json=page, headers={"X-Total-Count": str(len(found))})
+
+    def _dispatch(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         method = request.method
 
@@ -364,6 +431,9 @@ class FakeGramps:
         if path == "/api/token/refresh/" and method == "POST":
             return httpx.Response(200, json={"access_token": "acc"})
 
+        m_hist = re.match(r"^/api/transactions/history/objects/([A-Za-z]+)/([^/]+)/?$", path)
+        if m_hist and method == "GET":
+            return self._object_history(request, m_hist.group(1), m_hist.group(2))
         if path.startswith("/api/transactions/history"):
             return self._transactions(path, method, request)
         if path == "/api/trees/" and method == "GET":
@@ -671,29 +741,137 @@ class FakeGramps:
                     links.append(family)
 
     def _merge(self, typ: str, keep: str, drop: str) -> httpx.Response:
-        """Mimic the server-side merge: re-point references, then delete the loser.
+        """Merge as Gramps' MergeXxxQuery does (gramps/gen/merge, Gramps 6.0).
 
-        Deliberately simple, but it does move references -- a test that merged
-        without re-pointing would pass against a fake that only deleted.
+        The survivor takes in what its class's ``merge`` combines, list by
+        list, with equivalent entries combined rather than repeated; every
+        reference to the loser is repointed, collapsing references that become
+        duplicates; then the loser is deleted. A person merge also merges two
+        of the survivor's families that now have the same parents, and a
+        family merge merges two different fathers or mothers -- both as Gramps
+        does. ``test_contract_live.py`` holds this to a real server.
         """
         if keep not in self.store[typ] or drop not in self.store[typ]:
             return httpx.Response(404, json={"message": "not found"})
+        pairs = [(keep, drop)] if typ == "person" else []
+        if typ == "family":
+            for key in ("father_handle", "mother_handle"):
+                mine = self.store["family"][keep].get(key)
+                theirs = self.store["family"][drop].get(key)
+                if mine and theirs and mine != theirs:
+                    pairs.append((mine, theirs))
+        for a, b in pairs:
+            refusal = _person_merge_refusal(self.store["person"][a], self.store["person"][b])
+            if refusal:
+                return httpx.Response(409, json={"message": refusal})
         self.merges.append((typ, keep, drop))
-        for objects in self.store.values():
-            for obj in objects.values():
-                _repoint(obj, drop, keep)
-        loser = self.store[typ].pop(drop)
-        winner = self.store[typ][keep]
-        # Place.merge also unions the enclosures (_merge_placeref_list), which
-        # is how a merged place ends up with two undated parents.
-        for key in ("media_list", "note_list", "citation_list", "tag_list", "placeref_list"):
-            if loser.get(key):
-                merged = list(winner.get(key) or [])
-                for entry in loser[key]:
-                    if entry not in merged:
-                        merged.append(entry)
-                winner[key] = merged
+        if typ == "person":
+            self._merge_person(keep, drop, family_merger=True)
+        elif typ == "family":
+            self._merge_family(keep, drop)
+        else:
+            winner, loser = self.store[typ][keep], self.store[typ][drop]
+            _merge_privacy(winner, loser)
+            if typ == "citation":
+                order = [0, 4, 1, 3, 2]  # Citation.merge keeps the earlier of these
+                pair = (winner.get("confidence", 2), loser.get("confidence", 2))
+                winner["confidence"] = order[min(order.index(c) for c in pair)]
+            for key in _MERGED_LISTS.get(typ, ()):
+                _merge_entries(winner, loser, key)
+            self._replace_everywhere(drop, keep)
+            self.store[typ].pop(drop)
+            if typ == "event":
+                for person in self.store["person"].values():
+                    if any(r.get("ref") == keep for r in person.get("event_ref_list") or []):
+                        self._set_birth_death(person)
         return httpx.Response(200, json=[])
+
+    def _replace_everywhere(self, old: str, new: str) -> None:
+        for objects in self.store.values():
+            for handle, obj in objects.items():
+                if handle != old:
+                    _replace_reference(obj, old, new)
+
+    def _set_birth_death(self, person: dict) -> None:
+        """The first Birth and Death in the Primary role, as the server computes them."""
+        for key, wanted in (("birth_ref_index", "Birth"), ("death_ref_index", "Death")):
+            person[key] = next(
+                (
+                    i
+                    for i, ref in enumerate(person.get("event_ref_list") or [])
+                    if ref.get("role", "Primary") == "Primary"
+                    and (self.store["event"].get(ref.get("ref")) or {}).get("type") == wanted
+                ),
+                -1,
+            )
+
+    def _merge_person(self, keep: str, drop: str, *, family_merger: bool) -> None:
+        winner, loser = self.store["person"][keep], self.store["person"][drop]
+        # Person.merge
+        if loser.get("gramps_id"):
+            winner.setdefault("attribute_list", []).append(
+                _complete("Attribute", {"type": "Merged Gramps ID", "value": loser["gramps_id"]})
+            )
+        _merge_privacy(winner, loser)
+        names = [winner.get("primary_name") or {}, *(winner.get("alternate_names") or [])]
+        for name in [loser.get("primary_name") or {}, *(loser.get("alternate_names") or [])]:
+            match = next((n for n in names if _same(n, name, _SAME_ENTRY["alternate_names"])), None)
+            if match is None:
+                winner.setdefault("alternate_names", []).append(copy.deepcopy(name))
+                names.append(winner["alternate_names"][-1])
+            elif match != name:
+                _absorb(match, name)
+        for key in _MERGED_LISTS["person"]:
+            _merge_entries(winner, loser, key)
+        for key in ("parent_family_list", "family_list"):
+            for handle in loser.get(key) or []:
+                if handle not in winner.setdefault(key, []):
+                    winner[key].append(handle)
+        # MergePersonQuery: repoint, then merge families left with the same parents
+        self._replace_everywhere(drop, keep)
+        self.store["person"].pop(drop)
+        if family_merger:
+            seen: dict[tuple, str] = {}
+            for handle in list(winner.get("family_list") or []):
+                family = self.store["family"].get(handle) or {}
+                parents = (family.get("father_handle"), family.get("mother_handle"))
+                if parents in seen:
+                    self._merge_family_into(seen[parents], handle, survivor=keep)
+                    break  # Gramps merges one pair and skips anything more complex
+                seen[parents] = handle
+        self._set_birth_death(winner)
+
+    def _merge_family(self, keep: str, drop: str) -> None:
+        winner, loser = self.store["family"][keep], self.store["family"][drop]
+        for key in ("father_handle", "mother_handle"):
+            mine, theirs = winner.get(key), loser.get(key)
+            if mine and theirs and mine != theirs:
+                self._merge_person(mine, theirs, family_merger=False)
+            elif theirs and not mine:
+                winner[key] = theirs
+        self._merge_family_into(keep, drop, survivor=None)
+
+    def _merge_family_into(self, keep: str, drop: str, *, survivor: str | None) -> None:
+        """MergeFamilyQuery / MergePersonQuery.merge_families, once the parents agree."""
+        winner, loser = self.store["family"][keep], self.store["family"][drop]
+        if _type_name(winner.get("type")) == "Unknown":
+            winner["type"] = loser.get("type")
+        _merge_privacy(winner, loser)
+        for key in _MERGED_LISTS["family"]:
+            _merge_entries(winner, loser, key)
+        for ref in loser.get("child_ref_list") or []:
+            child = self.store["person"].get(ref.get("ref")) or {}
+            links = child.get("parent_family_list") or []
+            if keep in links:
+                child["parent_family_list"] = [h for h in links if h != drop]
+            else:
+                child["parent_family_list"] = [keep if h == drop else h for h in links]
+        for key in ("father_handle", "mother_handle"):
+            parent = self.store["person"].get(winner.get(key) or "")
+            if parent is not None:
+                parent["family_list"] = [h for h in parent.get("family_list") or [] if h != drop]
+        self._replace_everywhere(drop, keep)
+        self.store["family"].pop(drop)
 
     def _transactions(self, path: str, method: str, request: httpx.Request) -> httpx.Response:
         if path.rstrip("/") == "/api/transactions/history":
@@ -1032,21 +1210,187 @@ def _unreference(node: Any, handle: str) -> None:
                 _unreference(value, handle)
 
 
-def _repoint(node: Any, old: str, new: str) -> None:
+#: How Gramps tells two entries of a list apart when it merges -- each class's
+#: ``is_equivalent`` (gramps/gen/lib, Gramps 6.0). Entries agreeing on these
+#: keys are one entry, whose privacy, citations, notes and attributes are
+#: combined; any other entry is appended.
+_SAME_ENTRY = {
+    "event_ref_list": ("ref", "role"),
+    "child_ref_list": ("ref",),
+    "person_ref_list": ("ref", "rel"),
+    "reporef_list": ("ref", "call_number", "media_type"),
+    "placeref_list": ("ref", "date"),
+    "attribute_list": ("type", "value"),
+    "urls": ("type", "path", "desc"),
+    "address_list": (
+        "street",
+        "locality",
+        "city",
+        "county",
+        "state",
+        "country",
+        "postal",
+        "phone",
+        "date",
+    ),
+    "alternate_names": (
+        "first_name",
+        "call",
+        "suffix",
+        "title",
+        "nick",
+        "famnick",
+        "type",
+        "date",
+        "surname_list",
+    ),
+    "alt_names": ("value", "lang", "date"),
+    "media_list": ("ref", "rect"),
+    "lds_ord_list": ("type", "place", "famc", "temple", "status", "date"),
+}
+
+#: The lists each class's ``merge`` combines (gramps/gen/lib, Gramps 6.0).
+_MERGED_LISTS = {
+    "person": (
+        "event_ref_list",
+        "lds_ord_list",
+        "media_list",
+        "address_list",
+        "attribute_list",
+        "urls",
+        "person_ref_list",
+        "note_list",
+        "citation_list",
+        "tag_list",
+    ),
+    "family": (
+        "event_ref_list",
+        "lds_ord_list",
+        "media_list",
+        "child_ref_list",
+        "attribute_list",
+        "note_list",
+        "citation_list",
+        "tag_list",
+    ),
+    "event": ("attribute_list", "note_list", "citation_list", "media_list", "tag_list"),
+    "source": ("note_list", "media_list", "tag_list", "attribute_list", "reporef_list"),
+    "citation": ("note_list", "media_list", "tag_list", "attribute_list"),
+    "repository": ("address_list", "urls", "note_list", "tag_list"),
+    "note": ("tag_list",),
+    "media": ("attribute_list", "note_list", "citation_list", "tag_list"),
+    "place": (
+        "alt_names",
+        "media_list",
+        "urls",
+        "note_list",
+        "citation_list",
+        "tag_list",
+        "placeref_list",
+    ),
+}
+
+
+def _person_merge_refusal(keep: dict, drop: dict) -> str | None:
+    """MergePersonQuery's MergeError, which the server answers with 409."""
+    keep_fams, drop_fams = set(keep.get("family_list") or []), set(drop.get("family_list") or [])
+    if keep_fams & drop_fams:
+        return "Spouses cannot be merged."
+    if keep_fams & set(drop.get("parent_family_list") or []) or drop_fams & set(
+        keep.get("parent_family_list") or []
+    ):
+        return "A parent and child cannot be merged."
+    return None
+
+
+def _comparable(value: Any) -> Any:
+    """A value as an equivalence test reads it: a date by what it says, not its sort value."""
+    if isinstance(value, dict):
+        if "dateval" in value:
+            keys = ("calendar", "modifier", "quality", "dateval", "text", "newyear")
+            return {k: _comparable(value.get(k)) for k in keys}
+        return {k: _comparable(v) for k, v in value.items() if k not in ("_class", "year")}
+    if isinstance(value, list):
+        return [_comparable(v) for v in value]
+    return value
+
+
+def _same(a: dict, b: dict, keys: tuple) -> bool:
+    return all(_comparable(a.get(k)) == _comparable(b.get(k)) for k in keys)
+
+
+def _merge_privacy(winner: dict, loser: dict) -> None:
+    if "private" in winner or "private" in loser:
+        winner["private"] = bool(winner.get("private")) or bool(loser.get("private"))
+
+
+def _absorb(into: dict, entry: dict) -> None:
+    """One entry merged into its equivalent: privacy, citations, notes, attributes."""
+    _merge_privacy(into, entry)
+    for key in ("citation_list", "note_list", "attribute_list"):
+        if entry.get(key):
+            _merge_entries(into, entry, key)
+
+
+def _merge_entries(winner: dict, loser: dict, key: str) -> None:
+    current = winner.setdefault(key, [])
+    for entry in loser.get(key) or []:
+        if not isinstance(entry, dict):
+            if entry not in current:
+                current.append(entry)
+            continue
+        match = next((e for e in current if _same(e, entry, _SAME_ENTRY.get(key, ()))), None)
+        if match is None:
+            current.append(copy.deepcopy(entry))
+        elif match != entry:
+            _absorb(match, entry)
+
+
+def _collapse(key: str, entries: list) -> list:
+    """A list whose references were repointed, with the duplicates that made merged."""
+    out: list = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            if entry not in out:
+                out.append(entry)
+            continue
+        match = next((e for e in out if _same(e, entry, _SAME_ENTRY.get(key, ("ref",)))), None)
+        if match is None:
+            out.append(entry)
+        else:
+            _absorb(match, entry)
+    return out
+
+
+def _replace_reference(node: Any, old: str, new: str) -> None:
+    """Gramps' replace_handle_reference: repoint, and merge what became duplicates."""
     if isinstance(node, dict):
-        for key, value in node.items():
+        for key, value in list(node.items()):
             if key == "handle":
                 continue
             if value == old:
                 node[key] = new
+            elif isinstance(value, list):
+                touched = old in value or any(
+                    isinstance(e, dict) and e.get("ref") == old for e in value
+                )
+                _replace_reference(value, old, new)
+                if touched:
+                    node[key] = _collapse(key, value)
             else:
-                _repoint(value, old, new)
+                _replace_reference(value, old, new)
     elif isinstance(node, list):
         for i, value in enumerate(node):
             if value == old:
                 node[i] = new
             else:
-                _repoint(value, old, new)
+                _replace_reference(value, old, new)
+
+
+def _type_name(value: Any) -> str:
+    if isinstance(value, dict):
+        return value.get("string") or str(value.get("value", ""))
+    return "" if value is None else str(value)
 
 
 def _gql_match(obj: dict, query: str) -> bool:
@@ -1275,6 +1619,9 @@ async def tools(fake: FakeGramps, tmp_path):
 #: rather than of the tool.
 LOCAL_VALIDATION_ERRORS = frozenset(
     {
+        "date_year",
+        "type_column",
+        "list_comparison",
         "no_criteria",
         "unsupported_type",
         "unsupported_filter",

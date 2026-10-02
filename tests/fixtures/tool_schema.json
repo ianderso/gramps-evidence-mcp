@@ -241,6 +241,11 @@
   "get_place": [
     "place"
   ],
+  "get_record_history": [
+    "limit",
+    "object_type",
+    "ref"
+  ],
   "get_relationship": [
     "all_paths",
     "depth",

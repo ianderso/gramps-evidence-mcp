@@ -282,3 +282,74 @@ async def test_an_undated_death_event_marks_a_person_historical(service):
     born_1950 = {"_class": "Date", "dateval": [0, 0, 1950, False], "text": ""}
     assert service._person_restricted(0, born_1950, empty) is False
     assert service._person_restricted(0, born_1950, None) is True
+
+
+# --------------------------------------------------------------------------- #
+# Forms the server answers wrongly are refused before they reach it
+# --------------------------------------------------------------------------- #
+def _where(path, op, value) -> list:
+    return [{"column": {"json_path": path}, "op": op, "value": value}]
+
+
+@pytest.mark.parametrize(
+    ("args", "fixed"),
+    [
+        ({"where": _where(["date", "year"], "lt", 1800)}, "['date', 'dateval', 2]"),
+        (
+            {"select": [{"json_path": ["birth", "date", "year"], "as": "y"}]},
+            "['birth', 'date', 'dateval', 2]",
+        ),
+        (
+            {"order_by": [{"column": {"json_path": ["date", "year"]}, "direction": "asc"}]},
+            "['date', 'dateval', 2]",
+        ),
+    ],
+)
+async def test_a_date_year_is_refused_with_the_path_that_works(tools, args, fixed):
+    out = await tools("query_records", object_type="person", **args)
+    assert out["error"] == "date_year", out
+    assert fixed in out["message"]
+    assert not tools.fake.query_bodies, "refused before reaching the server"
+
+
+async def test_type_as_a_plain_column_points_events_at_event_type(tools):
+    out = await tools(
+        "query_records",
+        object_type="event",
+        where=[{"column": "type", "op": "eq", "value": 12}],
+    )
+    assert out["error"] == "type_column"
+    assert "event_type=" in out["message"]
+    family = await tools(
+        "query_records",
+        object_type="family",
+        order_by=[{"column": "type", "direction": "asc"}],
+    )
+    assert family["error"] == "type_column"
+    assert '["type", "value"]' in family["message"]
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        _where(["citation_list"], "eq", []),
+        _where(["citation_list"], "ne", []),
+        _where(["date", "dateval"], "eq", [0, 0, 1850, False]),
+    ],
+)
+async def test_a_list_value_is_refused_except_with_in(tools, where):
+    out = await tools("query_records", object_type="event", where=where)
+    assert out["error"] == "list_comparison", out
+    assert "contains" in out["message"] and "list_unsourced_facts" in out["message"]
+    assert not tools.fake.query_bodies
+
+
+async def test_the_forms_that_work_still_pass(tools):
+    for where in (
+        [{"column": "gramps_id", "op": "in", "value": ["E0001", "E0002"]}],
+        _where(["citation_list"], "contains", "h000001"),
+        _where(["date", "dateval", 2], "gt", 0),
+        [{"column": {"json_path": ["type", "value"]}, "op": "eq", "value": 12}],
+    ):
+        out = await tools("query_records", object_type="event", where=where)
+        assert "error" not in out, (where, out)

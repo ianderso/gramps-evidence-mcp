@@ -167,6 +167,8 @@ async def fake_tools(cache_dir: Path) -> AsyncIterator[Any]:
     from tests.conftest import FakeGramps
 
     fake = FakeGramps()
+    if LIVE_VERSION:  # answer as the version it is being compared with
+        fake.metadata["gramps_webapi"]["version"] = LIVE_VERSION
     with respx.mock(base_url="http://testserver") as router:
         router.route().mock(side_effect=fake.handle)
         client = GrampsWebClient("http://testserver", "mcp", "pw")

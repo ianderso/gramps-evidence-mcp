@@ -990,6 +990,40 @@ class GrampsWebClient:
         data = resp.json()
         return data if isinstance(data, list) else [data]
 
+    async def object_history(
+        self, object_type: str, handle: str, *, pagesize: int = 20
+    ) -> tuple[list[dict], int]:
+        """One object's changes, newest first: ``(changes, total)``.
+
+        ``GET /api/transactions/history/objects/{class}/{handle}``, added in
+        gramps-webapi 3.22. A handle the history does not know gives an empty
+        list, which is how a deleted object's history is still reachable.
+
+        Raises
+        ------
+        UnsupportedServerError
+            On a server without the endpoint, naming its version.
+        """
+        path = f"/api/transactions/history/objects/{_CLASS_NAMES[object_type]}/{_seg(handle)}"
+        try:
+            resp = await self._request(
+                "GET", path, params={"sort": "-id", "page": 1, "pagesize": pagesize}
+            )
+        except GrampsApiError as exc:
+            if exc.status != 404:
+                raise
+            meta = await self.metadata()
+            version = ((meta.get("gramps_webapi") or {}) if isinstance(meta, dict) else {}).get(
+                "version"
+            )
+            raise UnsupportedServerError(
+                f"A record's change history needs gramps-webapi 3.22 or later; this "
+                f"server runs {version or 'an older one'}. list_transactions shows the "
+                "recent writes across the whole tree."
+            ) from exc
+        changes = resp.json()
+        return changes, int(resp.headers.get("X-Total-Count") or len(changes))
+
     async def transaction(self, transaction_id: int) -> dict:
         """Read one transaction from the change log."""
         resp = await self._request("GET", f"/api/transactions/history/{transaction_id}")

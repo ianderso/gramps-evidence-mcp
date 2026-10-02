@@ -187,6 +187,8 @@ async def _building_and_reading(step: Recorder) -> None:
     await step("check_family_links", include_private=True)
     await step("get_dna_matches", person=child["gramps_id"])
     await step("list_tags")
+    await step("get_record_history", object_type="person", ref=father["gramps_id"])
+    await step("get_record_history", object_type="family", ref=family["gramps_id"])
     await step(
         "query_records",
         object_type="event",
@@ -346,6 +348,156 @@ def _differences(fake: Any, live: Any, path: str = "") -> list[str]:
     return []
 
 
+async def _merging(step: Recorder) -> None:
+    """Each kind of object merged through merge_objects, as Gramps merges it."""
+
+    def cite(title: str, page: str) -> dict:
+        return {"source_title": title, "page": page}
+
+    # Two records of one man, each with what the other lacks.
+    elias = await step(
+        "add_person",
+        given="Elias",
+        surname="Wren",
+        gender="male",
+        birth={"date": "1801", "citation": cite("Register of Births", "p. 12")},
+    )
+    other = await step(
+        "add_person",
+        given="Elias",
+        surname="Wrenn",
+        gender="male",
+        birth={"date": "about 1801", "citation": cite("Census 1850", "sheet 4")},
+        death={"date": "1866", "citation": cite("Register of Deaths", "p. 3")},
+    )
+    await step(
+        "add_alternate_name",
+        person=other["gramps_id"],
+        given="Elias",
+        surname="Renn",
+        citation=cite("Census 1860", "sheet 9"),
+    )
+    await step(
+        "add_note", text="seen in two censuses", target=other["gramps_id"], target_type="person"
+    )
+    await step(
+        "add_attribute",
+        object_type="person",
+        target=other["gramps_id"],
+        name="Occupation",
+        value="Smith",
+    )
+    await step(
+        "add_url", object_type="person", target=other["gramps_id"], url="https://example.org/elias"
+    )
+    await step("tag_object", object_type="person", target=other["gramps_id"], tag="Duplicate")
+    hannah = await step("add_person", given="Hannah", surname="Ashbee", gender="female")
+    mercy = await step("add_person", given="Mercy", surname="Wren", gender="female")
+    hope = await step("add_person", given="Hope", surname="Wren", gender="female")
+    first = await step(
+        "add_family",
+        father=elias["gramps_id"],
+        mother=hannah["gramps_id"],
+        children=[mercy["gramps_id"]],
+        marriage={"date": "1828", "citation": cite("Register of Marriages", "p. 7")},
+    )
+    second = await step(
+        "add_family",
+        father=other["gramps_id"],
+        mother=hannah["gramps_id"],
+        children=[hope["gramps_id"]],
+        marriage={"date": "1828", "citation": cite("Banns", "p. 2")},
+    )
+    for dry_run in (True, False):
+        await step(
+            "merge_objects",
+            object_type="person",
+            keep=elias["gramps_id"],
+            drop=other["gramps_id"],
+            dry_run=dry_run,
+        )
+    await step("get_person", person=elias["gramps_id"])
+    await step("check_family_links", include_private=True)
+
+    # The two families now share both parents: merge them.
+    for dry_run in (True, False):
+        await step(
+            "merge_objects",
+            object_type="family",
+            keep=first["gramps_id"],
+            drop=second["gramps_id"],
+            dry_run=dry_run,
+        )
+    await step("get_family", family=first["gramps_id"])
+    await step("check_family_links", include_private=True)
+
+    # Two events, two sources, two citations, two notes, two repositories.
+    residences = [
+        await step(
+            "add_event_to_person",
+            person=mercy["gramps_id"],
+            event={
+                "type": "Residence",
+                "date": "1850",
+                "citation": cite(f"Census 1850 copy {n}", f"sheet {n}"),
+            },
+        )
+        for n in (1, 2)
+    ]
+    await step(
+        "merge_objects",
+        object_type="event",
+        keep=residences[0]["event_handle"],
+        drop=residences[1]["event_handle"],
+        dry_run=False,
+    )
+    sources = [await step("add_source", title=f"Deed Book {n}", author="Recorder") for n in (1, 2)]
+    repos = [
+        await step("add_repository", name=f"Library {n}", repository_type="Library") for n in (1, 2)
+    ]
+    for source, repo in zip(sources, repos, strict=True):
+        await step(
+            "link_repositories",
+            items=[
+                {"source": source["handle"], "repository": repo["handle"], "media_type": "Book"}
+            ],
+        )
+    citations = [
+        await step("add_citation", citation={"source": sources[n]["handle"], "page": f"p. {n}"})
+        for n in (0, 1)
+    ]
+    await step(
+        "merge_objects",
+        object_type="source",
+        keep=sources[0]["handle"],
+        drop=sources[1]["handle"],
+        dry_run=False,
+    )
+    await step(
+        "merge_objects",
+        object_type="citation",
+        keep=citations[0]["handle"],
+        drop=citations[1]["handle"],
+        dry_run=False,
+    )
+    await step(
+        "merge_objects",
+        object_type="repository",
+        keep=repos[0]["handle"],
+        drop=repos[1]["handle"],
+        dry_run=False,
+    )
+    notes = [await step("add_note", text=f"finding {n}") for n in (1, 2)]
+    await step(
+        "merge_objects",
+        object_type="note",
+        keep=notes[0]["handle"],
+        drop=notes[1]["handle"],
+        dry_run=False,
+    )
+    await step("get_backlinks", object_type="source", ref=sources[0]["handle"])
+
+
 async def _compare(tmp_path, scenario) -> None:
     async with fake_tools(tmp_path / "fake") as call:
         step = Recorder(call)
@@ -369,3 +521,7 @@ async def test_building_and_reading_answer_as_the_server_does(live_server, tmp_p
 
 async def test_editing_and_deleting_answer_as_the_server_does(live_server, tmp_path):
     await _compare(tmp_path, _editing_and_deleting)
+
+
+async def test_merging_answers_as_the_server_does(live_server, tmp_path):
+    await _compare(tmp_path, _merging)
