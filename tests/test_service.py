@@ -295,7 +295,9 @@ async def test_add_attribute_picks_attribute_vs_srcattribute(service, fake):
     assert fake.store["person"][p["handle"]]["attribute_list"][0]["type"] == "Occupation"
 
     src = await service.add_source("A book", None, None, None, None, None)
-    await service.add_attribute("source", src["handle"], "URL", "https://example.com")
+    await service.add_attribute(
+        "source", src["handle"], "URL", "https://example.com", allow_new_type=True
+    )
     method, typ, sent = fake.requests[-1]
     assert (method, typ) == ("PUT", "source")
     assert sent["attribute_list"][0]["_class"] == "SrcAttribute"
@@ -307,7 +309,7 @@ async def test_add_url_supported_and_unsupported(service, fake):
     assert "error" not in ok
     url = fake.store["person"][p["handle"]]["urls"][0]
     assert url["path"] == "https://findagrave.com/1"
-    assert url["type"] == "Web Home Page"
+    assert url["type"] == "Web Home"
 
     src = await service.add_source("Book", None, None, None, None, None)
     bad = await service.add_url("source", src["handle"], "https://x")
@@ -389,7 +391,7 @@ async def test_get_source_shape(service, fake):
     repo = await service.add_repository("NARA", "Archive", None)
     src = await service.add_source("Census", "Gov", "1900", None, None, None)
     await service.link_repository(src["handle"], repo["handle"], call_number="T9")
-    await service.add_attribute("source", src["handle"], "URL", "https://x")
+    await service.add_attribute("source", src["handle"], "URL", "https://x", allow_new_type=True)
     detail = await service.get_source(src["handle"])
     assert detail["title"] == "Census"
     assert detail["author"] == "Gov"

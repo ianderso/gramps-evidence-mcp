@@ -12,8 +12,8 @@ approval.
 from __future__ import annotations
 
 
-async def _place(tools, name, place_type, parent=""):
-    return await tools("add_place", name=name, place_type=place_type, parent=parent)
+async def _place(tools, name, place_type, parent="", **kw):
+    return await tools("add_place", name=name, place_type=place_type, parent=parent, **kw)
 
 
 async def _hierarchy(tools):
@@ -106,7 +106,7 @@ async def test_keep_both_keeps_the_union(tools):
 async def test_a_dated_enclosure_is_never_pruned(tools):
     """A dated enclosure is a deliberate alternative: a territory before a state."""
     state, county = await _hierarchy(tools)
-    territory = await _place(tools, "Iowa Territory", "Territory")
+    territory = await _place(tools, "Iowa Territory", "Territory", allow_new_type=True)
     keep = await _place(tools, "Des Moines", "City", county["gramps_id"])
     drop = await _place(tools, "Des Moines", "City")
     tools.fake.store["place"][drop["handle"]]["placeref_list"] = [

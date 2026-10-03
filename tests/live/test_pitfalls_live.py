@@ -9,6 +9,8 @@ unit tests instead.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from gramps_evidence_mcp.client import GrampsApiError
@@ -651,12 +653,44 @@ async def test_25_a_family_merge_that_would_merge_a_father_and_son_is_refused_40
 
 
 # --------------------------------------------------------------------------- #
-# Vocabularies the edit tools validate against
+# 26: type names are matched exactly, and the rest kept as custom for good
 # --------------------------------------------------------------------------- #
-async def test_type_vocabularies_carry_the_keys_the_tools_read(live):
+async def test_26_a_name_not_spelt_exactly_is_stored_as_a_lasting_custom_type(live):
+    client = live.client
+    lower = await _event(client, "census")
+    assert (await client.get_object("event", lower["handle"]))["type"] == "census"
+    exact = await _event(client, "Census")
+    custom = (await client.types())["custom"]["event_types"]
+    assert "census" in custom and "Census" not in custom
+    new = f"Land Grant {uuid.uuid4().hex[:8]}"
+    made = await _event(client, new)
+    assert new in (await client.types())["custom"]["event_types"]
+    for event in (lower, exact, made):
+        await client.delete_object("event", event["handle"])
+    assert new in (await client.types())["custom"]["event_types"], "never taken off the list"
+
+
+async def test_26_every_vocabulary_the_tools_match_is_served(live):
     types = await live.client.types()
-    for key in ("event_types", "event_role_types", "child_reference_types", "name_types"):
+    for key in (
+        "event_types",
+        "event_role_types",
+        "child_reference_types",
+        "name_types",
+        "family_relation_types",
+        "place_types",
+        "note_types",
+        "repository_types",
+        "source_media_types",
+        "url_types",
+        "attribute_types",
+        "source_attribute_types",
+    ):
         assert key in types["default"], key
-        assert key in types["custom"], key
+    for kind in ("person", "family", "event", "media", "source"):
+        assert f"{kind}_attribute_types" in types["custom"], kind
     assert "Stepchild" in types["default"]["child_reference_types"]
     assert "Custom" not in types["default"]["child_reference_types"]
+    assert types["default"]["source_attribute_types"] == ["Unknown"]
+    assert "Web Home" in types["default"]["url_types"]
+    assert "Web Home Page" not in types["default"]["url_types"]

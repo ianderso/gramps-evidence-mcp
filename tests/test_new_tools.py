@@ -766,27 +766,28 @@ async def test_update_place_refuses_to_flatten_dated_enclosures(service, fake):
 
 
 async def test_update_url_retypes_one_entry_and_leaves_the_rest(service, fake):
-    """A Find a Grave link filed under the wrong type, 'Web Home Page'."""
+    """A Find a Grave link filed under the wrong type, 'Web Home'."""
     person = await _person(service)
     await service.add_url(
-        "person", person["gramps_id"], "https://example.com/home", "homepage", "Web Home Page"
+        "person", person["gramps_id"], "https://example.com/home", "homepage", "Web Home"
     )
     await service.add_url(
         "person",
         person["gramps_id"],
         "https://www.findagrave.com/memorial/123",
         "memorial",
-        "Web Home Page",
+        "Web Home",
     )
     result = await service.update_url(
         "person",
         person["gramps_id"],
         "findagrave.com/memorial/123",
         url_type="Find A Grave",
+        allow_new_type=True,
     )
     assert result["changed"] is True
     urls = fake.store["person"][person["handle"]]["urls"]
-    assert [u["type"] for u in urls] == ["Web Home Page", "Find A Grave"]
+    assert [u["type"] for u in urls] == ["Web Home", "Find A Grave"]
     assert urls[1]["path"] == "https://www.findagrave.com/memorial/123"  # untouched
 
 
@@ -799,35 +800,29 @@ async def test_update_url_refuses_zero_or_multiple_matches(service, fake):
         person["gramps_id"],
         "https://www.findagrave.com/memorial/123",
         "",
-        "Web Home Page",
+        "Web Home",
     )
     await service.add_url(
         "person",
         person["gramps_id"],
         "https://www.findagrave.com/memorial/456",
         "",
-        "Web Home Page",
+        "Web Home",
     )
     with pytest.raises(NotFoundError):
         await service.update_url(
-            "person", person["gramps_id"], "ancestry.com", url_type="Find A Grave"
+            "person", person["gramps_id"], "ancestry.com", url_type="Web Search"
         )
     with pytest.raises(NotFoundError):
-        await service.update_url(
-            "person", person["gramps_id"], "findagrave", url_type="Find A Grave"
-        )
+        await service.update_url("person", person["gramps_id"], "findagrave", url_type="Web Search")
     urls = fake.store["person"][person["handle"]]["urls"]
-    assert all(u["type"] == "Web Home Page" for u in urls)  # nothing changed
+    assert all(u["type"] == "Web Home" for u in urls)  # nothing changed
 
 
 async def test_update_url_can_remove_exactly_one_entry(service, fake):
     person = await _person(service)
-    await service.add_url(
-        "person", person["gramps_id"], "https://example.com/a", "", "Web Home Page"
-    )
-    await service.add_url(
-        "person", person["gramps_id"], "https://example.com/b", "", "Web Home Page"
-    )
+    await service.add_url("person", person["gramps_id"], "https://example.com/a", "", "Web Home")
+    await service.add_url("person", person["gramps_id"], "https://example.com/b", "", "Web Home")
     result = await service.update_url("person", person["gramps_id"], "example.com/a", remove=True)
     assert result["changed"] is True
     urls = fake.store["person"][person["handle"]]["urls"]
