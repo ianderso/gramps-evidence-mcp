@@ -10,6 +10,10 @@ drift unnoticed. To regenerate it, against an empty throwaway tree::
     export $(tests/live/start_server.sh 3.21.1)
     uv run python -m tests.live.capture_defaults
 
+It also records Gramps' standard type names (``GET /api/types/``, under
+``default``), which the tools match a caller's type names against
+(docs/PITFALLS.md section 26), so the fake refuses and accepts the same names.
+
 Each request below sends, somewhere, one instance of every class with nothing
 but its ``_class`` (and the ``ref`` a reference needs): what comes back for it
 is that class's default. Every nested object sent with a ``_class`` also
@@ -134,6 +138,7 @@ async def capture() -> dict:
     defaults: dict[str, dict] = {}
     nested: dict[str, dict] = {}
     try:
+        types = (await client.types())["default"]
         refs = {}
         for object_type, cls in TOP_LEVEL:
             sent = _c(cls)
@@ -151,12 +156,14 @@ async def capture() -> dict:
     return {
         "_comment": (
             f"What gramps-webapi {version} stores for a field a request leaves out, by "
-            "class, and which class each nested field holds. Written by "
-            "tests/live/capture_defaults.py; checked by tests/live/test_contract_live.py."
+            "class, which class each nested field holds, and its standard type names. "
+            "Written by tests/live/capture_defaults.py; checked by "
+            "tests/live/test_contract_live.py."
         ),
         "defaults": dict(sorted(defaults.items())),
         "nested": {k: dict(sorted(v.items())) for k, v in sorted(nested.items())},
         "nulls": nulls,
+        "types": dict(sorted(types.items())),
     }
 
 

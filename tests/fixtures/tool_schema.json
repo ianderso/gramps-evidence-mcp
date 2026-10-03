@@ -1,5 +1,6 @@
 {
   "add_alternate_name": [
+    "allow_new_type",
     "citation",
     "given",
     "name_prefix",
@@ -10,12 +11,14 @@
     "surname"
   ],
   "add_attribute": [
+    "allow_new_type",
     "name",
     "object_type",
     "target",
     "value"
   ],
   "add_child_to_family": [
+    "allow_new_type",
     "child",
     "family",
     "frel",
@@ -31,6 +34,7 @@
     "segments"
   ],
   "add_event_ref": [
+    "allow_new_type",
     "event",
     "person",
     "role"
@@ -46,6 +50,7 @@
     "require_citation"
   ],
   "add_family": [
+    "allow_new_type",
     "children",
     "father",
     "marriage",
@@ -59,6 +64,7 @@
     "file_path"
   ],
   "add_note": [
+    "allow_new_type",
     "note_type",
     "target",
     "target_type",
@@ -75,6 +81,7 @@
     "surname"
   ],
   "add_place": [
+    "allow_new_type",
     "code",
     "latitude",
     "longitude",
@@ -84,12 +91,14 @@
     "title"
   ],
   "add_repository": [
+    "allow_new_type",
     "name",
     "repository_type",
     "url"
   ],
   "add_source": [
     "abbreviation",
+    "allow_new_type",
     "author",
     "call_number",
     "media_type",
@@ -98,6 +107,7 @@
     "title"
   ],
   "add_url": [
+    "allow_new_type",
     "description",
     "object_type",
     "target",
@@ -281,9 +291,11 @@
     "person"
   ],
   "link_repositories": [
+    "allow_new_type",
     "items"
   ],
   "link_repository": [
+    "allow_new_type",
     "call_number",
     "media_type",
     "repository",
@@ -385,6 +397,7 @@
     "transaction_id"
   ],
   "update_alternate_name": [
+    "allow_new_type",
     "given",
     "match",
     "name_prefix",
@@ -396,6 +409,7 @@
     "surname"
   ],
   "update_child_ref": [
+    "allow_new_type",
     "child",
     "family",
     "frel",
@@ -428,6 +442,7 @@
     "path"
   ],
   "update_object_fields": [
+    "allow_new_type",
     "fields",
     "object_type",
     "ref"
@@ -441,6 +456,7 @@
     "reason"
   ],
   "update_place": [
+    "allow_new_type",
     "code",
     "latitude",
     "longitude",
@@ -459,6 +475,7 @@
     "title"
   ],
   "update_url": [
+    "allow_new_type",
     "description",
     "match",
     "object_type",

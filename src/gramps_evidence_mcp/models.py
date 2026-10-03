@@ -14,7 +14,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 
 class Gender(str, Enum):
@@ -191,6 +191,13 @@ class EventInput(_StrictInput):
     citation: CitationInput | None = Field(
         default=None, description="Citation supporting this event (see require_citation)."
     )
+    allow_new_type: bool = Field(
+        default=False,
+        description="Accept a type that is neither a Gramps standard type nor one of "
+        "the tree's custom types, creating it as a new custom type. Only when meant: a "
+        "near-miss is refused with the closest names.",
+    )
+    _type_resolved: bool = PrivateAttr(default=False)
 
 
 class VitalEventInput(EventInput):

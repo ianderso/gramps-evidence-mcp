@@ -316,6 +316,16 @@ the event with an **`UNSOURCED=true` attribute** so `list_unsourced_facts` can
 find it later. Confidence levels map to Gramps' 0–4 scale
 (`very_low, low, normal, high, very_high`).
 
+**Type names are Gramps' own.** Gramps stores any type name it does not know
+exactly — `"birth"`, `"Web Home Page"` — as a new custom type, beside the
+standard one it was meant to be, and keeps it in the tree's vocabulary for
+good. So every write matches a type name first: against Gramps' standard names
+and the tree's custom ones, ignoring case and punctuation, then through a few
+unambiguous synonyms ("Born" is Birth, "microfilm" is Film). A name that still
+matches nothing is refused with the closest names; `allow_new_type` creates it
+when a new custom type is meant ("Land Grant", a "Territory" place).
+[docs/PITFALLS.md](docs/PITFALLS.md) section 26 has the details.
+
 ### How writes map to DbTxn transactions
 
 `gramps-webapi` wraps every object create/update in its own server-side `DbTxn`
@@ -503,7 +513,7 @@ unfiltered listing of the first 200 objects.
 | `search_people` | Name substring + optional birth-year range (privacy-filtered). |
 | `get_ancestors` / `get_descendants` | Walk the tree N generations (privacy-filtered). |
 | `list_tags` | Every tag with handle, name and colour. |
-| `list_object_types` | The tree's type vocabularies (an unknown type string becomes a new custom type). |
+| `list_object_types` | The type names the write tools accept: Gramps' standard ones and the tree's custom ones. |
 
 **Audit**
 
@@ -673,9 +683,12 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
 - **No tree selector.** On gramps-webapi the tree is bound to the account you
   authenticate as; no data endpoint takes a tree parameter. To work against a
   different tree, use credentials belonging to it.
-- Type strings (`"Birth"`, `"Married"`) rely on the server's English/locale type
-  coercion. If your instance runs a non-English default locale, prefer canonical
-  English type names.
+- Type names (`"Birth"`, `"Married"`) are matched against Gramps' English
+  standard names and the tree's custom ones, ignoring case and punctuation,
+  with a few clear synonyms ("Born" is Birth). Anything else is refused with
+  the closest names unless `allow_new_type` asks for a new custom type, so a
+  type name in another language is refused rather than stored: give the
+  English name. See [docs/PITFALLS.md](docs/PITFALLS.md) section 26.
 - `search_people`, `list_unsourced_facts` and `find_duplicates` read whole
   collections. That suits a personal tree of a few thousand people; they are not
   built for very large databases.

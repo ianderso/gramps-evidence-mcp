@@ -90,3 +90,15 @@ async def test_the_query_engine_reads_an_event_type_as_its_number(service):
 
     assert await where(["type", "value"], 12) == 1
     assert await where(["type", "string"], "Birth") == 0
+
+
+async def test_a_name_the_server_does_not_know_exactly_becomes_a_lasting_custom_type(service):
+    """PITFALLS 26: matched case and all; listed from then on, even once unused."""
+    census = await service.client.create_object("event", {"_class": "Event", "type": "census"})
+    await service.client.create_object("event", {"_class": "Event", "type": "Census"})
+    types = await service.client.types()
+    assert "census" in types["custom"]["event_types"]
+    assert "Census" not in types["custom"]["event_types"]
+    assert "Census" in types["default"]["event_types"]
+    await service.client.delete_object("event", census["handle"])
+    assert "census" in (await service.client.types())["custom"]["event_types"]
