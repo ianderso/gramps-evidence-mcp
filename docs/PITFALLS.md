@@ -427,22 +427,60 @@ go further than the two objects asked about:
 refuse before sending it. Verified on 3.21.1 and 3.22.3, where the contract
 tests hold the unit tests' fake to every one of these.
 
-## 26. Type names are matched exactly
+## 26. Type names are matched exactly, and the rest kept for good
 
-The server converts a type given as a string -- an event's type, a name's,
-a child's relationship -- by exact, case-sensitive lookup among the English
-names, then the localized ones (`_set_type_from_string`,
+The server converts a type given as a string -- an event's type, a role, a
+name's type, a child's relationship, a place's, note's, repository's, medium's,
+attribute's or URL's type -- by exact, case-sensitive lookup among Gramps'
+English standard names, then the localized ones (`_set_type_from_string`,
 `api/resources/util.py`). Anything else becomes a new custom type with that
 string. So `"birth"` is not Birth: it is a custom type beside it, which
-filters and Gramps' own birth logic never see.
+filters and Gramps' own birth logic never see. Gramps adds each custom name to
+the tree's vocabulary when it stores an object carrying it, and never takes
+one off, even once nothing uses it (`DbGeneric.commit_*`, saved as metadata
+when the database closes after each request): `GET /api/types/` lists it under
+`custom` from then on.
 
-These are spelt as the tree spells them: an event's type wherever an event is
-created or retyped (an event created with `"census"` is stored as Census, and
-a type the tree has never seen is still created, as a custom one), the role in
-`add_event_ref`, a child's relationships in `update_child_ref`, and a name's
-type in `update_alternate_name`. `update_event` goes further and refuses an
-unknown event type unless `allow_new_type` says it is meant. Everywhere else
-the string is sent as given, so its case matters: `add_alternate_name`'s name
-type, `add_child_to_family`'s relationships, and a place's, note's,
-repository's, family relationship's, repository medium's, attribute's or
-URL's type.
+The standard names are Gramps', not the tree's: `GET /api/types/` lists every
+one under `default` whether the tree has used it or not -- 46 event types on
+Gramps 6.0, Stillbirth and Bas Mitzvah among them. Gramps 6 has no standard
+source attribute but Unknown, so every source or citation attribute name is a
+custom one. Custom attribute names are listed by the kind of object that
+carries them (`person_attribute_types`, `event_attribute_types`, and so on;
+a citation's go with a source's).
+
+So every tool that writes a type name matches it first, against
+`GET /api/types/` read afresh on each call:
+
+1. Gramps' standard names, ignoring case, spacing and punctuation: "census",
+   "cause-of-death" and "E-MAIL" are Census, Cause Of Death and E-mail.
+2. A short list of synonyms, each meaning one standard name unambiguously
+   (`_TYPE_SYNONYMS` in `service.py`): "Born" is Birth, "buried" Burial,
+   "godmother" Godparent, "maiden name" Birth Name, "microfilm" Film, "Web
+   Home Page" Web Home. A near-miss is never on it.
+3. The tree's custom names, matched the same way and spelt as first made. One
+   that a standard name or a synonym already matches -- a "census" or "Web
+   Home Page" an earlier client left -- is never used or offered. An attribute
+   on a person, family, event or media matches a custom name from any of
+   those four lists.
+
+Anything else is refused as `unknown_type`, with the closest names ("Did you
+mean 'Census'?") and both lists. `allow_new_type` makes it a new custom type,
+for one that is meant: "Land Grant", a "Territory" place, the first use of a
+source attribute.
+
+This covers an event's type wherever an event is created or retyped, the role
+in `add_event_ref`, a family's relationship and a child's (`add_family`,
+`add_child_to_family`, `update_child_ref`), a name's type
+(`add_alternate_name`, `update_alternate_name`), a place's (`add_place`,
+`update_place`), a note's (`add_note`), a repository's (`add_repository`), a
+source's medium at a repository (`add_source`, `link_repository`,
+`link_repositories`), an attribute's name (`add_attribute`), a URL's type
+(`add_url`, `update_url`), and the `type` of a note, family or repository set
+through `update_object_fields`. 1.1 and earlier wrote "Web Home Page" as
+`add_url`'s default and as a repository's home-page URL; Gramps has no such
+name, so each made a custom type. Both now write Web Home. A custom name
+already in a tree stays in its vocabulary, and the objects carrying it keep
+it until retyped (`update_event`, `update_url`, `update_place`, ...).
+Verified on 3.21.1 and 3.22.3, where the contract tests also hold the fake's
+standard names to the server's.

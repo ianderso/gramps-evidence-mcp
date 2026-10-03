@@ -79,7 +79,7 @@ async def test_update_child_ref_refuses_what_it_cannot_do(tools):
         )
     )["error"] == "not_a_child"
     bad = await tools(
-        "update_child_ref", family=family["gramps_id"], child=kids[0]["gramps_id"], mrel="Step"
+        "update_child_ref", family=family["gramps_id"], child=kids[0]["gramps_id"], mrel="Godchild"
     )
     assert bad["error"] == "unknown_type"
     assert "Stepchild" in bad["message"]

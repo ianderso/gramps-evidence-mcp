@@ -37,7 +37,7 @@ async def test_the_recorded_defaults_are_the_servers(live_server):
     """The fake completes objects from this file; it must say what the server does."""
     recorded = json.loads(DEFAULTS_FILE.read_text())
     current = await capture()
-    for key in ("defaults", "nested", "nulls"):
+    for key in ("defaults", "nested", "nulls", "types"):
         assert current[key] == recorded[key], (
             f"gramps-webapi now stores different {key}. Regenerate the file with "
             "`uv run python -m tests.live.capture_defaults`, then run the unit tests."

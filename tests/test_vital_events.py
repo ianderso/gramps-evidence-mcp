@@ -5,6 +5,7 @@ death's to Death and a marriage's to Marriage, but the schema required the
 type, so a caller that believed the description was refused before the tool
 ran. And a type was sent to the server as given, which matches names
 case-sensitively: "birth" was stored as a new custom type beside Birth.
+How every type name is matched is tests/test_type_names.py.
 """
 
 from __future__ import annotations
@@ -75,12 +76,20 @@ async def test_an_event_type_is_spelt_as_the_tree_spells_it(tools):
     assert tools.fake.store["event"][out["event_handle"]]["type"] == "Census"
 
 
-async def test_a_type_the_tree_lacks_is_still_created(tools):
+async def test_a_type_the_tree_lacks_is_refused_unless_meant(tools):
+    """Gramps would keep it as a new custom type; that is done only on request."""
     person = await tools("add_person", given="Mercy")
-    out = await tools(
+    refused = await tools(
         "add_event_to_person",
         person=person["gramps_id"],
         event={"type": "Land Grant", "date": "1850", "citation": CITED},
+    )
+    assert refused["error"] == "unknown_type"
+    assert not tools.fake.store["event"]
+    out = await tools(
+        "add_event_to_person",
+        person=person["gramps_id"],
+        event={"type": "Land Grant", "date": "1850", "citation": CITED, "allow_new_type": True},
     )
     assert "error" not in out, out
     assert tools.fake.store["event"][out["event_handle"]]["type"] == "Land Grant"

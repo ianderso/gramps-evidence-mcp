@@ -8,7 +8,7 @@ adding one is a minor release.
 
 ## [Unreleased]
 
-## [1.2.0] — 2026-10-02
+## [1.2.0] — 2026-10-03
 
 What an audit of the documentation and the live suite found open after 1.1.0.
 
@@ -24,8 +24,13 @@ What an audit of the documentation and the live suite found open after 1.1.0.
   as `also_merges`. A merge Gramps refuses -- two spouses, a parent and their
   own child -- is reported by the dry run and refused, as `merge_refused`,
   before anything is sent.
+- `allow_new_type` on every tool that writes a type name, to create a new
+  custom type deliberately (see Changed).
 - Contract tests for merges of every kind against a real server. The unit
   tests' fake now merges as Gramps does, and records each record's history.
+  Its type vocabularies are Gramps' standard names, recorded from a real
+  server and checked against one, and the custom names its stored objects
+  carry, as Gramps keeps them.
 
 ### Fixed
 
@@ -35,10 +40,13 @@ What an audit of the documentation and the live suite found open after 1.1.0.
 - `add_person` given a birth of another type, a Baptism say, made it the
   person's birth until the server unset it on the next edit. It is kept as an
   event and not made the birth, as the server itself computes it.
-- An event created with its type in another case -- "census" -- was stored as
-  a new custom type beside Census, which type filters and Gramps' own birth
-  logic never see. A created event's type is spelt as the tree spells it; a
-  type the tree lacks is still created, as a custom one.
+- A type name in another case -- an event created as "census" -- was stored
+  as a new custom type beside Census, which type filters and Gramps' own
+  birth logic never see. Every type name is now spelt as Gramps spells it
+  (see Changed).
+- `add_url`'s default type, and the type of the URL `add_repository` records,
+  was "Web Home Page", which Gramps does not have: every such URL made a
+  custom type. Both are now Web Home.
 - `query_records` refuses the forms gramps-webapi answers wrongly, and says
   what works instead: `type` as a plain column, which matches nothing; a
   date's `year`, which is not stored; and a list compared with anything but
@@ -46,6 +54,15 @@ What an audit of the documentation and the live suite found open after 1.1.0.
 
 ### Changed
 
+- Every type name a tool writes -- an event's type, a role, a family's or a
+  child's relationship, a name's, place's, note's, repository's, medium's,
+  attribute's or URL's type -- is matched against Gramps' standard names and
+  the tree's custom ones (`GET /api/types/`), ignoring case, spacing and
+  punctuation, then through a short list of unambiguous synonyms ("Born" is
+  Birth, "microfilm" Film). A name that matches nothing is refused as
+  `unknown_type` with the closest names, where 1.1 stored it as a new custom
+  type; `allow_new_type` creates one when it is meant. A standard type the
+  tree has never used is accepted like any other.
 - `docs/PITFALLS.md` section 6 is corrected: the server's `If-Match` support
   cannot be used by any client, since a read's ETag never matches what a write
   checks. 1.1.0 said a stale tag is refused, implying a fresh one is accepted.
@@ -54,7 +71,7 @@ What an audit of the documentation and the live suite found open after 1.1.0.
 - PITFALLS no longer says every server claim is checked live, and names the
   four that are not. Section 13 states the list-comparison rule in full, and
   sections 25 (what a merge also merges) and 26 (type names are matched
-  exactly) are new.
+  exactly, and Gramps keeps every custom name for good) are new.
 - `SECURITY.md` counted 43 read-only tools; there are 45.
 
 ## [1.1.0] — 2026-10-01

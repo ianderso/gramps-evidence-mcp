@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -268,57 +269,13 @@ class FakeGramps:
             "gramps": {"version": "6.0.4"},
             "gramps_webapi": {"version": "3.21.1"},
         }
-        #: GET /api/types/: standard English names under "default" (Gramps'
-        #: get_standard_xml, every standard name but Custom) and the tree's
-        #: own under "custom". The keys are gramps-webapi 3.21.1's.
-        self.types: dict = {
-            "default": {
-                "event_types": [
-                    "Unknown",
-                    "Marriage",
-                    "Birth",
-                    "Death",
-                    "Baptism",
-                    "Burial",
-                    "Census",
-                    "Elected",
-                    "Occupation",
-                    "Property",
-                    "Residence",
-                    "Military Service",
-                ],
-                "event_role_types": [
-                    "Unknown",
-                    "Primary",
-                    "Clergy",
-                    "Celebrant",
-                    "Aide",
-                    "Bride",
-                    "Groom",
-                    "Witness",
-                    "Family",
-                    "Informant",
-                    "Godparent",
-                ],
-                "child_reference_types": [
-                    "None",
-                    "Birth",
-                    "Adopted",
-                    "Stepchild",
-                    "Sponsored",
-                    "Foster",
-                    "Unknown",
-                ],
-                "name_types": ["Unknown", "Also Known As", "Birth Name", "Married Name"],
-            },
-            "custom": {
-                "event_types": ["Widowhood"],
-                "event_role_types": [],
-                "child_reference_types": [],
-                "name_types": [],
-                "family_relation_types": [],
-            },
-        }
+        #: The tree's custom type names, served by GET /api/types/ under
+        #: "custom" beside the standard names recorded from a real server.
+        #: Gramps adds a name when it stores an object carrying it and never
+        #: takes one off, so these only grow (_learn_custom_types). Widowhood
+        #: stands for a custom type the tree already had.
+        self.custom_types: dict[str, set[str]] = {key: set() for key in _CUSTOM_TYPE_STANDARD}
+        self.custom_types["event_types"].add("Widowhood")
         #: When set, DELETE commits and then answers this status, as
         #: gramps-webapi 3.21.1 does when its search-index step fails after
         #: the transaction has landed.
@@ -372,7 +329,22 @@ class FakeGramps:
         response = self._dispatch(request)
         if before is not None and response.status_code < 400:
             self._record_history(before)
+            self._learn_custom_types()
         return response
+
+    def _learn_custom_types(self) -> None:
+        """Add each type name a stored object carries that is not a standard one.
+
+        The server keeps a name it does not know exactly, case and all, as a
+        new custom type (docs/PITFALLS.md section 26), and lists it from then on.
+        """
+        for typ, objects in self.store.items():
+            for obj in objects.values():
+                for key, value in _type_fields(typ, obj):
+                    name = value.get("string") if isinstance(value, dict) else value
+                    standard = _SERVER_SHAPES["types"][_CUSTOM_TYPE_STANDARD[key]]
+                    if isinstance(name, str) and name and name not in standard:
+                        self.custom_types[key].add(name)
 
     def _record_history(self, before: dict) -> None:
         changes = []
@@ -586,7 +558,13 @@ class FakeGramps:
                 return httpx.Response(status, text="Bad Gateway")
             return httpx.Response(200, json=self.metadata)
         if path == "/api/types/":
-            return httpx.Response(200, json=self.types)
+            return httpx.Response(
+                200,
+                json={
+                    "default": copy.deepcopy(_SERVER_SHAPES["types"]),
+                    "custom": {k: sorted(v) for k, v in self.custom_types.items()},
+                },
+            )
         if path == "/api/objects/" and method == "POST":
             payloads = json.loads(request.content or b"[]")
             out = []
@@ -1171,6 +1149,74 @@ _CLASS_TO_TYPE = {
     "Tag": "tag",
 }
 _TYPE_TO_CLASS = {typ: cls for cls, typ in _CLASS_TO_TYPE.items()}
+
+#: GET /api/types/' custom lists, each with the standard list it extends.
+#: Gramps keeps attribute names apart by the kind of object that carries them
+#: but has one standard list for them all; a citation's go with a source's.
+_CUSTOM_TYPE_STANDARD = {
+    "child_reference_types": "child_reference_types",
+    "event_attribute_types": "attribute_types",
+    "event_role_types": "event_role_types",
+    "event_types": "event_types",
+    "family_attribute_types": "attribute_types",
+    "family_relation_types": "family_relation_types",
+    "media_attribute_types": "attribute_types",
+    "name_origin_types": "name_origin_types",
+    "name_types": "name_types",
+    "note_types": "note_types",
+    "person_attribute_types": "attribute_types",
+    "place_types": "place_types",
+    "repository_types": "repository_types",
+    "source_attribute_types": "source_attribute_types",
+    "source_media_types": "source_media_types",
+    "url_types": "url_types",
+}
+
+_ATTRIBUTE_KIND = {
+    "person": "person",
+    "family": "family",
+    "event": "event",
+    "media": "media",
+    "source": "source",
+    "citation": "source",
+}
+
+
+def _type_fields(typ: str, obj: dict) -> Iterator[tuple[str, Any]]:
+    """(custom list, value) for each type-valued field of a stored object."""
+    if typ in _ATTRIBUTE_KIND:
+        for attribute in obj.get("attribute_list") or []:
+            yield f"{_ATTRIBUTE_KIND[typ]}_attribute_types", attribute.get("type")
+    if typ in ("person", "family"):
+        for ref in obj.get("event_ref_list") or []:
+            yield "event_role_types", ref.get("role")
+    for ref in obj.get("media_list") or []:
+        for attribute in ref.get("attribute_list") or []:
+            yield "media_attribute_types", attribute.get("type")
+    if typ in ("person", "place", "repository"):
+        for url in obj.get("urls") or []:
+            yield "url_types", url.get("type")
+    if typ == "event":
+        yield "event_types", obj.get("type")
+    elif typ == "person":
+        for name in [obj.get("primary_name") or {}, *(obj.get("alternate_names") or [])]:
+            yield "name_types", name.get("type")
+            for surname in name.get("surname_list") or []:
+                yield "name_origin_types", surname.get("origintype")
+    elif typ == "family":
+        yield "family_relation_types", obj.get("type")
+        for child in obj.get("child_ref_list") or []:
+            yield "child_reference_types", child.get("frel")
+            yield "child_reference_types", child.get("mrel")
+    elif typ == "place":
+        yield "place_types", obj.get("place_type")
+    elif typ == "repository":
+        yield "repository_types", obj.get("type")
+    elif typ == "source":
+        for ref in obj.get("reporef_list") or []:
+            yield "source_media_types", ref.get("media_type")
+    elif typ == "note":
+        yield "note_types", obj.get("type")
 
 
 def _references(node: Any, handle: str) -> bool:

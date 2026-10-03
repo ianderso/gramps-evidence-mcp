@@ -12,6 +12,7 @@ asserted here, because on a throwaway tree it can be set up deliberately.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from .harness import live_version
@@ -428,6 +429,48 @@ async def test_vital_events_are_typed_and_indexed_as_the_server_keeps_them(live)
     assert await shape() == (["Birth", "Burial"], 0, -1)
     await live("update_person", person=out["gramps_id"], gender="male")
     assert await shape() == (["Birth", "Burial"], 0, -1), "unchanged by the server's recompute"
+
+
+async def test_type_names_are_spelt_as_gramps_does_and_unknown_ones_refused(live):
+    """PITFALLS 26: nothing reaches the server as a near-miss of a standard name."""
+    cited = {"source_title": "Register", "page": "p. 3"}
+    person = await live("add_person", given="Ada", surname="Quillfeather")
+
+    async def event(given_type, **extra):
+        out = await live(
+            "add_event_to_person",
+            person=person["gramps_id"],
+            event={"type": given_type, "date": "1851", "citation": cited, **extra},
+        )
+        if "error" in out:
+            return out
+        return (await live.client.get_object("event", out["event_handle"]))["type"]
+
+    assert await event("stillbirth") == "Stillbirth", "standard, though the tree never used it"
+    assert await event("Born") == "Birth"
+    custom = (await live.client.types())["custom"]["event_types"]
+    assert "stillbirth" not in custom and "Born" not in custom
+
+    held = len((await live.client.get_object("person", person["handle"]))["event_ref_list"])
+    refused = await event("Censsus")
+    assert refused["error"] == "unknown_type"
+    assert "Did you mean 'Census'?" in refused["message"]
+    after = (await live.client.get_object("person", person["handle"]))["event_ref_list"]
+    assert len(after) == held
+
+    new = f"Land Grant {uuid.uuid4().hex[:8]}"
+    assert await event(new, allow_new_type=True) == new
+    assert new in (await live.client.types())["custom"]["event_types"]
+    assert await event(new.upper()) == new, "the tree's own now, matched like a standard one"
+
+    family = await live("add_family", father=person["gramps_id"], relationship="civil union")
+    assert (await live.client.get_object("family", family["handle"]))["type"] == "Civil Union"
+    await live("add_url", object_type="person", target=person["gramps_id"], url="https://x.test")
+    (url,) = (await live.client.get_object("person", person["handle"]))["urls"]
+    assert url["type"] == "Web Home"
+    assert "Web Home" not in (await live.client.types())["custom"]["url_types"]
+    place = await live("add_place", name="Wexcombe", place_type="village")
+    assert (await live.client.get_object("place", place["handle"]))["place_type"] == "Village"
 
 
 # --------------------------------------------------------------------------- #

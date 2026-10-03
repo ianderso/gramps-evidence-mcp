@@ -194,6 +194,16 @@ def _include_private() -> Any:
     )
 
 
+def _allow_new_type() -> Any:
+    """The opt-in every tool that writes a type name takes (PITFALLS 26)."""
+    return Field(
+        default=False,
+        description="Accept a type that is neither a Gramps standard type nor one of "
+        "the tree's custom types, creating it as a new custom type. Only when meant: "
+        "a near-miss is refused with the closest names.",
+    )
+
+
 # ==========================================================================  #
 # WRITE TOOLS
 # ==========================================================================  #
@@ -276,6 +286,7 @@ async def add_family(
     require_citation: bool = Field(
         default=True, description="Require a citation on the marriage event (default)."
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Create a family linking parents and children, with an optional cited marriage.
 
@@ -287,7 +298,13 @@ async def add_family(
     try:
         svc = await state.service_()
         return await svc.add_family(
-            father, mother, children, marriage, relationship, require_citation
+            father,
+            mother,
+            children,
+            marriage,
+            relationship,
+            require_citation,
+            allow_new_type=allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -310,8 +327,9 @@ async def add_source(
     media_type: str = Field(
         default="Unknown",
         description="Medium of the source at that repository, e.g. 'Book', "
-        "'Microfilm', 'Electronic'. Only used with repository.",
+        "'Film', 'Electronic'. Only used with repository.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Create a Source (a body of evidence: a record set, book, certificate, website).
 
@@ -322,7 +340,14 @@ async def add_source(
     try:
         svc = await state.service_()
         return await svc.add_source(
-            title, author, publication_info, abbreviation, repository, call_number, media_type
+            title,
+            author,
+            publication_info,
+            abbreviation,
+            repository,
+            call_number,
+            media_type,
+            allow_new_type=allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -349,9 +374,10 @@ async def add_repository(
     name: str = Field(description="Repository name, e.g. 'National Archives (NARA)'."),
     repository_type: str = Field(
         default="Archive",
-        description="Type: 'Library', 'Archive', 'Cemetery', 'Church', 'Website', etc.",
+        description="Type: 'Library', 'Archive', 'Cemetery', 'Church', 'Web site', etc.",
     ),
     url: str | None = Field(default=None, description="Optional website URL."),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Create a Repository (an institution or place that holds sources).
 
@@ -361,7 +387,7 @@ async def add_repository(
     """
     try:
         svc = await state.service_()
-        return await svc.add_repository(name, repository_type, url)
+        return await svc.add_repository(name, repository_type, url, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -378,6 +404,7 @@ async def add_note(
         description="Type of the target: 'person', 'family', 'event', 'source', "
         "'citation', 'place', 'repository', 'media'.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Create a research/general note, optionally attached to an object.
 
@@ -386,7 +413,7 @@ async def add_note(
     """
     try:
         svc = await state.service_()
-        return await svc.add_note(target, target_type, text, note_type)
+        return await svc.add_note(target, target_type, text, note_type, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -524,6 +551,7 @@ async def add_event_ref(
         description="The person's role in it: 'Primary', 'Witness', 'Informant', "
         "'Godparent', 'Family', 'Clergy', or a custom role the tree already has.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Share an existing event with another person, in a role.
 
@@ -534,7 +562,7 @@ async def add_event_ref(
     """
     try:
         svc = await state.service_()
-        return await svc.add_event_ref(person, event, role)
+        return await svc.add_event_ref(person, event, role, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -608,8 +636,12 @@ async def add_attribute(
         "'source', 'citation'."
     ),
     target: str = Field(description="Handle or gramps_id of the object."),
-    name: str = Field(description="Attribute type/name, e.g. 'Occupation', 'National ID'."),
+    name: str = Field(
+        description="Attribute type/name, e.g. 'Occupation', 'Identification Number', "
+        "or a custom name the tree already has."
+    ),
     value: str = Field(description="Attribute value, e.g. 'Blacksmith'."),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Add a typed key/value attribute to an object.
 
@@ -618,7 +650,7 @@ async def add_attribute(
     """
     try:
         svc = await state.service_()
-        return await svc.add_attribute(object_type, target, name, value)
+        return await svc.add_attribute(object_type, target, name, value, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -632,9 +664,11 @@ async def add_url(
     url: str = Field(description="The URL, e.g. 'https://www.findagrave.com/memorial/123'."),
     description: str = Field(default="", description="Optional link description."),
     url_type: str = Field(
-        default="Web Home Page",
-        description="URL type, e.g. 'Web Home Page', 'Web Search', 'E-mail'.",
+        default="Web Home",
+        description="URL type: 'Web Home', 'Web Search', 'E-mail', 'FTP', or a custom "
+        "type the tree already has.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Add a web URL to a person, place, or repository.
 
@@ -643,7 +677,7 @@ async def add_url(
     """
     try:
         svc = await state.service_()
-        return await svc.add_url(object_type, target, url, description, url_type)
+        return await svc.add_url(object_type, target, url, description, url_type, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -666,11 +700,13 @@ async def update_url(
     ),
     url_type: str | None = Field(
         default=None,
-        description="New URL type, e.g. 'Find A Grave', 'Web Home Page'. Omit to keep.",
+        description="New URL type, e.g. 'Web Home', 'Web Search', or a custom type "
+        "the tree already has. Omit to keep.",
     ),
     remove: bool = Field(
         default=False, description="Remove the matched entry instead of editing it."
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Edit or remove ONE existing URL entry on a person, place, or repository.
 
@@ -688,6 +724,7 @@ async def update_url(
             description=description,
             url_type=url_type,
             remove=remove,
+            allow_new_type=allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -748,8 +785,9 @@ async def link_repository(
     media_type: str = Field(
         default="Unknown",
         description="Medium of the source at the repository, e.g. 'Book', "
-        "'Microfilm', 'Electronic', 'Unknown'.",
+        "'Film', 'Electronic', 'Unknown'.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Link an existing source to an existing repository that holds it.
 
@@ -759,7 +797,9 @@ async def link_repository(
     """
     try:
         svc = await state.service_()
-        return await svc.link_repository(source, repository, call_number, media_type)
+        return await svc.link_repository(
+            source, repository, call_number, media_type, allow_new_type
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -771,6 +811,7 @@ async def link_repositories(
         max_length=500,
         description="Rows of {source, repository, call_number?, media_type?}.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Link many sources to their repositories in one call -- a sweep.
 
@@ -780,7 +821,7 @@ async def link_repositories(
     """
     try:
         svc = await state.service_()
-        return await svc.link_repositories(items)
+        return await svc.link_repositories(items, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -818,6 +859,7 @@ async def add_child_to_family(
         default="Birth",
         description="Relationship to the mother, e.g. 'Birth', 'Adopted', 'Stepchild'.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Add an existing person as a child of an existing family.
 
@@ -827,7 +869,7 @@ async def add_child_to_family(
     """
     try:
         svc = await state.service_()
-        return await svc.add_child_to_family(family, child, frel, mrel)
+        return await svc.add_child_to_family(family, child, frel, mrel, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -844,6 +886,7 @@ async def update_child_ref(
     mrel: str | None = Field(
         default=None, description="Relationship to the mother, the same values. Omit to keep."
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Change a child's relationship to the father or mother -- a stepson held
     as a birth child -- in place.
@@ -853,7 +896,9 @@ async def update_child_ref(
     """
     try:
         svc = await state.service_()
-        return await svc.update_child_ref(family, child, frel=frel, mrel=mrel)
+        return await svc.update_child_ref(
+            family, child, frel=frel, mrel=mrel, allow_new_type=allow_new_type
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -895,6 +940,7 @@ async def add_alternate_name(
         "itself -- 'this record spells it so' -- not on the person. Cite an existing "
         "name with cite_object(object_type='name').",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Add an alternate (non-primary) name to a person, cited to the record using it.
 
@@ -911,7 +957,7 @@ async def add_alternate_name(
             suffix=name_suffix,
             nick=nickname,
         )
-        return await svc.add_alternate_name(person, name, name_type, citation)
+        return await svc.add_alternate_name(person, name, name_type, citation, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1219,11 +1265,11 @@ async def find_duplicates(
 
 @mcp.tool(annotations=READS)
 async def list_object_types() -> dict:
-    """The tree's type vocabularies (event types, attribute types, and so on).
+    """The tree's type vocabularies: Gramps' standard names and its own custom ones.
 
-    Check an unfamiliar type string here first: Gramps accepts an unrecognised
-    one as a NEW custom type rather than rejecting it, so a typo permanently
-    enters the tree's vocabulary.
+    The write tools take any of these, in any case. A name in neither is
+    refused unless allow_new_type asks for a NEW custom type, which then stays
+    in the tree's vocabulary for good.
     """
     try:
         svc = await state.service_()
@@ -1407,6 +1453,7 @@ async def update_alternate_name(
         description="Remove the name. Refused while it carries citations or notes; "
         "of identical duplicates, one is removed.",
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Correct, retype or remove one alternate name, in place.
 
@@ -1425,6 +1472,7 @@ async def update_alternate_name(
             nickname=nickname,
             name_type=name_type,
             remove=remove,
+            allow_new_type=allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -1438,6 +1486,7 @@ async def update_object_fields(
         description="Scalar fields to set, e.g. {'name': 'Cedar Flat, Brannock, Ohio, USA'} "
         "on a place, or {'text': '...'} on a note."
     ),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Set scalar fields on any object -- the escape hatch for places, notes,
     repositories and the rest.
@@ -1449,7 +1498,7 @@ async def update_object_fields(
     """
     try:
         svc = await state.service_()
-        return await svc.update_object_fields(object_type, ref, fields)
+        return await svc.update_object_fields(object_type, ref, fields, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1460,7 +1509,8 @@ async def update_place(
     place_type: str | None = Field(
         default=None,
         description="New place type: 'Country', 'State', 'County', 'City', "
-        "'Town', 'Village', 'Cemetery', etc. Omit to leave unchanged.",
+        "'Town', 'Village', 'Parish', 'Farm', 'Building', etc., or a custom type the "
+        "tree already has. Omit to leave unchanged.",
     ),
     parent: str | None = Field(
         default=None,
@@ -1485,6 +1535,7 @@ async def update_place(
     latitude: str | None = Field(default=None, description="Latitude, e.g. '40.1532'."),
     longitude: str | None = Field(default=None, description="Longitude, e.g. '-82.4101'."),
     code: str | None = Field(default=None, description="Place code (postal etc.)."),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Edit a place's type, parent enclosure, name, title, or coordinates.
 
@@ -1508,6 +1559,7 @@ async def update_place(
             latitude=latitude,
             longitude=longitude,
             code=code,
+            allow_new_type=allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -2150,7 +2202,7 @@ async def add_place(
     place_type: str = Field(
         default="",
         description="Gramps place type: Town, City, County, State, Country, "
-        "Parish, Cemetery, and so on.",
+        "Parish, Farm, Building, and so on, or a custom type the tree already has.",
     ),
     parent: str = Field(
         default="",
@@ -2166,6 +2218,7 @@ async def add_place(
     latitude: str = Field(default="", description="Latitude, decimal degrees."),
     longitude: str = Field(default="", description="Longitude, decimal degrees."),
     code: str = Field(default="", description="Postal or FIPS code."),
+    allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Create a place deliberately, with a type and a parent.
 
@@ -2183,6 +2236,7 @@ async def add_place(
             latitude or None,
             longitude or None,
             code or None,
+            allow_new_type,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as structured error
         return _error(exc)

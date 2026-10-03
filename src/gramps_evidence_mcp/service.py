@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import difflib
 import hashlib
 import logging
 import mimetypes
@@ -139,7 +140,7 @@ class InvalidCarryTargetError(ValueError):
 
 
 class UnknownTypeError(ValueError):
-    """Raised when an edit names a type the tree's vocabulary does not hold.
+    """Raised when a write names a type neither Gramps nor the tree has.
 
     Gramps would store it as a new custom type rather than refuse it, which
     is how a typo becomes part of the vocabulary for good.
@@ -245,53 +246,96 @@ class GrampsService:
     # vocabularies and dates
     # ------------------------------------------------------------------ #
     async def _canonical_type(
-        self, datatype: str, value: str, allow_new: bool = False, types: dict | None = None
+        self,
+        datatype: str,
+        value: str,
+        allow_new: bool = False,
+        types: dict | None = None,
+        custom_keys: tuple[str, ...] = (),
     ) -> str:
-        """Match a type name against the tree's vocabulary, case-insensitively.
+        """Spell a type name as the tree's vocabulary does, or refuse it.
 
-        Gramps stores any unrecognised string as a new custom type rather than
-        refusing it, so a typo in an edit becomes a permanent entry in the
-        tree's vocabulary. The vocabulary is ``GET /api/types/``: the standard
-        English names under ``default`` and the tree's own under ``custom``
-        (gramps-webapi 3.21.1, ``api/resources/types.py``). It is read on
-        every call, so a custom type created a moment ago is known.
+        The server matches a type name exactly, and stores any other string as
+        a new custom type (docs/PITFALLS.md section 26), so a typo or a stray
+        capital becomes a permanent entry in the tree's vocabulary. The
+        vocabulary is ``GET /api/types/``: Gramps' standard names under
+        ``default`` and the tree's own under ``custom``, read on every call so
+        a custom type created a moment ago is known.
+
+        A name matches ignoring case, spacing and punctuation ("census",
+        "E-Mail"), then through a short list of unambiguous synonyms
+        (``_TYPE_SYNONYMS``: "Born" is Birth), then among the tree's custom
+        names. Anything else is refused, with the closest names suggested,
+        unless it is meant as a new custom type.
 
         Parameters
         ----------
         datatype : str
-            The vocabulary, e.g. ``"event_types"``, ``"event_role_types"``,
-            ``"child_reference_types"``, ``"name_types"``.
+            The standard vocabulary, e.g. ``"event_types"``.
         value : str
             The name the caller gave.
         allow_new : bool, optional
             Accept a name in neither list, as a deliberate new custom type.
         types : dict, optional
             ``GET /api/types/`` already read in this call.
+        custom_keys : tuple of str, optional
+            The tree's custom lists to match against, when not the one named
+            like ``datatype``: Gramps keeps attribute names apart by the kind
+            of object carrying them. The first list's spelling wins.
 
         Returns
         -------
         str
-            The name as the vocabulary spells it, or ``value`` stripped when
-            new names are allowed or the server lists no vocabulary at all.
+            The name as the vocabulary spells it; ``value`` with its spacing
+            tidied when it is a new custom type, or when the server lists no
+            vocabulary at all.
 
         Raises
         ------
         UnknownTypeError
-            If the name is in neither list and ``allow_new`` is False.
+            If the name matches nothing and ``allow_new`` is False.
         """
-        wanted = value.strip()
+        wanted = " ".join(str(value).split())
         types = types if types is not None else await self.client.types()
-        default = list(((types.get("default") or {}).get(datatype)) or [])
-        custom = [c for c in ((types.get("custom") or {}).get(datatype)) or [] if c]
-        for name in (*default, *custom):
-            if str(name).strip().lower() == wanted.lower():
-                return str(name)
-        if allow_new or not (default or custom):
+        default = [str(n).strip() for n in ((types.get("default") or {}).get(datatype)) or []]
+        custom = list(
+            dict.fromkeys(
+                str(n).strip()
+                for key in custom_keys or (datatype,)
+                for n in ((types.get("custom") or {}).get(key)) or []
+                if n
+            )
+        )
+        if not (default or custom):
             return wanted
+        by_key = {_type_key(n): n for n in default}
+        synonyms = _TYPE_SYNONYMS.get(datatype, {})
+
+        def standard(key: str) -> str | None:
+            target = synonyms.get(key)
+            return by_key.get(key) or (by_key.get(_type_key(target)) if target else None)
+
+        key = _type_key(wanted)
+        if found := standard(key):
+            return found
+        # The tree's own names, less any a standard one shadows: a custom
+        # "census" or "Web Home Page" is an old accident, never the name to use.
+        own = [n for n in custom if standard(_type_key(n)) is None]
+        for name in own:
+            if _type_key(name) == key:
+                return name
+        if allow_new:
+            return wanted
+        known = {_type_key(n): n for n in (*own, *default)}
+        close = [known[k] for k in difflib.get_close_matches(key, list(known), n=3, cutoff=0.6)]
+        label = _TYPE_LABELS.get(datatype) or datatype.removesuffix("_types").replace("_", " ")
+        article = "an" if label[0] in "aeio" else "a"
         raise UnknownTypeError(
-            f"{wanted!r} is not a type in this tree's {datatype}. Standard: "
-            f"{', '.join(default)}. Custom: {', '.join(custom) or 'none'}. Gramps "
-            "would store an unknown name as a new custom type, so check the spelling."
+            f"{wanted!r} is not {article} {label} type in this tree."
+            + (f" Did you mean {' or '.join(repr(c) for c in close)}?" if close else "")
+            + f" Standard: {', '.join(n for n in default if n != 'Unknown') or 'none'}."
+            + f" Custom: {', '.join(own) or 'none'}."
+            + " Pass allow_new_type=True to create it as a new custom type."
         )
 
     async def _open_spans_supported(self) -> bool:
@@ -491,6 +535,7 @@ class GrampsService:
         latitude: str | None = None,
         longitude: str | None = None,
         code: str | None = None,
+        allow_new_type: bool = False,
     ) -> dict:
         """Edit a place's type, enclosure, name, title or coordinates.
 
@@ -531,6 +576,8 @@ class GrampsService:
                 "error": "conflicting_arguments",
                 "message": "Pass either parent or remove_parent, not both.",
             }
+        if place_type is not None:
+            place_type = await self._canonical_type("place_types", place_type, allow_new_type)
 
         parent_handle: str | None = None
         if parent:
@@ -612,15 +659,27 @@ class GrampsService:
     # ------------------------------------------------------------------ #
     # write: events
     # ------------------------------------------------------------------ #
+    async def _resolve_event_type(self, ev: EventInput) -> None:
+        """Spell an event's type as the tree does, refusing an unknown one unless meant.
+
+        Done once per event, before anything is written: ``add_person`` checks
+        a birth and a death together, so a refused death leaves no birth
+        behind.
+        """
+        if not ev._type_resolved:
+            ev.type = await self._canonical_type("event_types", ev.type, ev.allow_new_type)
+            ev._type_resolved = True
+
     async def _create_event(self, ev: EventInput, require_citation: bool) -> tuple[str, bool]:
         """Create an Event object. Returns (event_handle, is_unsourced).
 
-        The type is spelt as the tree spells it: the server matches type
-        names case-sensitively, so "birth" would otherwise be stored as a new
-        custom type beside Birth. A name the tree does not know is still
-        created, as a custom type. ``ev.type`` is updated to what was stored.
+        The type is spelt as Gramps spells it, and a name matching nothing is
+        refused unless ``ev.allow_new_type`` (:meth:`_resolve_event_type`):
+        the server matches type names case-sensitively, so "birth" would
+        otherwise be stored as a new custom type beside Birth. ``ev.type`` is
+        updated to what was stored.
         """
-        ev.type = await self._canonical_type("event_types", ev.type, allow_new=True)
+        await self._resolve_event_type(ev)
         citation_handles, extra_attrs = await self._citation_list_for_fact(
             ev.citation, require_citation
         )
@@ -683,6 +742,12 @@ class GrampsService:
         # to be unset by the next edit (docs/PITFALLS.md section 19).
         if birth is not None:
             birth.type = birth.type or "Birth"
+        if death is not None:
+            death.type = death.type or "Death"
+        for event in (birth, death):  # both checked before either is written
+            if event is not None:
+                await self._resolve_event_type(event)
+        if birth is not None:
             handle, is_uns = await self._create_event(birth, require_citation)
             if birth.type == "Birth":
                 birth_index = len(event_refs)
@@ -690,7 +755,6 @@ class GrampsService:
             if is_uns:
                 unsourced.append("birth")
         if death is not None:
-            death.type = death.type or "Death"
             handle, is_uns = await self._create_event(death, require_citation)
             if death.type == "Death":
                 death_index = len(event_refs)
@@ -904,7 +968,9 @@ class GrampsService:
 
         return await self._mutate("event", event_handle, edit, label="updated")
 
-    async def add_event_ref(self, person_ref: str, event_ref: str, role: str = "Primary") -> dict:
+    async def add_event_ref(
+        self, person_ref: str, event_ref: str, role: str = "Primary", allow_new_type: bool = False
+    ) -> dict:
         """Add an existing event to a person, in a role.
 
         One census entry, burial or residence that several people took part
@@ -932,7 +998,7 @@ class GrampsService:
             If the role is not in the tree's vocabulary.
         """
         event = await self._resolve("event", event_ref, keys="handle,gramps_id,type")
-        role_name = await self._canonical_type("event_role_types", role)
+        role_name = await self._canonical_type("event_role_types", role, allow_new_type)
         event_type = _type_string(event.get("type"))
         event_label = event.get("gramps_id") or event["handle"]
         state = {"present": False}
@@ -1165,6 +1231,7 @@ class GrampsService:
         marriage: EventInput | None = None,
         relationship: str = "Married",
         require_citation: bool = True,
+        allow_new_type: bool = False,
     ) -> dict:
         """Create a family linking parents and children.
 
@@ -1202,8 +1269,12 @@ class GrampsService:
 
         event_refs: list[dict] = []
         unsourced = False
+        relationship = await self._canonical_type(
+            "family_relation_types", relationship, allow_new_type
+        )
         if marriage is not None:
             marriage.type = marriage.type or "Marriage"
+            await self._resolve_event_type(marriage)
             handle, unsourced = await self._create_event(marriage, require_citation)
             event_refs.append(mapping.event_ref(handle, role="Family"))
 
@@ -1240,6 +1311,7 @@ class GrampsService:
         repository_ref: str | None,
         call_number: str | None,
         media_type: str = "Unknown",
+        allow_new_type: bool = False,
     ) -> dict:
         """Create a source, optionally held in a repository.
 
@@ -1266,6 +1338,9 @@ class GrampsService:
         if abbrev:
             payload["abbrev"] = abbrev
         if repository_ref:
+            media_type = await self._canonical_type(
+                "source_media_types", media_type, allow_new_type
+            )
             repo_handle = await self._resolve_handle("repository", repository_ref)
             payload["reporef_list"] = [_reporef(repo_handle, call_number, media_type)]
         created = await self.client.create_object("source", payload)
@@ -1294,7 +1369,9 @@ class GrampsService:
             "message": f"Citation ready (handle {handle}).",
         }
 
-    async def add_repository(self, name: str, repo_type: str, url: str | None) -> dict:
+    async def add_repository(
+        self, name: str, repo_type: str, url: str | None, allow_new_type: bool = False
+    ) -> dict:
         """Create a repository such as an archive, library or website.
 
         Parameters
@@ -1304,16 +1381,20 @@ class GrampsService:
         repo_type : str
             Gramps repository type.
         url : str or None
-            Home page, recorded as a Web Home Page URL.
+            Home page, recorded as a Web Home URL.
 
         Returns
         -------
         dict
             Handle, gramps_id and a message.
         """
+        types = await self.client.types()
+        repo_type = await self._canonical_type(
+            "repository_types", repo_type, allow_new_type, types=types
+        )
         payload: dict[str, Any] = {"_class": "Repository", "name": name, "type": repo_type}
         if url:
-            payload["urls"] = [{"_class": "Url", "path": url, "type": "Web Home Page"}]
+            payload["urls"] = [{"_class": "Url", "path": url, "type": "Web Home"}]
         created = await self.client.create_object("repository", payload)
         return _write_result("repository", created)
 
@@ -1323,6 +1404,7 @@ class GrampsService:
         target_type: str | None,
         text: str,
         note_type: str,
+        allow_new_type: bool = False,
     ) -> dict:
         """Create a note, optionally attaching it to an object.
 
@@ -1352,6 +1434,7 @@ class GrampsService:
             if target_ref and target_type
             else None
         )
+        note_type = await self._canonical_type("note_types", note_type, allow_new_type)
         note = await self.client.create_object(
             "note", {"_class": "Note", "text": {"string": text}, "type": note_type}
         )
@@ -1869,9 +1952,25 @@ class GrampsService:
             for t in tags
         ]
 
-    async def add_attribute(self, object_type: str, ref: str, name: str, value: str) -> dict:
+    async def add_attribute(
+        self, object_type: str, ref: str, name: str, value: str, allow_new_type: bool = False
+    ) -> dict:
         """Append an Attribute (or SrcAttribute for sources/citations) to an object."""
-        cls = "SrcAttribute" if object_type in {"source", "citation"} else "Attribute"
+        source_like = object_type in {"source", "citation"}
+        cls = "SrcAttribute" if source_like else "Attribute"
+        # A name the tree already uses on another kind of object is no typo.
+        kinds = ("person", "family", "event", "media")
+        name = await self._canonical_type(
+            "source_attribute_types" if source_like else "attribute_types",
+            name,
+            allow_new_type,
+            custom_keys=("source_attribute_types",)
+            if source_like
+            else tuple(
+                f"{kind}_attribute_types"
+                for kind in sorted(kinds, key=lambda kind: kind != object_type)
+            ),
+        )
 
         def edit(obj: dict) -> str:
             obj.setdefault("attribute_list", []).append(
@@ -1896,7 +1995,8 @@ class GrampsService:
         ref: str,
         url: str,
         description: str = "",
-        url_type: str = "Web Home Page",
+        url_type: str = "Web Home",
+        allow_new_type: bool = False,
     ) -> dict:
         """Append a Url. Only person/place/repository carry a urls list."""
         if object_type not in {"person", "place", "repository"}:
@@ -1905,6 +2005,8 @@ class GrampsService:
                 "message": f"URLs are only supported on person, place, or "
                 f"repository, not {object_type}. Use an attribute instead.",
             }
+
+        url_type = await self._canonical_type("url_types", url_type, allow_new_type)
 
         def edit(obj: dict) -> str:
             obj.setdefault("urls", []).append(
@@ -1932,6 +2034,7 @@ class GrampsService:
         description: str | None = None,
         url_type: str | None = None,
         remove: bool = False,
+        allow_new_type: bool = False,
     ) -> dict:
         """Edit or remove one existing URL entry.
 
@@ -1971,6 +2074,9 @@ class GrampsService:
             }
 
         needle = match.strip().lower()
+
+        if url_type is not None:
+            url_type = await self._canonical_type("url_types", url_type, allow_new_type)
 
         def edit(obj: dict) -> str | bool:
             urls = obj.get("urls") or []
@@ -2081,8 +2187,10 @@ class GrampsService:
         repository_ref: str,
         call_number: str | None = None,
         media_type: str = "Unknown",
+        allow_new_type: bool = False,
     ) -> dict:
         """Attach a RepoRef linking a repository to a source (dedup by repo handle)."""
+        media_type = await self._canonical_type("source_media_types", media_type, allow_new_type)
         repo_handle = await self._resolve_handle("repository", repository_ref)
 
         def edit(source: dict) -> str | bool:
@@ -2108,7 +2216,9 @@ class GrampsService:
             result,
         )
 
-    async def link_repositories(self, items: list[RepositoryLink]) -> dict:
+    async def link_repositories(
+        self, items: list[RepositoryLink], allow_new_type: bool = False
+    ) -> dict:
         """Link many sources to repositories in one call.
 
         Each row is its own whole-object write, as with link_repository, so
@@ -2126,7 +2236,11 @@ class GrampsService:
             row: dict[str, Any] = {"source": item.source, "repository": item.repository}
             try:
                 out = await self.link_repository(
-                    item.source, item.repository, item.call_number, item.media_type
+                    item.source,
+                    item.repository,
+                    item.call_number,
+                    item.media_type,
+                    allow_new_type=allow_new_type,
                 )
                 row["status"] = "linked" if out.get("changed") else "already_linked"
             except NotFoundError as exc:
@@ -2248,6 +2362,7 @@ class GrampsService:
         child_ref: str,
         frel: str = "Birth",
         mrel: str = "Birth",
+        allow_new_type: bool = False,
     ) -> dict:
         """Add an existing person as a child of an existing family.
 
@@ -2268,6 +2383,13 @@ class GrampsService:
             left as it is; :meth:`update_child_ref` changes its relationship.
         """
         child_handle = await self._resolve_handle("person", child_ref)
+        vocabulary = await self.client.types()
+        frel = await self._canonical_type(
+            "child_reference_types", frel, allow_new_type, types=vocabulary
+        )
+        mrel = await self._canonical_type(
+            "child_reference_types", mrel, allow_new_type, types=vocabulary
+        )
 
         def add_child(family: dict) -> str | bool:
             child_ref_list = family.setdefault("child_ref_list", [])
@@ -2318,6 +2440,7 @@ class GrampsService:
         child_ref: str,
         frel: str | None = None,
         mrel: str | None = None,
+        allow_new_type: bool = False,
     ) -> dict:
         """Change a child's relationship to the father or mother, in place.
 
@@ -2346,7 +2469,9 @@ class GrampsService:
         child_handle = await self._resolve_handle("person", child_ref)
         vocabulary = await self.client.types()
         wanted = {
-            key: await self._canonical_type("child_reference_types", value, types=vocabulary)
+            key: await self._canonical_type(
+                "child_reference_types", value, allow_new_type, types=vocabulary
+            )
             for key, value in (("frel", frel), ("mrel", mrel))
             if value is not None
         }
@@ -2570,6 +2695,7 @@ class GrampsService:
         name: NameParts,
         name_type: str = "Also Known As",
         citation: CitationInput | None = None,
+        allow_new_type: bool = False,
     ) -> dict:
         """Add a non-primary name to a person, optionally cited.
 
@@ -2593,6 +2719,7 @@ class GrampsService:
             message.
         """
         person_handle = await self._resolve_handle("person", person_ref)
+        name_type = await self._canonical_type("name_types", name_type, allow_new_type)
         citation_handle = await self.resolve_citation(citation) if citation else None
         name_dict = mapping.name_payload(name)
         name_dict["type"] = name_type
@@ -2873,6 +3000,7 @@ class GrampsService:
         latitude: str | None = None,
         longitude: str | None = None,
         code: str | None = None,
+        allow_new_type: bool = False,
     ) -> dict:
         """Create a place deliberately, typed and parented.
 
@@ -2910,6 +3038,7 @@ class GrampsService:
         if title:
             payload["title"] = title
         if place_type:
+            place_type = await self._canonical_type("place_types", place_type, allow_new_type)
             # Gramps' field is place_type. 1.0.x wrote "type", which the server
             # kept as a stray key while the place stayed Unknown.
             payload["place_type"] = place_type
@@ -3502,8 +3631,8 @@ class GrampsService:
         return {
             "default": types.get("default", {}),
             "custom": {k: v for k, v in custom.items() if v},
-            "warning": "An unrecognised type string is silently accepted as a new "
-            "custom type. Check this list before using an unfamiliar one.",
+            "warning": "A type name in neither list is refused unless allow_new_type "
+            "is set; it then becomes a custom type, kept in the tree for good.",
         }
 
     async def get_object(
@@ -3769,6 +3898,7 @@ class GrampsService:
         nickname: str | None = None,
         name_type: str | None = None,
         remove: bool = False,
+        allow_new_type: bool = False,
     ) -> dict:
         """Correct, retype or remove one alternate name, in place.
 
@@ -3820,7 +3950,9 @@ class GrampsService:
                 "update_person(name=...).",
             }
         new_type = (
-            await self._canonical_type("name_types", name_type) if name_type is not None else None
+            await self._canonical_type("name_types", name_type, allow_new_type)
+            if name_type is not None
+            else None
         )
         held: dict[str, list[str]] = {}
 
@@ -3884,7 +4016,7 @@ class GrampsService:
     }
 
     async def update_object_fields(
-        self, object_type: str, ref: str, fields: dict[str, Any]
+        self, object_type: str, ref: str, fields: dict[str, Any], allow_new_type: bool = False
     ) -> dict:
         """Set scalar fields on any object -- the escape hatch for the rest.
 
@@ -3905,6 +4037,12 @@ class GrampsService:
                 "message": f"Cannot set {rejected} on a {object_type} this way. "
                 f"Settable: {sorted(allowed)}. Structural lists have their own "
                 f"tools (cite_object, detach_object, tag_object, attach_media).",
+            }
+        vocabulary = _TYPE_FIELD_VOCABULARY.get(object_type)
+        if vocabulary and isinstance(fields.get("type"), str):
+            fields = {
+                **fields,
+                "type": await self._canonical_type(vocabulary, fields["type"], allow_new_type),
             }
 
         def edit(obj: dict) -> str | bool:
@@ -6375,6 +6513,120 @@ def _person_merge_refusal(keep: dict, drop: dict) -> str | None:
             "the family first."
         )
     return None
+
+
+#: The vocabulary of the ``type`` field update_object_fields may set.
+_TYPE_FIELD_VOCABULARY = {
+    "note": "note_types",
+    "family": "family_relation_types",
+    "repository": "repository_types",
+}
+
+
+#: How a refusal names a vocabulary, where its key does not read well.
+_TYPE_LABELS = {
+    "url_types": "URL",
+    "source_media_types": "source medium",
+    "family_relation_types": "family relationship",
+    "child_reference_types": "child relationship",
+}
+
+
+def _type_key(name: str) -> str:
+    """A type name as matching compares it: lower case, letters and digits only."""
+    return re.sub(r"[^0-9a-z]", "", str(name).lower())
+
+
+#: Names that mean one standard type unambiguously, per vocabulary, keyed as
+#: :func:`_type_key` spells them. A near-miss is never here: "Censsus" is
+#: refused with a suggestion, not corrected. Every target is a standard name
+#: (gramps-webapi 3.21.1, Gramps 6.0); a test holds the table to that.
+_TYPE_SYNONYMS: dict[str, dict[str, str]] = {
+    "event_types": {
+        "born": "Birth",
+        "died": "Death",
+        "deceased": "Death",
+        "buried": "Burial",
+        "interment": "Burial",
+        "interred": "Burial",
+        "baptized": "Baptism",
+        "baptised": "Baptism",
+        "christened": "Christening",
+        "married": "Marriage",
+        "wedding": "Marriage",
+        "divorced": "Divorce",
+        "cremated": "Cremation",
+        "emigrated": "Emigration",
+        "immigrated": "Immigration",
+        "naturalized": "Naturalization",
+        "naturalised": "Naturalization",
+        "naturalisation": "Naturalization",
+        "graduated": "Graduation",
+        "ordained": "Ordination",
+        "engaged": "Engagement",
+        "retired": "Retirement",
+        "confirmed": "Confirmation",
+        "military": "Military Service",
+        "adoption": "Adopted",
+        "stillborn": "Stillbirth",
+        "banns": "Marriage Banns",
+        "marriagelicence": "Marriage License",
+        "batmitzvah": "Bas Mitzvah",
+        "resided": "Residence",
+    },
+    "event_role_types": {
+        "godfather": "Godparent",
+        "godmother": "Godparent",
+        "officiant": "Officiator",
+        "neighbour": "Neighbor",
+        "principal": "Primary",
+    },
+    "name_types": {
+        "aka": "Also Known As",
+        "alias": "Also Known As",
+        "maiden": "Birth Name",
+        "maidenname": "Birth Name",
+        "birth": "Birth Name",
+        "married": "Married Name",
+    },
+    "child_reference_types": {
+        "biological": "Birth",
+        "natural": "Birth",
+        "adoptive": "Adopted",
+        "adoption": "Adopted",
+        "step": "Stepchild",
+        "stepson": "Stepchild",
+        "stepdaughter": "Stepchild",
+        "fostered": "Foster",
+    },
+    "family_relation_types": {"marriage": "Married"},
+    "place_types": {"neighbourhood": "Neighborhood"},
+    "note_types": {"transcription": "Transcript", "html": "Html code"},
+    "repository_types": {"archives": "Archive", "graveyard": "Cemetery"},
+    "source_media_types": {
+        "photograph": "Photo",
+        "microfilm": "Film",
+        "microfiche": "Fiche",
+        "headstone": "Tombstone",
+        "gravestone": "Tombstone",
+        "digital": "Electronic",
+        "online": "Electronic",
+    },
+    "url_types": {
+        "webhomepage": "Web Home",
+        "homepage": "Web Home",
+        "website": "Web Home",
+        "webpage": "Web Home",
+        "search": "Web Search",
+    },
+    "attribute_types": {
+        "ssn": "Social Security Number",
+        "idnumber": "Identification Number",
+        "nationalid": "Identification Number",
+        "profession": "Occupation",
+        "nick": "Nickname",
+    },
+}
 
 
 def _describe_cascade(also: list[dict]) -> str:
