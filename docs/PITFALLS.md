@@ -5,7 +5,7 @@ before adding a tool that mutates, or before calling the API directly.
 
 **The claims here about the server are checked on every CI run**, with the
 exceptions below. The live suite (`tests/live`, see CONTRIBUTING.md) starts a
-throwaway gramps-webapi 3.21.1 and 3.22.3 and runs `test_pitfalls_live.py`,
+throwaway gramps-webapi 3.21.1, 3.22.3 and 3.23.1 and runs `test_pitfalls_live.py`,
 whose tests are named for these sections. Where the two versions differ, the
 section says so. Sections 4, 9, 10 and 11 describe this project's own code and
 are covered by the unit tests.
@@ -14,8 +14,10 @@ Not checked, because a healthy throwaway server cannot show them: the HTTP 500
 answered to a delete that has landed (section 17), which needs a failing
 search index; that the server never removes a media file (section 16), which
 needs an upload; the 500s on every write under prolonged concurrent writing
-(section 6); and how a server on Gramps older than 5.2 stores "from X"
-(section 20), since no supported server runs one. Each says where it came
+(section 6); how a server on Gramps older than 5.2 stores "from X"
+(section 20), since no supported server runs one; and what 3.23 does with a
+stray key or a `year` an older server stored (sections 18 and 24), which needs
+a tree written by one version and served by another. Each says where it came
 from.
 
 The sections were first found on gramps-webapi 3.20.1 and 3.21.1, in research
@@ -76,7 +78,7 @@ The server has `If-Match` support that no client can use. A `PUT` with
 object (`hash_object` in `api/resources/util.py`), but a read's `ETag` is a
 hash of the *response body*, suffixed `:gzip` when compressed (`emit.py`).
 No tag the API hands out ever matches, fresh or stale; only `If-Match: *`
-passes, which checks nothing. Verified on 3.21.1 and 3.22.3, where a test in
+passes, which checks nothing. Verified on 3.21.1, 3.22.3 and 3.23.1, where a test in
 the live suite holds it as a tripwire: when gramps-webapi fixes this, the test
 fails, and `_mutate()` should start sending the tag of its read. Until then,
 `_mutate()` narrows the race to one round trip -- it reads and writes back to
@@ -100,7 +102,7 @@ GrampsQL runs over raw object JSON, not the profile view.
     a tree full of births (744 of them, when first found). Use
     `query_records` instead; see section 12.
   - Sources have no `citation_list`; citations point at sources. With
-    gramps-ql 0.5.0 (what 3.21.1 and 3.22.3 install) `citation_list.length = 0`
+    gramps-ql 0.5.0 (what 3.21.1 to 3.23.1 install) `citation_list.length = 0`
     matches no source, cited or not, so every source looks cited; on 3.20.1 it
     matched every source. Neither is an answer. Find uncited sources through
     `backlinks`.
@@ -301,26 +303,40 @@ the status would retry, or believe the tree unchanged. Explained from the
 On a 5xx from a delete, the service looks the object up again and reports the
 delete as done, with the status it came back with, when the object is gone.
 
-## 18. A place's type is `place_type`; an unknown key is kept and ignored
+## 18. A place's type is `place_type`; an unknown key is kept -- until 3.23
 
-Gramps' field is `place_type`. A payload carrying `type` instead is accepted:
-the server converts the string to a type object, stores it under the stray key,
-and never reads it, so the place stays Unknown while a reader of the raw record
-sees the type it was given. `add_place` in 1.0.x did this; eight places created
-on 2026-09-30 were found that way on a live tree. Read in `fix_object_dict`
-(`api/resources/util.py`, 3.21.1) on 2026-10-01.
+Gramps' field is `place_type`. Through 3.22, a payload carrying `type` instead
+is accepted: the server converts the string to a type object, stores it under
+the stray key, and never reads it, so the place stays Unknown while a reader of
+the raw record sees the type it was given. `add_place` in 1.0.x did this; eight
+places created on 2026-09-30 were found that way on a live tree. Read in
+`fix_object_dict` (`api/resources/util.py`, 3.21.1) on 2026-10-01.
+
+That is one case of a general rule through 3.22: the server keeps any key a
+write carries that the object's class lacks, at any depth, and serves it back
+-- which is how section 24's `year` gets stored.
+
+From 3.23 it refuses such a key with 400, naming where it is:
+`$: unknown Place keys: 'type'`, `$.name: unknown PlaceName keys: 'lang_code'`
+(`_validate_keys`, `api/resources/util.py`). A date's served `year` is the one
+key it drops instead (section 24). A key an older server stored is still
+served, so a client that writes back what it read is refused until the key is
+gone: written with 3.22.3 and served by 3.23.1 on 2026-10-05, a stray place
+`type` came back from a read, and the place written back as read was refused.
+The live suite runs one version per tree and cannot stage that.
 
 `_mutate()` removes a stray `type` from any place it writes, moving it into
-`place_type` when that is unset, and `get_place` reports one it finds.
+`place_type` when that is unset, and `get_place` reports one it finds. On 3.23
+that repair is what lets the tools write such a place at all. A stray key of
+any other kind, which no version of this server writes, would make its object
+unwritable through the tools until removed.
 
-That is one case of a general rule: the server keeps any key a write carries
-that the object's class lacks, at any depth, and serves it back -- which is
-how section 24's `year` gets stored. It does check the types of the fields
-the class has: a null where the schema wants a string, list or object is
-refused with 400 (`$.description: None is not of type 'string'`), while a
-family's null parent handle is stored as `""` and an event's null place stays
-null. The fake in `tests/conftest.py` records which, field by field, from a
-real server.
+Every version checks the types of the fields the class has: a null where the
+schema wants a string, list or object is refused with 400
+(`$.description: None is not of type 'string'`), while a family's null parent
+handle is stored as `""` and an event's null place stays null. The fake in
+`tests/conftest.py` records which, field by field, from a real server, and
+refuses an unknown key when it plays 3.23 or later.
 
 ## 19. The server recomputes birth and death -- on an update
 
@@ -383,12 +399,12 @@ The client now renews once, under a lock, for every request that saw the old
 token, and waits out one 429 from a token endpoint (another client behind the
 same address can still cause one). Found by the live suite.
 
-## 24. A date's served `year` goes stale once written back
+## 24. A date's served `year` goes stale once written back -- until 3.23
 
 Every date the server serves carries `year`, which is not a field of a Gramps
-date and is not stored. A client that writes back what it read stores it, and
-from then on the server serves the stored `year` instead of computing it,
-however the date changes:
+date and is not stored. Through 3.22, a client that writes back what it read
+stores it, and from then on the server serves the stored `year` instead of
+computing it, however the date changes:
 
 ```text
 GET   date.dateval [0, 0, 1850, false]   year 1850   (computed)
@@ -401,6 +417,13 @@ to write back, by a year that may be wrong (section 13). No tool reads `year`
 -- the year is `dateval[2]` -- but `_mutate()` drops it from every date it
 writes, which also repairs a stale one, and says so when it does. Found by the
 live suite, on 3.21.1 and 3.22.3.
+
+3.23 drops `year` from every date it is sent -- the one key it computes on
+read (section 18) -- so a written-back year is never stored. One an older
+server stored is still served, until the date's object is next written by any
+client: written with 3.22.3 and served by 3.23.1 on 2026-10-05, a stale 1850
+was served for a date of 1860, and the event written back as read was served
+1860. The live suite checks the drop on 3.23.1.
 
 ## 25. A merge merges more than it names
 
@@ -424,7 +447,7 @@ go further than the two objects asked about:
 
 `merge_objects` reports the families or people a merge would also merge, as
 `also_merges` in its dry run and its result, and refuses a merge Gramps would
-refuse before sending it. Verified on 3.21.1 and 3.22.3, where the contract
+refuse before sending it. Verified on 3.21.1, 3.22.3 and 3.23.1, where the contract
 tests hold the unit tests' fake to every one of these.
 
 ## 26. Type names are matched exactly, and the rest kept for good
@@ -482,5 +505,5 @@ through `update_object_fields`. 1.1 and earlier wrote "Web Home Page" as
 name, so each made a custom type. Both now write Web Home. A custom name
 already in a tree stays in its vocabulary, and the objects carrying it keep
 it until retyped (`update_event`, `update_url`, `update_place`, ...).
-Verified on 3.21.1 and 3.22.3, where the contract tests also hold the fake's
+Verified on 3.21.1, 3.22.3 and 3.23.1, where the contract tests also hold the fake's
 standard names to the server's.

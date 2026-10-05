@@ -102,3 +102,42 @@ async def test_a_name_the_server_does_not_know_exactly_becomes_a_lasting_custom_
     assert "Census" in types["default"]["event_types"]
     await service.client.delete_object("event", census["handle"])
     assert "census" in (await service.client.types())["custom"]["event_types"]
+
+
+async def test_from_3_23_a_served_year_written_back_is_dropped(service, fake):
+    """PITFALLS 24: 3.23 drops the computed key; one an older server stored is served."""
+    fake.metadata["gramps_webapi"]["version"] = "3.23.1"
+    made = await service.client.create_object(
+        "event", {"_class": "Event", "type": "Birth", "date": {"dateval": [0, 0, 1850, False]}}
+    )
+    served = await service.client.get_object("event", made["handle"])
+    served["date"]["dateval"][2] = 1860
+    await service.client.update_object("event", made["handle"], served)
+    assert (await service.client.get_object("event", made["handle"]))["date"]["year"] == 1860
+    fake.store["event"][made["handle"]]["date"]["year"] = 1850  # as 3.22 would have stored it
+    assert (await service.client.get_object("event", made["handle"]))["date"]["year"] == 1850
+
+
+async def test_from_3_23_a_key_the_class_lacks_is_refused_at_any_depth(service, fake):
+    """PITFALLS 18: through 3.22 kept as sent; from 3.23 a 400 naming where it is."""
+    place = {"_class": "Place", "name": {"_class": "PlaceName", "value": "Brannock"}}
+    kept = await service.client.create_object("place", {**place, "type": "County"})
+    assert fake.store["place"][kept["handle"]]["type"] == "County"
+
+    fake.metadata["gramps_webapi"]["version"] = "3.23.1"
+    for payload, message in (
+        ({**place, "type": "County"}, "$: unknown Place keys: 'type'"),
+        (
+            {**place, "name": {**place["name"], "lang_code": "en"}},
+            "$.name: unknown PlaceName keys: 'lang_code'",
+        ),
+    ):
+        with pytest.raises(GrampsApiError) as exc:
+            await service.client.create_object("place", payload)
+        assert (exc.value.status, message in exc.value.detail) == (400, True), exc.value.detail
+    # A key an older server stored is served, and refused when written back.
+    served = await service.client.get_object("place", kept["handle"])
+    assert served["type"] == "County"
+    with pytest.raises(GrampsApiError) as exc:
+        await service.client.update_object("place", kept["handle"], served)
+    assert exc.value.status == 400

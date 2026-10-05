@@ -58,7 +58,8 @@ def _complete(cls: str | None, value: Any) -> Any:
 
     The server builds a Gramps object from what it is sent, so a field the
     request leaves out is stored with its default, inside nested objects too,
-    and a key the class does not have is kept as sent (docs/PITFALLS.md
+    and a key the class does not have is kept as sent -- through 3.22; from
+    3.23 :func:`_refuse_unknown_keys` refuses it first (docs/PITFALLS.md
     section 18). A date's sort value is recomputed whatever was sent.
     """
     if not isinstance(value, dict):
@@ -103,6 +104,58 @@ def _admit(cls: str, payload: dict) -> httpx.Response | None:
             )
         if rule is not None:
             payload[key] = copy.deepcopy(rule)
+    return None
+
+
+#: Classes whose instances name another object by ``ref``.
+_REF_CLASSES = {"ChildRef", "EventRef", "MediaRef", "PersonRef", "PlaceRef", "RepoRef"}
+
+
+def _class_keys(cls: str) -> set[str] | None:
+    """The keys a class has, from the recorded defaults; None if not recorded."""
+    defaults = _SERVER_SHAPES["defaults"].get(cls)
+    if defaults is None:
+        return None
+    keys = set(defaults) | {"_class"}
+    if cls in _CLASS_TO_TYPE:
+        keys |= {"handle", "change"} | (set() if cls == "Tag" else {"gramps_id"})
+    if cls in _REF_CLASSES:
+        keys.add("ref")
+    return keys
+
+
+def _refuse_unknown_keys(cls: str | None, value: Any, path: str = "$") -> str | None:
+    """What gramps-webapi 3.23 and later check before storing a write.
+
+    A date's ``year``, served but never stored, is dropped (the only key the
+    server computes); any other key the object's class lacks, at any depth,
+    is refused, naming where it is: ``$.name: unknown PlaceName keys: 'x'``
+    (``_validate_keys`` in its ``api/resources/util.py``). Edits ``value``
+    in place; returns the refusal, or None. A class the defaults do not
+    record is not checked.
+    """
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            if refusal := _refuse_unknown_keys(cls, item, f"{path}[{i}]"):
+                return refusal
+        return None
+    if not isinstance(value, dict):
+        return None
+    cls = value.get("_class") or cls
+    if cls == "Date":
+        value.pop("year", None)
+    known = _class_keys(cls) if cls else None
+    if known is not None:
+        unknown = sorted(key for key in value if key not in known)
+        if unknown:
+            return f"{path}: unknown {cls} keys: {', '.join(repr(k) for k in unknown)}"
+    nested = _SERVER_SHAPES["nested"].get(cls or "", {})
+    for key, item in value.items():
+        kind = nested.get(key)
+        if refusal := _refuse_unknown_keys(
+            kind[0] if isinstance(kind, list) else kind, item, f"{path}.{key}"
+        ):
+            return refusal
     return None
 
 
@@ -375,10 +428,25 @@ class FakeGramps:
                 }
             )
 
+    def _server_at_least(self, major: int, minor: int) -> bool:
+        """Whether the gramps-webapi version the fake plays is this one or later."""
+        version = str((self.metadata.get("gramps_webapi") or {}).get("version") or "")
+        return tuple(int(v) for v in re.findall(r"\d+", version)[:2]) >= (major, minor)
+
+    def _refusal(self, cls: str, payload: dict, label: str = "object") -> httpx.Response | None:
+        """3.23 and later: refuse an unknown key, drop a served year (PITFALLS 18, 24)."""
+        if not self._server_at_least(3, 23):
+            return None
+        refusal = _refuse_unknown_keys(cls, payload)
+        if refusal is None:
+            return None
+        return httpx.Response(
+            400, json={"code": 400, "message": f"Error while processing {label}: {refusal}"}
+        )
+
     def _object_history(self, request: httpx.Request, cls: str, handle: str) -> httpx.Response:
         """GET /api/transactions/history/objects/{class}/{handle}, added in 3.22."""
-        version = str((self.metadata.get("gramps_webapi") or {}).get("version") or "")
-        if tuple(int(v) for v in re.findall(r"\d+", version)[:2]) < (3, 22):
+        if not self._server_at_least(3, 22):
             return httpx.Response(404, json={"message": "not found"})
         if cls not in _CLASS_TO_TYPE:
             return httpx.Response(422, json={"message": f"Unknown object class: {cls}"})
@@ -570,8 +638,10 @@ class FakeGramps:
             out = []
             for item in payloads:
                 typ = _CLASS_TO_TYPE.get(item.get("_class", ""), "note")
-                admitted = dict(item)
-                refused = _admit(_TYPE_TO_CLASS[typ], admitted)
+                admitted = copy.deepcopy(item)
+                refused = self._refusal(_TYPE_TO_CLASS[typ], admitted, "objects")
+                if refused is None:
+                    refused = _admit(_TYPE_TO_CLASS[typ], admitted)
                 if refused is not None:
                     return refused
                 obj = _complete(_TYPE_TO_CLASS[typ], admitted)
@@ -635,8 +705,10 @@ class FakeGramps:
         if self.write_forbidden:
             return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
         payload = json.loads(request.content or b"{}")
-        admitted = dict(payload)
-        refused = _admit(_TYPE_TO_CLASS[typ], admitted)
+        admitted = copy.deepcopy(payload)
+        refused = self._refusal(_TYPE_TO_CLASS[typ], admitted)
+        if refused is None:
+            refused = _admit(_TYPE_TO_CLASS[typ], admitted)
         if refused is not None:
             return refused
         obj = _complete(_TYPE_TO_CLASS[typ], admitted)
@@ -656,8 +728,10 @@ class FakeGramps:
         if self.put_error:
             return httpx.Response(self.put_error, json={"message": "write failed"})
         payload = json.loads(request.content or b"{}")
-        sent = {k: v for k, v in payload.items() if k not in _COMPUTED_KEYS}
-        refused = _admit(_TYPE_TO_CLASS[typ], sent)
+        sent = copy.deepcopy({k: v for k, v in payload.items() if k not in _COMPUTED_KEYS})
+        refused = self._refusal(_TYPE_TO_CLASS[typ], sent)
+        if refused is None:
+            refused = _admit(_TYPE_TO_CLASS[typ], sent)
         if refused is not None:
             return refused
         previous = self.store[typ].get(handle) or {}

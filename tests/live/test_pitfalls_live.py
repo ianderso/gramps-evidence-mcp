@@ -483,14 +483,37 @@ async def test_16_a_deleted_citation_strands_its_note(live):
     assert not stranded.get("backlinks")
 
 
-async def test_18_a_stray_type_key_is_kept_and_ignored(live):
+async def test_18_a_stray_type_key_is_kept_and_ignored_until_3_23(live):
     client = live.client
-    place = await client.create_object(
-        "place", {"_class": "Place", "name": {"value": "Brannock"}, "type": "County"}
-    )
+    payload = {"_class": "Place", "name": {"value": "Brannock"}, "type": "County"}
+    if live_version() >= (3, 23):
+        with pytest.raises(GrampsApiError) as exc:
+            await client.create_object("place", payload)
+        assert exc.value.status == 400
+        assert "$: unknown Place keys: 'type'" in exc.value.detail
+        return
+    place = await client.create_object("place", payload)
     stored = await client.get_object("place", place["handle"])
     assert "type" in stored
     assert stored["place_type"] == "Unknown"
+
+
+async def test_18_an_unknown_key_at_any_depth_is_kept_until_3_23_then_refused(live):
+    client = live.client
+    nested = {"_class": "Place", "name": {"value": "Brannock", "lang_code": "en"}}
+    if live_version() < (3, 23):
+        place = await client.create_object("place", nested)
+        assert (await client.get_object("place", place["handle"]))["name"]["lang_code"] == "en"
+        return
+    with pytest.raises(GrampsApiError) as exc:
+        await client.create_object("place", nested)
+    assert exc.value.status == 400
+    assert "$.name: unknown PlaceName keys: 'lang_code'" in exc.value.detail
+    place = await client.create_object("place", {"_class": "Place", "name": {"value": "Brannock"}})
+    served = await client.get_object("place", place["handle"])
+    with pytest.raises(GrampsApiError) as exc:
+        await client.update_object("place", place["handle"], {**served, "type": "County"})
+    assert exc.value.status == 400
 
 
 async def test_19_a_person_update_recomputes_birth_and_death_a_create_does_not(live):
@@ -547,7 +570,7 @@ async def test_22_a_write_is_recorded_under_a_fixed_description(live):
 # --------------------------------------------------------------------------- #
 # 24: a date's served year
 # --------------------------------------------------------------------------- #
-async def test_24_a_served_year_written_back_is_kept_and_served_stale(live):
+async def test_24_a_served_year_written_back_is_kept_and_served_stale_until_3_23(live):
     client = live.client
     event = await _event(client, "Residence", date="1850")
     served = await client.get_object("event", event["handle"])
@@ -565,6 +588,11 @@ async def test_24_a_served_year_written_back_is_kept_and_served_stale(live):
     served["date"]["dateval"][2] = 1860  # an edit that keeps the served year
     await client.update_object("event", event["handle"], served)
     stale = (await client.get_object("event", event["handle"]))["date"]
+    if live_version() >= (3, 23):
+        assert (stale["dateval"][2], stale["year"]) == (1860, 1860), "dropped, not stored"
+        out = await live("update_event", event=event["handle"], description="Census")
+        assert "repaired" not in out, out
+        return
     assert (stale["dateval"][2], stale["year"]) == (1860, 1850)
 
     out = await live("update_event", event=event["handle"], description="Census")

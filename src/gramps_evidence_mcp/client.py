@@ -384,7 +384,6 @@ class GrampsWebClient:
         *,
         rules: dict | None = None,
         gql: str | None = None,
-        oql: str | None = None,
         handles: list[str] | str | None = None,
         gramps_id: str | None = None,
         dates: str | None = None,
@@ -421,8 +420,9 @@ class GrampsWebClient:
             Key of :data:`ENDPOINTS`.
         rules : dict, optional
             Gramps filter-rule object, JSON-encoded into the query.
-        gql, oql : str, optional
-            Query expressions.
+        gql : str, optional
+            A GrampsQL expression. (gramps-webapi 3.23 removed ``oql``, which
+            no tool used.)
         handles : list of str or str, optional
             Explicit handles to fetch.
         gramps_id, dates, filter_name, sort, locale : str, optional
@@ -448,7 +448,6 @@ class GrampsWebClient:
             params["handles"] = handles if isinstance(handles, str) else ",".join(handles)
         for k, v in (
             ("gql", gql),
-            ("oql", oql),
             ("gramps_id", gramps_id),
             ("dates", dates),
             ("filter", filter_name),

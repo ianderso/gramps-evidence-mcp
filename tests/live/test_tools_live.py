@@ -15,6 +15,10 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import pytest
+
+from gramps_evidence_mcp.client import GrampsApiError
+
 from .harness import live_version
 
 
@@ -85,9 +89,18 @@ async def test_add_place_writes_place_type_and_a_merge_keeps_the_finer_parent(li
 
 
 async def test_a_stray_type_key_is_reported_and_cleaned_by_an_empty_update(live):
-    place = await live.client.create_object(
-        "place", {"_class": "Place", "name": {"value": "Brannock"}, "type": "County"}
-    )
+    """A tree an older server wrote can hold one; from 3.23 none can be written.
+
+    3.23 still serves a stray key stored before, and refuses the object written
+    back with it (PITFALLS 18), so this repair is then what lets the tools write
+    such a place at all. One server cannot stage that; the unit tests do.
+    """
+    payload = {"_class": "Place", "name": {"value": "Brannock"}, "type": "County"}
+    if live_version() >= (3, 23):
+        with pytest.raises(GrampsApiError):
+            await live.client.create_object("place", payload)
+        return
+    place = await live.client.create_object("place", payload)
     shown = await live("get_place", place=place["gramps_id"])
     assert shown["stray_type_key"] == "County"
     out = await live("update_place", place=place["gramps_id"])

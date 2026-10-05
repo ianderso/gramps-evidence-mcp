@@ -8,6 +8,25 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- gramps-webapi 3.23.1 is tested on every CI run, beside 3.21.1 and 3.22.3.
+  The tools work on it unchanged. 3.22.3 stays in the matrix as the last
+  release before 3.23 changed what a write may carry.
+
+### Changed
+
+- `docs/PITFALLS.md` sections 18 and 24 say what 3.23 changed. A key the
+  object's class lacks is refused with 400 rather than stored, and a date's
+  served `year` written back is dropped rather than served stale. A stray key
+  or a stale year that an older server stored is still served by 3.23, and
+  an object read with a stray key cannot be written back as read; the tools
+  remove the one this server ever wrote, a place's `type`, before writing.
+  The live tests for both sections, and the unit tests' fake, follow the
+  version they run against.
+- The REST client no longer takes `oql`, which gramps-webapi 3.23 removed.
+  No tool used it.
+
 ## [1.2.0] — 2026-10-03
 
 What an audit of the documentation and the live suite found open after 1.1.0.

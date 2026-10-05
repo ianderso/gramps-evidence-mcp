@@ -124,9 +124,11 @@ can run alongside this one.
 
 ### API coverage
 
-Swept against the full `/api/openapi.json` of gramps-webapi 3.21.1 (137 paths)
-and 3.22.3 (138: it adds one record's change history, which
-`get_record_history` reads and which answers with a version error on 3.21).
+Swept against the full `/api/openapi.json` of gramps-webapi 3.21.1 (137 paths),
+3.22.3 (138: it adds one record's change history, which
+`get_record_history` reads and which answers with a version error on 3.21)
+and 3.23.1 (143: it adds persistent access tokens and their exchange, the
+server's own metadata, and every place's coordinates, all left out below).
 Everything genealogically useful is covered. What is left out, and why:
 
 **Deliberately excluded — destructive.**
@@ -144,11 +146,14 @@ Everything genealogically useful is covered. What is left out, and why:
 
 **Excluded — not this server's job.**
 
-- `/api/users/*`, `/api/token/create_owner/`, `/api/oidc/*` — accounts and
-  authentication. Managed in the Gramps Web UI.
-- `/api/config/`, `/api/translations/`, `/api/name-formats/`,
-  `/api/name-groups/`, `/api/holidays/`, `/api/bookmarks/` — instance
-  preferences and UI state.
+- `/api/users/*`, `/api/token/create_owner/`, `/api/token/sync/`,
+  `/api/oidc/*` — accounts and authentication, 3.23's persistent access tokens
+  among them. Managed in the Gramps Web UI.
+- `/api/config/`, `/api/metadata/server/`, `/api/translations/`,
+  `/api/name-formats/`, `/api/name-groups/`, `/api/holidays/`,
+  `/api/bookmarks/` — instance preferences, server metadata and UI state.
+- `/api/places/coordinates/` (3.23) — every place's name and coordinates, a
+  map's feed; the place tools read the same coordinates per place.
 - `/api/chat/` — Gramps Web's own assistant endpoint.
 - `/api/media/{handle}/thumbnail|cropped|tile`, `/api/anniversaries.ics` —
   binary and calendar formats that a stdio tool surface cannot usefully carry.

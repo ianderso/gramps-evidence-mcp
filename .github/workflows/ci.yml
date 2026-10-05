@@ -67,8 +67,11 @@ jobs:
   live:
     # The fake the test job runs against is only as right as our reading of
     # the server. This runs the tools, every PITFALLS claim, and the fake
-    # itself against real gramps-webapi releases: the oldest supported, and
-    # the newest. tests/live/server-*.txt pins each one's whole dependency set.
+    # itself against real gramps-webapi releases: the oldest supported, the
+    # newest, and 3.22.3, the last to store a key a write carries that the
+    # object's class lacks (PITFALLS 18 and 24 differ from 3.23 on), which
+    # trees written before then can still hold. tests/live/server-*.txt pins
+    # each one's whole dependency set.
     name: Live (gramps-webapi ${{ matrix.webapi }})
     # Pinned: the server compiles against these system libraries, and a new
     # Ubuntu can rename them.
@@ -77,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        webapi: ["3.21.1", "3.22.3"]
+        webapi: ["3.21.1", "3.22.3", "3.23.1"]
     env:
       # Fails the job if the server's settings do not arrive, rather than
       # skipping every test and passing.

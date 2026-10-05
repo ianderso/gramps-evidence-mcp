@@ -29,7 +29,7 @@ setting in your shell.
 
 `tests/live` runs against a real gramps-webapi, which it starts for itself,
 empty, on a loopback port. It is skipped unless one is named, and CI runs it
-against 3.21.1 and 3.22.3. To run it locally, on Linux or macOS with the
+against 3.21.1, 3.22.3 and 3.23.1. To run it locally, on Linux or macOS with the
 libraries the server compiles against (on Ubuntu: `sudo apt-get install
 libicu-dev pkg-config libcairo2-dev libgirepository1.0-dev gir1.2-gtk-3.0`):
 

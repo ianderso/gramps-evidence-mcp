@@ -6434,7 +6434,7 @@ def _query_trap(
 ) -> dict | None:
     """Refuse the structured-query forms the server answers wrongly, saying what works.
 
-    Each was verified against gramps-webapi 3.21.1 and 3.22.3 and is in
+    Each was verified against gramps-webapi 3.21.1, 3.22.3 and 3.23.1 and is in
     ``docs/PITFALLS.md``:
 
     - a date's ``year`` (sections 13 and 24): never stored by the server, so
