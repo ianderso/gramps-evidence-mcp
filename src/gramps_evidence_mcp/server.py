@@ -13,6 +13,7 @@ hints from legacy trees; hints are not sources.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import traceback
@@ -42,6 +43,8 @@ from .models import (
     NameMatch,
     NameParts,
     RepositoryLink,
+    TaskPriority,
+    TaskStatus,
     VitalEventInput,
 )
 from .service import (
@@ -1854,6 +1857,125 @@ async def ocr_media(
 
 
 # ==========================================================================  #
+# RESEARCH TASKS: Gramps Web's Tasks view
+# ==========================================================================  #
+def _task_attributes(removes: bool) -> Any:
+    """A research task's further attributes, beside Status and Priority."""
+    return Field(
+        default=None,
+        description="More source attributes, name to value, e.g. {'Bears-On': 'I0035'}. "
+        "Status and Priority have parameters of their own."
+        + (" A null value removes the attribute." if removes else ""),
+    )
+
+
+@mcp.tool(annotations=ADDS)
+async def add_research_task(
+    title: str = Field(description="What to do, in one line, as the Tasks list shows it."),
+    description: str = Field(
+        default="", description="Details. Stored as the task's first note, type To Do."
+    ),
+    priority: TaskPriority = Field(default=TaskPriority.medium, description="high, medium or low."),
+    tags: list[str] | None = Field(
+        default=None,
+        description="Tags besides ToDo, found or created by exact name, e.g. ['Probate'].",
+    ),
+    attributes: dict[str, str] | None = _task_attributes(removes=False),
+    private: bool = Field(default=False, description="Mark the task and its note private."),
+    allow_new_type: bool = _allow_new_type(),
+) -> dict:
+    """Add a research task to Gramps Web's own task list (its Tasks view).
+
+    Written exactly as Gramps Web's New Task form writes one: a Source tagged
+    ToDo, Status 'Open', a Priority, and the description as a To Do note. A
+    task is a to-do, never evidence: never cite it.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.add_research_task(
+            title, description, priority, tags, attributes, private, allow_new_type
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=READS)
+async def list_research_tasks(
+    status: list[TaskStatus] | None = Field(
+        default=None, description="Only these states, e.g. ['Open', 'In Progress']."
+    ),
+    tag: str | None = Field(default=None, description="Only tasks also carrying this tag."),
+    attributes: dict[str, str] | None = Field(
+        default=None,
+        description="Only tasks with these attribute values, ignoring case; an empty "
+        "value matches any value, e.g. {'Request-Custodian': ''}.",
+    ),
+    include_private: bool = _include_private(),
+) -> dict:
+    """List the research tasks in Gramps Web's Tasks view: title, status,
+    priority, tags, attributes and description.
+
+    Ordered as the view orders them: Open, In Progress, Blocked, Done. Not
+    background jobs (list_jobs). A private task is a redacted stub.
+    """
+    try:
+        svc = await state.service_()
+        with svc.privacy_lifted(include_private, "list_research_tasks"):
+            return await svc.list_research_tasks(status, tag, attributes)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def update_research_task(
+    task: str = Field(description="The task's handle or gramps_id, e.g. 'S1501'."),
+    status: TaskStatus | None = Field(default=None, description="New status."),
+    priority: TaskPriority | None = Field(default=None, description="New priority."),
+    attributes: dict[str, str | None] | None = _task_attributes(removes=True),
+    note_append: str | None = Field(
+        default=None,
+        description="A paragraph to add to the task's description note, e.g. "
+        "'2026-10-05: letter sent'.",
+    ),
+    private: bool | None = Field(
+        default=None,
+        description="True makes the task and its description note private. False "
+        "makes the task public; a private note stays private unless private_note "
+        "is false.",
+    ),
+    private_note: bool | None = Field(
+        default=None,
+        description="Set the description note's private flag yourself. Omitted, the "
+        "note follows a private task and is never made public.",
+    ),
+    allow_new_type: bool = _allow_new_type(),
+) -> dict:
+    """Change a research task's status, priority, privacy or attributes, or add
+    to its description.
+
+    Each attribute is replaced, never added beside the old one, so Gramps Web
+    shows the value set. add_attribute would append a second Status that
+    Gramps Web ignores. A private task's description note is private too;
+    making the task public leaves a private note private unless
+    private_note=false. Refuses a source that is not a task.
+    """
+    try:
+        svc = await state.service_()
+        return await svc.update_research_task(
+            task,
+            status,
+            priority,
+            attributes,
+            note_append,
+            allow_new_type,
+            private=private,
+            private_note=private_note,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+# ==========================================================================  #
 # OPS: backup, change log, undo
 # ==========================================================================  #
 @mcp.tool(annotations=WRITES_LOCAL_FILE)
@@ -1978,7 +2100,7 @@ async def run_report(
     incl_private false) unless you pass those options or include_private;
     Gramps' own default includes both.
 
-    Usually runs in the background, returning a task_id to poll with get_task.
+    Usually runs in the background, returning a task_id to poll with get_job.
     """
     try:
         svc = await state.service_()
@@ -2108,17 +2230,19 @@ async def consolidated_timeline(
 
 
 @mcp.tool(annotations=READS)
-async def list_tasks(
-    limit: int = Field(default=25, description="Maximum tasks to return."),
+async def list_jobs(
+    limit: int = Field(default=25, description="Maximum jobs to return."),
 ) -> dict:
-    """List recent background jobs for this tree, newest first.
+    """List recent background jobs for this tree, newest first: undo, verify,
+    reindex, report.
 
     Use when you have lost a task_id, or to see whether anything is still
-    running before starting a write session.
+    running before starting a write session. Research tasks are
+    list_research_tasks.
     """
     try:
         svc = await state.service_()
-        return await svc.list_tasks(limit)
+        return await svc.list_jobs(limit)
     except Exception as exc:  # noqa: BLE001 - surfaced as structured error
         return _error(exc)
 
@@ -2653,12 +2777,11 @@ async def reindex_search(
         "Slower, and the right choice after a large import.",
     ),
 ) -> dict:
-    """Rebuild the full-text search index.
+    """Rebuild the full-text index behind Gramps Web's search box.
 
-    `search_text` reads a stored index, and nothing refreshes it after writes.
-    Run this after a bulk import or a large editing session, or searches will
-    quietly miss everything added since the last build. Returns a task_id to
-    poll with get_task.
+    The server updates the index in the background after each write. Rebuild
+    it after a large import, or when search misses something the tree holds.
+    Returns a task_id to poll with get_job.
     """
     try:
         svc = await state.service_()
@@ -2667,13 +2790,16 @@ async def reindex_search(
         return _error(exc)
 
 
+def _task_id() -> Any:
+    """The id a background job is polled by, as the server names it."""
+    return Field(
+        description="The task_id returned by whatever dispatched the work: "
+        "undo_transaction, verify_tree, reindex_search or run_report."
+    )
+
+
 @mcp.tool(annotations=READS)
-async def get_task(
-    task_id: str = Field(
-        description="Task id returned by whatever dispatched the work, e.g. "
-        "the task_id from undo_transaction or verify_tree."
-    ),
-) -> dict:
+async def get_job(task_id: str = _task_id()) -> dict:
     """Check whether a background job has finished, and whether it worked.
 
     Undo, verification, import and reindex are dispatched to a worker and
@@ -2683,7 +2809,7 @@ async def get_task(
     """
     try:
         svc = await state.service_()
-        return await svc.get_task(task_id)
+        return await svc.get_job(task_id)
     except Exception as exc:  # noqa: BLE001 - surfaced as structured error
         return _error(exc)
 
@@ -2759,7 +2885,7 @@ async def verify_tree(
     of error.
 
     May run in the background, in which case a task_id comes back — poll it
-    with get_task.
+    with get_job.
     """
     try:
         svc = await state.service_()
@@ -2895,6 +3021,34 @@ def compact_schemas() -> int:
 
 #: Characters trimmed from the published schemas at import.
 SCHEMA_CHARS_SAVED = compact_schemas()
+
+
+def clean_descriptions() -> int:
+    """Publish every description as Python 3.13 compiles it. Returns the characters saved.
+
+    A tool's description is its docstring. Python 3.13 strips a docstring's
+    indentation when it compiles it; 3.11 and 3.12 keep four spaces on every
+    line after the first, which the model is sent on every session and the
+    description budget counted -- about 1,700 characters across the surface,
+    so the same tools measured 28,016 on 3.13 and 29,736 on 3.11.
+    ``inspect.cleandoc`` gives every version the same text.
+
+    Run once at import. Idempotent, so calling it again is harmless.
+    """
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None:  # pragma: no cover - guards a future mcp refactor
+        return 0
+    saved = 0
+    for tool in getattr(manager, "_tools", {}).values():
+        if tool.description:
+            cleaned = inspect.cleandoc(tool.description)
+            saved += len(tool.description) - len(cleaned)
+            tool.description = cleaned
+    return saved
+
+
+#: Characters of docstring indentation removed from the descriptions at import.
+DESCRIPTION_CHARS_SAVED = clean_descriptions()
 
 
 def _refusing_unknown(model: type[BaseModel], tool_name: str) -> type[BaseModel]:

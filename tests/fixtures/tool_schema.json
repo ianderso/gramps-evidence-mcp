@@ -96,6 +96,15 @@
     "repository_type",
     "url"
   ],
+  "add_research_task": [
+    "allow_new_type",
+    "attributes",
+    "description",
+    "priority",
+    "private",
+    "tags",
+    "title"
+  ],
   "add_source": [
     "abbreviation",
     "allow_new_type",
@@ -234,6 +243,9 @@
   "get_family": [
     "family"
   ],
+  "get_job": [
+    "task_id"
+  ],
   "get_media": [
     "media"
   ],
@@ -272,9 +284,6 @@
   "get_source": [
     "source"
   ],
-  "get_task": [
-    "task_id"
-  ],
   "get_timeline": [
     "ancestors",
     "include_private",
@@ -308,12 +317,18 @@
   "list_filter_rules": [
     "namespace"
   ],
-  "list_object_types": [],
-  "list_reports": [],
-  "list_tags": [],
-  "list_tasks": [
+  "list_jobs": [
     "limit"
   ],
+  "list_object_types": [],
+  "list_reports": [],
+  "list_research_tasks": [
+    "attributes",
+    "include_private",
+    "status",
+    "tag"
+  ],
+  "list_tags": [],
   "list_transactions": [
     "limit"
   ],
@@ -466,6 +481,16 @@
     "place_type",
     "remove_parent",
     "title"
+  ],
+  "update_research_task": [
+    "allow_new_type",
+    "attributes",
+    "note_append",
+    "priority",
+    "private",
+    "private_note",
+    "status",
+    "task"
   ],
   "update_source": [
     "abbreviation",

@@ -506,3 +506,84 @@ async def test_record_history_or_the_version_it_needs(live):
     gone = await live("get_record_history", object_type="person", ref=person["handle"])
     assert gone["deleted"] is True
     assert gone["changes"][0]["change"] == "deleted"
+
+
+# --------------------------------------------------------------------------- #
+# Research tasks (PITFALLS 27)
+# --------------------------------------------------------------------------- #
+async def test_a_task_the_tools_make_is_stored_as_gramps_webs_form_stores_one(live):
+    """Post what the New Task form posts, make one with the tools, compare."""
+    client = live.client
+    made = await live("add_research_task", title="By agent", description="About it.")
+    assert "error" not in made, made
+    todo = next(
+        t["handle"]
+        for t in await client.list_objects("tag", keys="handle,name")
+        if t["name"] == "ToDo"
+    )
+    source_handle, note_handle = uuid.uuid4().hex, uuid.uuid4().hex
+    await client.create_objects(
+        [
+            {
+                "_class": "Source",
+                "title": "By hand",
+                "attribute_list": [
+                    {"_class": "SrcAttribute", "type": "Priority", "value": "5"},
+                    {"_class": "SrcAttribute", "type": "Status", "value": "Open"},
+                ],
+                "handle": source_handle,
+                "note_list": [note_handle],
+                "tag_list": [todo],
+            },
+            {
+                "_class": "Note",
+                "text": {"_class": "StyledText", "string": "About it.", "tags": []},
+                "handle": note_handle,
+                "tag_list": [todo],
+                "type": "To Do",
+            },
+        ]
+    )
+
+    def shape(obj: dict) -> dict:
+        drop = {"handle", "gramps_id", "change", "title", "note_list"}
+        return {k: v for k, v in obj.items() if k not in drop}
+
+    agent = await _raw(live, "source", made["gramps_id"])
+    hand = await client.get_object("source", source_handle)
+    assert shape(agent) == shape(hand)
+    agent_note = await client.get_object("note", agent["note_list"][0])
+    hand_note = await client.get_object("note", note_handle)
+    assert shape(agent_note) == shape(hand_note)
+
+    listed = await live("list_research_tasks")
+    assert [t["title"] for t in listed["tasks"]] == ["By hand", "By agent"]
+    assert {t["status"] for t in listed["tasks"]} == {"Open"}
+
+
+async def test_a_status_set_twice_leaves_one_status(live):
+    made = await live("add_research_task", title="T", tags=["Probate"])
+    for status in ("In Progress", "Done"):
+        out = await live("update_research_task", task=made["gramps_id"], status=status)
+        assert out["status"] == status, out
+    stored = await _raw(live, "source", made["gramps_id"])
+    assert [(_t(a["type"]), a["value"]) for a in stored["attribute_list"]] == [
+        ("Priority", "5"),
+        ("Status", "Done"),
+    ]
+    appended = await live("update_research_task", task=made["gramps_id"], note_append="Filed.")
+    note = await _raw(live, "note", appended["description_note"])
+    assert (note["text"]["string"], _t(note["type"])) == ("Filed.", "To Do")
+    listed = await live("list_research_tasks", status=["Done"], tag="Probate")
+    assert [t["gramps_id"] for t in listed["tasks"]] == [made["gramps_id"]]
+
+
+async def test_a_private_tasks_note_is_private_and_stays_so(live):
+    made = await live("add_research_task", title="T", description="d")
+    await live("update_research_task", task=made["gramps_id"], private=True)
+    stored = await _raw(live, "source", made["gramps_id"])
+    note = await _raw(live, "note", stored["note_list"][0])
+    assert (stored["private"], note["private"]) == (True, True)
+    public = await live("update_research_task", task=made["gramps_id"], private=False)
+    assert public["description_note_private"] is True, public
+    assert (await _raw(live, "note", stored["note_list"][0]))["private"] is True

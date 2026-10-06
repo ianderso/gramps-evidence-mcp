@@ -257,7 +257,7 @@ async def test_reindex_returns_a_task_to_poll(tools):
     """Reindexing is dispatched; the caller needs the handle to follow it."""
     out = await tools("reindex_search")
     assert out["task_id"] == "reindex1"
-    assert "get_task" in out["message"]
+    assert "get_job" in out["message"]
 
 
 @pytest.mark.parametrize(("full", "expected"), [(True, "1"), (False, None)])

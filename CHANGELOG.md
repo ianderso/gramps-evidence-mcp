@@ -13,6 +13,22 @@ adding one is a minor release.
 - gramps-webapi 3.23.1 is tested on every CI run, beside 3.21.1 and 3.22.3.
   The tools work on it unchanged. 3.22.3 stays in the matrix as the last
   release before 3.23 changed what a write may carry.
+- Research tasks, in Gramps Web's own task list (its Tasks view):
+  `add_research_task`, `list_research_tasks` and `update_research_task`. A
+  task is written exactly as Gramps Web's New Task form writes one -- a
+  Source tagged `ToDo`, with `Priority` and `Status` source attributes and
+  its description in a To Do note -- so a task made by a tool and one made
+  by hand are the same thing, and each shows where the other does.
+  `update_research_task` replaces an attribute rather than appending one:
+  Gramps Web reads the first `Status`, so a second one, all `add_attribute`
+  could add, changed nothing anyone saw. A private task's description note is
+  private too, which the form does not do: `add_research_task(private=True)`
+  and `update_research_task(private=True)` mark the note, a note created or
+  edited on a private task is made private, and making a task public leaves a
+  private note private unless `private_note=False` asks otherwise.
+  `docs/PITFALLS.md` section 27 records the shape and where it was read.
+- `list_jobs` and `get_job`: the background-job tools under names that say
+  what they are (see Removed).
 
 ### Changed
 
@@ -26,6 +42,25 @@ adding one is a minor release.
   version they run against.
 - The REST client no longer takes `oql`, which gramps-webapi 3.23 removed.
   No tool used it.
+- `reindex_search`'s description named a `search_text` tool this server has
+  never had, and said nothing refreshes the index after a write; the server
+  updates it after every write, in the background. It now says what the
+  index is for and when a rebuild helps.
+- Tool descriptions are published as Python 3.13 compiles a docstring, on
+  every Python: 3.11 and 3.12 kept four spaces of indentation on every line,
+  which every session was sent and the description budget counted -- 29,736
+  characters on 3.11 for what was 28,016 on 3.13.
+
+### Removed
+
+- **Breaking:** `list_tasks` and `get_task` are renamed `list_jobs` and
+  `get_job`, with no alias. They report the server's background jobs --
+  undo, verification, reindex, reports -- and were easily taken for the
+  research task list. `list_jobs` answers `job_count` and `jobs` where
+  `list_tasks` answered `task_count` and `tasks`; `get_job` takes the same
+  `task_id` and answers as `get_task` did. Results that said to poll
+  `get_task` now say `get_job`. A client or script calling the old names must
+  change, so this is a major release.
 
 ### Fixed
 

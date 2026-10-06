@@ -188,6 +188,17 @@ async def test_no_editing_tool_ever_sends_a_partial_object(tools):
     )
     assert linked["outcomes"] == {"linked": 1}, linked
 
+    # Added in 1.3.0.
+    task = await tools("add_research_task", title="Order the pension file", description="NARA")
+    updated = await tools(
+        "update_research_task",
+        task=task["gramps_id"],
+        status="In Progress",
+        note_append="Request sent.",
+        private=True,
+    )
+    assert updated["changed"] is True, updated
+
     assert fake.partial_writes == [], (
         f"a tool sent a partial object; every write must go through _mutate: {fake.partial_writes}"
     )

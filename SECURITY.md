@@ -26,7 +26,7 @@ maintain. Report problems with those to the
 
 - **The server has write access to a tree of living people.** That is its
   purpose, and it is why every tool declares MCP annotations: a client can
-  approve the 45 read-only tools automatically and ask before anything that
+  approve the 46 read-only tools automatically and ask before anything that
   adds, changes or deletes. Use a dedicated Gramps Web user; a user with a
   read-only role turns every write tool into a permission error.
 - **Credentials stay in the environment.** The user name and password are sent

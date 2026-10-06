@@ -34,6 +34,8 @@ from .models import (
     NameMatch,
     NameParts,
     RepositoryLink,
+    TaskPriority,
+    TaskStatus,
 )
 from .privacy import assess, redacted_stub
 
@@ -5053,7 +5055,7 @@ class GrampsService:
         task_id = _task_id_from(result)
         summary["task_id"] = task_id
         summary["message"] = f"Undo of transaction {transaction_id} submitted." + (
-            f" It runs in the background; poll get_task('{task_id}')." if task_id else ""
+            f" It runs in the background; poll get_job('{task_id}')." if task_id else ""
         )
         logger.info("undid transaction %s (force=%s)", transaction_id, force)
         return summary
@@ -5158,7 +5160,7 @@ class GrampsService:
             "privacy_options": {k: merged[k] for k in _REPORT_PRIVACY_OPTIONS if k in merged},
             "file_name": raw.get("file_name") or raw.get("filename"),
             "message": (
-                f"Report submitted; poll get_task('{task_id}')." if task_id else "Report generated."
+                f"Report submitted; poll get_job('{task_id}')." if task_id else "Report generated."
             ),
             "raw": raw,
         }
@@ -5334,21 +5336,24 @@ class GrampsService:
             "events": events,
         }
 
-    async def list_tasks(self, limit: int = 25) -> dict:
-        """List recent background tasks for this tree.
+    async def list_jobs(self, limit: int = 25) -> dict:
+        """List recent background jobs for this tree.
+
+        gramps-webapi calls them tasks (``GET /api/tasks/``); they are not the
+        research tasks of :meth:`list_research_tasks`.
 
         Parameters
         ----------
         limit : int, optional
-            Maximum tasks to return.
+            Maximum jobs to return.
 
         Returns
         -------
         dict
-            Recent tasks with their state, newest first.
+            ``job_count`` and ``jobs``, newest first, each with its state.
         """
         raw = await self.client.task_list(limit=limit)
-        return {"task_count": len(raw), "tasks": raw}
+        return {"job_count": len(raw), "jobs": raw}
 
     async def get_transaction(self, transaction_id: int) -> dict:
         """Read one transaction from the change log in full.
@@ -6016,10 +6021,11 @@ class GrampsService:
         return {"event1": event1, "event2": event2, "span": raw.get("span")}
 
     async def reindex_search(self, full: bool = False) -> dict:
-        """Rebuild the full-text search index.
+        """Rebuild the full-text index behind Gramps Web's search.
 
-        ``search_text`` goes stale after bulk writes; nothing refreshes it
-        automatically.
+        gramps-webapi updates the index after each write, as a background task
+        (``update_search_indices_from_transaction``); a rebuild is for after a
+        large import, or an index that has fallen behind.
 
         Parameters
         ----------
@@ -6029,7 +6035,7 @@ class GrampsService:
         Returns
         -------
         dict
-            A ``task_id`` to poll with :meth:`get_task`, when the server
+            A ``task_id`` to poll with :meth:`get_job`, when the server
             dispatched the work.
         """
         raw = await self.client.reindex_search(full=full)
@@ -6038,7 +6044,7 @@ class GrampsService:
             "full": full,
             "task_id": task_id,
             "message": (
-                f"Reindex submitted; poll get_task('{task_id}')."
+                f"Reindex submitted; poll get_job('{task_id}')."
                 if task_id
                 else "Reindex submitted."
             ),
@@ -6080,8 +6086,8 @@ class GrampsService:
             raise NotFoundError(f"Several trees are reachable; name one explicitly: {names}")
         return trees[0]["id"]
 
-    async def get_task(self, task_id: str) -> dict:
-        """Report a background task's state.
+    async def get_job(self, task_id: str) -> dict:
+        """Report a background job's state.
 
         Undo, import, reindex and verification are dispatched to a worker;
         the dispatching call returns before the work is done. Without this,
@@ -6133,7 +6139,7 @@ class GrampsService:
         dict
             ``findings`` with a ``finding_count``, or ``task_id`` when the
             server ran the check in the background -- poll it with
-            :meth:`get_task`.
+            :meth:`get_job`.
         """
         resolved = await self.resolve_tree_id(tree_id)
         raw = await self.client.verify(resolved, **thresholds)
@@ -6144,8 +6150,7 @@ class GrampsService:
                 "tree_id": resolved,
                 "task_id": task_id,
                 "message": (
-                    "Verification is running in the background. Poll it with "
-                    f"get_task('{task_id}')."
+                    f"Verification is running in the background. Poll it with get_job('{task_id}')."
                 ),
             }
 
@@ -6155,6 +6160,574 @@ class GrampsService:
             "finding_count": len(findings),
             "findings": findings,
         }
+
+    # ------------------------------------------------------------------ #
+    # research tasks: Gramps Web's Tasks view
+    # ------------------------------------------------------------------ #
+    async def _tag_handles(
+        self, names: Iterable[str], *, create: bool, color: str | None = "#4444FF"
+    ) -> tuple[dict[str, str], list[str]]:
+        """Handles of tags by exact name, creating the missing ones when asked.
+
+        Parameters
+        ----------
+        names : iterable of str
+            Tag names, matched exactly, as tag_object matches them.
+        create : bool
+            Create a tag that does not exist yet.
+        color : str or None, optional
+            Colour of a created tag, tag_object's default; None leaves the
+            server's, as Gramps Web does when it creates the ToDo tag.
+
+        Returns
+        -------
+        (dict, list)
+            Name to handle for every name found or created, and the names
+            created.
+        """
+        existing = {
+            (tag.get("name") or ""): tag["handle"]
+            for tag in await self.client.list_objects("tag", keys="handle,name")
+        }
+        found: dict[str, str] = {}
+        created: list[str] = []
+        for name in dict.fromkeys(names):
+            if name in existing:
+                found[name] = existing[name]
+            elif create:
+                payload: dict[str, Any] = {"_class": "Tag", "name": name}
+                if color:
+                    payload["color"] = color
+                tag = await self.client.create_object("tag", payload)
+                found[name] = existing[name] = tag["handle"]
+                created.append(name)
+                logger.info("created tag %s", tag["handle"])
+        return found, created
+
+    async def _task_attribute_names(
+        self, attributes: dict[str, str | None] | None, allow_new_type: bool
+    ) -> list[tuple[str, str | None]] | dict:
+        """A task's further attributes, each name spelt as the tree spells it.
+
+        Status and Priority are refused here: they have parameters of their
+        own, and Gramps Web reads them by those exact names. Returns the
+        refusal instead of the list when one is named.
+        """
+        given = dict(attributes or {})
+        reserved = [n for n in given if _type_key(n) in _RESERVED_TASK_KEYS]
+        if reserved:
+            return {
+                "error": "conflicting_arguments",
+                "message": f"Pass {', '.join(reserved)} as status or priority, not in "
+                "attributes: Gramps Web reads them by those exact names.",
+            }
+        types = await self.client.types() if given else {}
+        return [
+            (
+                await self._canonical_type(
+                    "source_attribute_types",
+                    name,
+                    # Removing an attribute creates no type, so any name will do.
+                    allow_new_type or value is None,
+                    types=types,
+                ),
+                value,
+            )
+            for name, value in given.items()
+        ]
+
+    async def add_research_task(
+        self,
+        title: str,
+        description: str = "",
+        priority: TaskPriority = TaskPriority.medium,
+        tags: list[str] | None = None,
+        attributes: dict[str, str] | None = None,
+        private: bool = False,
+        allow_new_type: bool = False,
+    ) -> dict:
+        """Create a research task exactly as Gramps Web's New Task form does.
+
+        A task is a Source tagged ``ToDo``, with a ``Priority`` and a
+        ``Status`` source attribute (``"5"`` and ``"Open"`` to begin with)
+        and, when there is a description, a first note of type To Do carrying
+        the same tags (``GrampsjsViewNewTask.js`` in the Gramps Web frontend).
+        The ToDo tag is created, as the form creates it, the first time.
+
+        Parameters
+        ----------
+        title : str
+            What to do, one line.
+        description : str, optional
+            The task's description, stored as its first note.
+        priority : TaskPriority, optional
+            high, medium or low: stored as "1", "5" or "9".
+        tags : list of str, optional
+            Tags beside ToDo, found or created by exact name.
+        attributes : dict, optional
+            Further source attributes, name to value, after Priority and
+            Status.
+        private : bool, optional
+            Mark the task, and its description note, private. Gramps Web's
+            form marks only the source; the note follows it here so that a
+            private task's description is not left public.
+        allow_new_type : bool, optional
+            Accept an attribute name the tree has never used.
+
+        Returns
+        -------
+        dict
+            The task's handle, gramps_id, status, priority, tags and note.
+        """
+        title = title.strip()
+        if not title:
+            return {"error": "title_required", "message": "A task needs a title."}
+        named = await self._task_attribute_names(attributes, allow_new_type)
+        if isinstance(named, dict):
+            return named
+        extra = list(dict.fromkeys(t for t in (tags or []) if t and t != TASK_TAG))
+        todo, created_tags = await self._tag_handles([TASK_TAG], create=True, color=None)
+        more, created_more = await self._tag_handles(extra, create=True)
+        tag_list = [todo[TASK_TAG], *(more[t] for t in extra)]
+        priority = TaskPriority(priority)
+        payload: dict[str, Any] = {
+            "_class": "Source",
+            "title": title,
+            "attribute_list": [
+                _src_attribute(TASK_PRIORITY, _PRIORITY_VALUES[priority]),
+                _src_attribute(TASK_STATUS, TaskStatus.open.value),
+                *(_src_attribute(name, value or "") for name, value in named),
+            ],
+            "tag_list": tag_list,
+            "private": private,
+        }
+        note = None
+        if description.strip():
+            note = await self.client.create_object(
+                "note", _task_note(description, tag_list, private)
+            )
+            payload["note_list"] = [note["handle"]]
+        try:
+            created = await self.client.create_object("source", payload)
+        except Exception:
+            if note:
+                await self._discard_note(note["handle"])
+            raise
+        logger.info("created research task %s", created.get("gramps_id"))
+        out = {
+            "handle": created["handle"],
+            "gramps_id": created.get("gramps_id"),
+            "object_type": "source",
+            "title": title,
+            "status": TaskStatus.open.value,
+            "priority": priority.value,
+            "tags": [TASK_TAG, *extra],
+            "description_note": note.get("gramps_id") if note else None,
+            "message": f"Created research task {created.get('gramps_id')} "
+            f"(Open, {priority.value} priority); it shows in Gramps Web's Tasks view.",
+        }
+        if created_tags or created_more:
+            out["created_tags"] = [*created_tags, *created_more]
+        return out
+
+    async def list_research_tasks(
+        self,
+        status: list[TaskStatus] | None = None,
+        tag: str | None = None,
+        attributes: dict[str, str] | None = None,
+    ) -> dict:
+        """List research tasks as Gramps Web's Tasks view lists them.
+
+        Every Source tagged ToDo (the view's ``HasTag`` rule), in the view's
+        order: Open, In Progress, Blocked, any other status, Done, and the
+        newest id first within each. A task's status and priority are its
+        first attribute of that name, the one Gramps Web reads.
+
+        Parameters
+        ----------
+        status : list of TaskStatus, optional
+            Only tasks in these states.
+        tag : str, optional
+            Only tasks that also carry this tag.
+        attributes : dict, optional
+            Only tasks with these attribute values, names and values matched
+            ignoring case; an empty value matches any value.
+
+        Returns
+        -------
+        dict
+            ``task_count``, ``by_status``, ``tasks`` and ``redacted_count``.
+            A private task is a redacted stub unless private records are
+            shown, and a private description note is left out the same way.
+        """
+        names = {
+            t["handle"]: t.get("name") or ""
+            for t in await self.client.list_objects("tag", keys="handle,name")
+        }
+        if TASK_TAG not in names.values():
+            return {
+                "task_count": 0,
+                "by_status": {},
+                "tasks": [],
+                "redacted_count": 0,
+                "message": f"No research tasks: the tree has no {TASK_TAG} tag yet. "
+                "add_research_task creates both.",
+            }
+        if tag is not None and tag not in names.values():
+            raise NotFoundError(f"No tag named {tag!r}; list_tags lists them.")
+        rows = await self.client.list_objects(
+            "source",
+            rules={"rules": [{"name": "HasTag", "values": [TASK_TAG]}]},
+            keys="handle,gramps_id,title,attribute_list,tag_list,note_list,private",
+        )
+        wanted = {TaskStatus(s).value for s in status or []}
+        wanted_attrs = [
+            (_type_key(n), (v or "").strip().casefold()) for n, v in (attributes or {}).items()
+        ]
+
+        def keep(row: dict) -> bool:
+            attrs = row.get("attribute_list") or []
+            if wanted and _task_attribute(attrs, TASK_STATUS) not in wanted:
+                return False
+            if tag is not None and tag not in {names.get(h) for h in row.get("tag_list") or []}:
+                return False
+            return all(
+                any(
+                    _type_key(_type_string(a.get("type"))) == name
+                    and (not value or str(a.get("value") or "").strip().casefold() == value)
+                    for a in attrs
+                )
+                for name, value in wanted_attrs
+            )
+
+        rows = [r for r in rows if keep(r)]
+        rows.sort(key=lambda r: r.get("gramps_id") or "", reverse=True)
+        rows.sort(
+            key=lambda r: _STATUS_ORDER.get(_task_attribute(r["attribute_list"], TASK_STATUS), 4)
+        )
+
+        shown = self.exposing_private
+        visible = [r for r in rows if shown or not r.get("private")]
+        firsts = [r["note_list"][0] for r in visible if r.get("note_list")]
+        notes = (
+            {
+                n["handle"]: n
+                for n in await self.client.list_objects(
+                    "note", handles=firsts, keys="handle,gramps_id,text,private"
+                )
+            }
+            if firsts
+            else {}
+        )
+        tasks: list[dict] = []
+        counts: dict[str, int] = {}
+        for row in rows:
+            if not shown and row.get("private"):
+                tasks.append(redacted_stub(row.get("gramps_id"), row.get("handle")))
+                continue
+            entry = _task_entry(row, names, notes, shown)
+            tasks.append(entry)
+            counts[entry["status"] or "(none)"] = counts.get(entry["status"] or "(none)", 0) + 1
+        return {
+            "task_count": len(tasks),
+            "by_status": counts,
+            "tasks": tasks,
+            "redacted_count": len(rows) - len(visible),
+        }
+
+    async def update_research_task(
+        self,
+        task: str,
+        status: TaskStatus | None = None,
+        priority: TaskPriority | None = None,
+        attributes: dict[str, str | None] | None = None,
+        note_append: str | None = None,
+        allow_new_type: bool = False,
+        *,
+        private: bool | None = None,
+        private_note: bool | None = None,
+    ) -> dict:
+        """Change a research task's status, priority, privacy or attributes, or add to its note.
+
+        An attribute is replaced, never appended beside the old one: the first
+        of that name takes the new value, as Gramps Web's task page sets it,
+        and any further one of that name is removed, so the value Gramps Web
+        reads is the value set. ``note_append`` adds a paragraph to the task's
+        first note, the description Gramps Web shows, creating that note (type
+        To Do) when the task has none.
+
+        A private task's description note is private too: a note this call
+        creates or edits on a private task is made private, and so is the
+        note of a task this call makes private. Making a task public never
+        makes its note public; that takes ``private_note=False``, and the
+        result says when a private note was left private.
+
+        Parameters
+        ----------
+        task : str
+            Handle or gramps_id of the task's Source.
+        status : TaskStatus, optional
+            The new status.
+        priority : TaskPriority, optional
+            The new priority.
+        attributes : dict, optional
+            Further attributes to set, name to value; a null value removes
+            every attribute of that name.
+        note_append : str, optional
+            Text to add, as a new paragraph, to the task's description note.
+        allow_new_type : bool, optional
+            Accept an attribute name the tree has never used.
+        private : bool, optional
+            Make the task private (True) or public (False).
+        private_note : bool, optional
+            Set the description note's private flag explicitly.
+
+        Returns
+        -------
+        dict
+            The task's status, priority and privacy after the call, and what
+            changed.
+        """
+        appended = (note_append or "").strip()
+        if (
+            status is None
+            and priority is None
+            and not attributes
+            and not appended
+            and private is None
+            and private_note is None
+        ):
+            return {
+                "error": "nothing_to_do",
+                "message": "Pass status, priority, attributes, note_append, private or "
+                "private_note.",
+            }
+        named = await self._task_attribute_names(attributes, allow_new_type)
+        if isinstance(named, dict):
+            return named
+        source = await self._resolve(
+            "source", task, keys="handle,gramps_id,tag_list,note_list,private"
+        )
+        todo = (await self._tag_handles([TASK_TAG], create=False))[0].get(TASK_TAG)
+        if not todo or todo not in (source.get("tag_list") or []):
+            return {
+                "error": "not_a_task",
+                "message": f"Source {source.get('gramps_id')} is not a research task: it "
+                f"does not carry the {TASK_TAG} tag. list_research_tasks lists the tasks.",
+            }
+        settings: list[tuple[str, str | None]] = []
+        if status is not None:
+            settings.append((TASK_STATUS, TaskStatus(status).value))
+        if priority is not None:
+            settings.append((TASK_PRIORITY, _PRIORITY_VALUES[TaskPriority(priority)]))
+        settings += named
+
+        task_private = bool(source.get("private")) if private is None else bool(private)
+        # The note's flag: the caller's; else private, with a private task;
+        # else left as it is -- never made public by default.
+        note_flag = private_note if private_note is not None else (True if task_private else None)
+        notes = source.get("note_list") or []
+        changes: list[str] = []
+        notices: list[str] = []
+        noted: str | None = None
+        note_private: bool | None = None
+
+        # The note first: if the task's own write then fails, the note has
+        # been made more private, never less, unless the caller asked so.
+        if notes and (appended or note_flag is not None or private is False):
+            said: list[str] = []
+            state: dict[str, Any] = {}
+
+            def edit_note(note: dict) -> str | bool:
+                if appended:
+                    text = note.setdefault("text", {"string": "", "tags": []})
+                    current = text.get("string") or ""
+                    text["string"] = f"{current}\n\n{appended}" if current.strip() else appended
+                    said.append("paragraph added")
+                if note_flag is not None and bool(note.get("private")) != note_flag:
+                    note["private"] = note_flag
+                    said.append("made private" if note_flag else "made public")
+                state["private"] = bool(note.get("private"))
+                return "; ".join(said) if said else False
+
+            done = await self._mutate("note", notes[0], edit_note, label="updated")
+            noted, note_private = done["gramps_id"], state.get("private")
+            if said:
+                changes.append(f"description note {noted}: {', '.join(said)}")
+            if private is False and private_note is None and note_private:
+                notices.append(
+                    f"Description note {noted} stays private; pass private_note=false to "
+                    "make it public."
+                )
+        elif private_note is not None and not notes and not appended:
+            notices.append("The task has no description note to mark.")
+
+        new_note = None
+        if appended and not notes:
+            note_private = bool(note_flag)
+            new_note = await self.client.create_object(
+                "note", _task_note(appended, source.get("tag_list") or [], note_private)
+            )
+            noted = new_note.get("gramps_id")
+        after: dict[str, Any] = {}
+
+        def edit(obj: dict) -> str | bool:
+            attrs = obj.setdefault("attribute_list", [])
+            for name, value in settings:
+                changes.extend(_set_task_attribute(attrs, name, value))
+            if private is not None and bool(obj.get("private")) != private:
+                obj["private"] = private
+                changes.append("task made private" if private else "task made public")
+            if new_note:
+                obj.setdefault("note_list", []).append(new_note["handle"])
+                changes.append(
+                    f"description note {noted} added" + (", private" if note_private else "")
+                )
+            after["status"] = _task_attribute(attrs, TASK_STATUS)
+            after["priority"] = _priority_label(_task_attribute(attrs, TASK_PRIORITY))
+            after["private"] = bool(obj.get("private"))
+            return "; ".join(changes) if changes else False
+
+        try:
+            result = await self._mutate("source", source["handle"], edit, label="updated task")
+        except Exception:
+            if new_note:
+                await self._discard_note(new_note["handle"])
+            raise
+        label = result.get("gramps_id") or result["handle"]
+        message = (
+            f"Task {label}: {'; '.join(changes)}"
+            if changes
+            else f"Task {label} already says that; nothing changed."
+        )
+        out = {
+            "handle": result["handle"],
+            "gramps_id": result.get("gramps_id"),
+            "object_type": "source",
+            "status": after.get("status"),
+            "priority": after.get("priority"),
+            "private": after.get("private"),
+            "changed": bool(changes),
+            "changes": changes,
+            "description_note": noted,
+            "description_note_private": note_private,
+            "message": " ".join([message, *notices]),
+        }
+        if notices:
+            out["notices"] = notices
+        return _with_repairs(out, result)
+
+
+#: A research task as Gramps Web keeps one: a Source carrying this tag,
+TASK_TAG = "ToDo"
+#: with its status and priority in source attributes of these names,
+TASK_STATUS = "Status"
+TASK_PRIORITY = "Priority"
+#: and its description in a first note of this type.
+TASK_NOTE_TYPE = "To Do"
+
+#: Priority as Gramps Web stores it (``GrampsjsViewNewTask.js``).
+_PRIORITY_VALUES = {TaskPriority.high: "1", TaskPriority.medium: "5", TaskPriority.low: "9"}
+
+#: The Tasks view's order (``GrampsjsViewTasks.js``); any other status sorts 4th.
+_STATUS_ORDER = {"Open": 1, "In Progress": 2, "Blocked": 3, "Done": 5}
+
+#: Attribute names a task's ``attributes`` may not set, as ``_type_key`` spells them.
+_RESERVED_TASK_KEYS = {"status", "priority"}
+
+#: How much of a description list_research_tasks shows; get_note reads all of it.
+_DESCRIPTION_CHARS = 400
+
+
+def _src_attribute(name: str, value: str) -> dict:
+    """A source attribute in the shape Gramps Web's task form writes."""
+    return {"_class": "SrcAttribute", "type": name, "value": value}
+
+
+def _task_note(text: str, tag_list: list[str], private: bool) -> dict:
+    """A task's description note: type To Do, carrying the task's tags."""
+    return {
+        "_class": "Note",
+        "text": {"_class": "StyledText", "string": text, "tags": []},
+        "type": TASK_NOTE_TYPE,
+        "tag_list": list(tag_list),
+        "private": private,
+    }
+
+
+def _task_attribute(attrs: list[dict] | None, name: str) -> str | None:
+    """The value of the first attribute of this exact name, the one Gramps Web reads."""
+    for attr in attrs or []:
+        if _type_string(attr.get("type")) == name:
+            return attr.get("value")
+    return None
+
+
+def _priority_label(value: str | None) -> str | None:
+    """high, medium or low, read from a stored priority as Gramps Web reads it."""
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return "high" if number < 5 else "medium" if number == 5 else "low"
+
+
+def _set_task_attribute(attrs: list[dict], name: str, value: str | None) -> list[str]:
+    """Set one attribute in place, leaving one of that name; None removes it.
+
+    The first attribute of the name takes the value and keeps its place,
+    privacy, citations and notes, as Gramps Web's task page edits it; any
+    further one of the name is removed. Edits ``attrs`` in place, and says
+    what changed.
+    """
+    at = [i for i, a in enumerate(attrs) if _type_string(a.get("type")) == name]
+    if value is None:
+        for i in reversed(at):
+            del attrs[i]
+        return [f"{name} removed"] if at else []
+    if not at:
+        attrs.append(_src_attribute(name, value))
+        return [f"{name} set to {value!r}"]
+    first = attrs[at[0]]
+    old = first.get("value")
+    first["value"] = value
+    for i in reversed(at[1:]):
+        del attrs[i]
+    said = [f"{name} {old!r} -> {value!r}"] if old != value else []
+    if len(at) > 1:
+        said.append(f"{len(at) - 1} more {name} attribute(s) removed")
+    return said
+
+
+def _task_entry(row: dict, tag_names: dict[str, str], notes: dict[str, dict], shown: bool) -> dict:
+    """One task as list_research_tasks shows it."""
+    attrs = row.get("attribute_list") or []
+    others: dict[str, Any] = {}
+    for attr in attrs:
+        name = _type_string(attr.get("type"))
+        if name not in (TASK_STATUS, TASK_PRIORITY):
+            others.setdefault(name, attr.get("value"))
+    first = (row.get("note_list") or [None])[0]
+    note = notes.get(first) if first else None
+    text = None
+    if note and (shown or not note.get("private")):
+        text = ((note.get("text") or {}).get("string") or "").strip()
+        if len(text) > _DESCRIPTION_CHARS:
+            text = text[:_DESCRIPTION_CHARS].rstrip() + " ..."
+    return {
+        "handle": row.get("handle"),
+        "gramps_id": row.get("gramps_id"),
+        "title": row.get("title"),
+        "status": _task_attribute(attrs, TASK_STATUS),
+        "priority": _priority_label(_task_attribute(attrs, TASK_PRIORITY)),
+        "tags": [
+            tag_names.get(h, h) for h in row.get("tag_list") or [] if tag_names.get(h) != TASK_TAG
+        ],
+        "attributes": others,
+        "description": text or None,
+        "description_note": note.get("gramps_id") if note else None,
+        "private": bool(row.get("private")),
+    }
 
 
 #: Side codes Gramps records on a shared segment.

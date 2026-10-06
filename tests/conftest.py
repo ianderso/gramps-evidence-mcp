@@ -646,7 +646,9 @@ class FakeGramps:
                 if refused is not None:
                     return refused
                 obj = _complete(_TYPE_TO_CLASS[typ], admitted)
-                obj["handle"] = self._new_handle()
+                # A handle the request makes is kept: Gramps Web's New Task
+                # form links its source to its note by handles it made.
+                obj["handle"] = obj.get("handle") or self._new_handle()
                 obj.setdefault("gramps_id", self._new_gid(typ))
                 obj["change"] = int(time.time())
                 self.store[typ][obj["handle"]] = obj
@@ -1005,6 +1007,12 @@ class FakeGramps:
         if "handles" in params:
             wanted = set(params["handles"].split(","))
             objs = [o for o in objs if o["handle"] in wanted]
+        if params.get("rules"):
+            rules = json.loads(params["rules"])
+            unknown = sorted({r.get("name") for r in rules.get("rules", [])} - {"HasTag"})
+            if unknown:
+                return httpx.Response(400, json={"message": f"the fake has no rule {unknown}"})
+            objs = [o for o in objs if self._rules_hold(o, rules)]
         if params.get("gql"):
             objs = [o for o in objs if _gql_match(o, params["gql"], self._served_by_handle)]
         if params.get("backlinks"):
@@ -1023,6 +1031,20 @@ class FakeGramps:
         """An object as GrampsQL's ``get_<type>`` reaches it, or None."""
         stored = self.store.get(typ, {}).get(handle)
         return _served(stored) if stored else None
+
+    def _rules_hold(self, obj: dict, rules: dict) -> bool:
+        """Gramps filter rules, as far as the tools send them: ``HasTag``.
+
+        HasTag matches a tag by exact name (``get_tag_from_name`` in Gramps'
+        rule); several rules combine by ``function``, "and" by default.
+        """
+        held = []
+        for rule in rules.get("rules", []):
+            tagged = {h for h, t in self.store["tag"].items() if t.get("name") == rule["values"][0]}
+            held.append(bool(tagged & set(obj.get("tag_list") or [])))
+        if rules.get("invert"):
+            held = [not h for h in held]
+        return any(held) if rules.get("function") == "or" else all(held)
 
     def _stored_dna_matches(self, handle: str) -> list[dict]:
         """Matches as gramps-webapi 3.21.1 reads them from the tree.

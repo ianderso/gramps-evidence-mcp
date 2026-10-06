@@ -225,6 +225,22 @@ async def test_compaction_is_idempotent():
     assert compact_schemas() == 0
 
 
+async def test_descriptions_are_the_same_text_on_every_python():
+    """3.13 strips a docstring's indentation; 3.11 and 3.12 kept it, and sent it.
+
+    The budget above measured 29,736 characters on 3.11 for what was 28,016
+    on 3.13, so the same tools passed on one version and failed on another.
+    """
+    import inspect
+
+    from gramps_evidence_mcp.server import clean_descriptions
+
+    for tool in await _tools():
+        assert tool.description == inspect.cleandoc(tool.description), tool.name
+        assert "\n    " not in tool.description, tool.name
+    assert clean_descriptions() == 0, "idempotent"
+
+
 async def test_tools_still_validate_their_arguments_after_compaction():
     """Titles are documentation-only, so validation must be unaffected.
 

@@ -63,7 +63,10 @@ class Recorder:
         """Add everything the scenario left stored, as get_object serves it."""
         for object_type in WIPE_ORDER:
             rows = await self.client.list_objects(object_type, keys="handle,gramps_id")
-            for row in sorted(rows, key=lambda r: r.get("gramps_id") or ""):
+            # A tag has no gramps_id, and the two list tags in different
+            # orders: its name in this comparison orders it the same in both.
+            rows.sort(key=lambda r: (r.get("gramps_id") or "", self.norm(r["handle"])))
+            for row in rows:
                 stored = await self.call("get_object", object_type=object_type, ref=row["handle"])
                 self.answers.append((f"stored {self.norm(row['handle'])}", stored))
         return [(label, self.norm(_stable(out))) for label, out in self.answers]
@@ -189,6 +192,20 @@ async def _building_and_reading(step: Recorder) -> None:
     await step("list_tags")
     await step("get_record_history", object_type="person", ref=father["gramps_id"])
     await step("get_record_history", object_type="family", ref=family["gramps_id"])
+    task = await step(
+        "add_research_task",
+        title="Order the deed",
+        description="Deed Book 3, p. 210",
+        tags=["Land"],
+        priority="high",
+    )
+    await step(
+        "update_research_task",
+        task=task["gramps_id"],
+        status="In Progress",
+        note_append="Letter sent.",
+    )
+    await step("list_research_tasks")
     await step(
         "query_records",
         object_type="event",

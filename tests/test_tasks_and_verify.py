@@ -11,12 +11,12 @@ import pytest
 
 
 # --------------------------------------------------------------------------- #
-# get_task
+# get_job
 # --------------------------------------------------------------------------- #
 async def test_pending_task_is_reported_as_unfinished(tools):
     """A caller must be able to tell 'not yet' from 'worked'."""
     tools.fake.tasks["t1"] = {"task_id": "t1", "state": "PENDING", "name": "undo", "info": "queued"}
-    out = await tools("get_task", task_id="t1")
+    out = await tools("get_job", task_id="t1")
     assert out["finished"] is False
     assert out["succeeded"] is None
 
@@ -29,7 +29,7 @@ async def test_successful_task_reports_its_result(tools):
         "name": "verify",
         "result_object": {"findings": []},
     }
-    out = await tools("get_task", task_id="t2")
+    out = await tools("get_job", task_id="t2")
     assert out["finished"] is True
     assert out["succeeded"] is True
     assert out["result"] == {"findings": []}
@@ -38,7 +38,7 @@ async def test_successful_task_reports_its_result(tools):
 async def test_failed_task_is_finished_but_not_successful(tools):
     """A failure that reads as 'done' would be worse than no tool at all."""
     tools.fake.tasks["t3"] = {"task_id": "t3", "state": "FAILURE", "info": "worker died"}
-    out = await tools("get_task", task_id="t3")
+    out = await tools("get_job", task_id="t3")
     assert out["finished"] is True
     assert out["succeeded"] is False
     assert out["info"] == "worker died"
@@ -47,14 +47,14 @@ async def test_failed_task_is_finished_but_not_successful(tools):
 async def test_revoked_task_is_terminal(tools):
     """A cancelled task will never change again; do not let a caller wait."""
     tools.fake.tasks["t4"] = {"task_id": "t4", "state": "REVOKED"}
-    out = await tools("get_task", task_id="t4")
+    out = await tools("get_job", task_id="t4")
     assert out["finished"] is True
     assert out["succeeded"] is False
 
 
 async def test_unknown_task_is_an_error_envelope(tools):
     """A bad id must not look like a pending task."""
-    out = await tools("get_task", task_id="nope")
+    out = await tools("get_job", task_id="nope")
     assert out["error"] == "api"
     assert out["status"] == 404
 
@@ -64,7 +64,7 @@ async def test_undo_hands_back_the_task_id_to_poll(tools):
     tools.fake.transactions = [{"id": 7, "changes": [], "_conflicts": []}]
     out = await tools("undo_transaction", transaction_id=7, dry_run=False)
     assert out["task_id"] == "t1"
-    assert "get_task" in out["message"]
+    assert "get_job" in out["message"]
 
 
 # --------------------------------------------------------------------------- #
@@ -154,4 +154,4 @@ async def test_background_verification_returns_a_task_to_poll(tools):
     tools.fake.verify_task_id = "v99"
     out = await tools("verify_tree")
     assert out["task_id"] == "v99"
-    assert "get_task" in out["message"]
+    assert "get_job" in out["message"]

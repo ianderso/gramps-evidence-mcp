@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 **read/write access to a Gramps genealogy tree**, plus a **read-only
 "reference layer"** over legacy GEDCOM exports.
 
-**90 tools, built around evidence discipline.** The premise is that an assistant
+**93 tools, built around evidence discipline.** The premise is that an assistant
 turned loose on a family tree will happily invent a plausible ancestor, so the
 write paths here are shaped to make every claim carry its source: facts are
 created with citations attached, `uncite` deletes what it orphans, parent-child
@@ -289,7 +289,7 @@ server does not authenticate callers itself; see
 ### 5. Add the connector in claude.ai
 
 **Settings → Connectors → Add custom connector →** paste
-`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 90 tools
+`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 93 tools
 appear in chat. (Custom connectors require a paid Claude plan; on
 Team/Enterprise an admin may need to enable them.)
 
@@ -398,6 +398,9 @@ Each use is logged with the tool's name, never the records.
 - Events, citations, notes and media are judged by their own private flag only.
   An event row carries no link back to its person, so a living person's birth
   event is visible to an event query unless the event itself is private.
+- `list_research_tasks` judges a task by its own private flag, and its
+  description by its note's. A task's title can name a living person; mark
+  such a task private.
 - Timeline entries are judged by their person, not by the event's own private
   flag, which the timeline endpoint does not report.
 - A stub still says that a record matched. A query for a name and a birth year
@@ -416,13 +419,13 @@ Request URLs are kept out of the log too, because a query filter travels in one.
 
 ## Tool reference
 
-**90 tools.** Every tool that mutates the tree re-fetches the *whole* object
+**93 tools.** Every tool that mutates the tree re-fetches the *whole* object
 before PUTting it back — edits through `service._mutate()` — see
 [the `keys=` trap](docs/PITFALLS.md#1-keys-plus-put-destroys-unfetched-fields).
 
 **Every tool declares MCP annotations** saying whether it only reads, adds, or
 changes and removes, so a client can approve reads automatically and ask before
-the rest. 45 tools only read.
+the rest. 46 tools only read.
 
 **Unknown parameters are refused.** A misspelt or invented argument is an error
 that lists the parameters the tool does take. It is not silently dropped, which
@@ -534,6 +537,19 @@ unfiltered listing of the first 200 objects.
 | `verify_tree` | Gramps' own genealogical plausibility checks — a mother at nine, a 120-year marriage, an unparseable date. A different audit from the citation sweeps. |
 | `ocr_media` | OCR a document image server-side (tesseract, 43 languages). **A finding aid, not evidence** — read the image before citing it. |
 
+**Research tasks** — Gramps Web's own task list
+
+| Tool | Purpose |
+| --- | --- |
+| `add_research_task` | Add a task to Gramps Web's Tasks view, written as its New Task form writes one: a Source tagged `ToDo`, with `Status` and `Priority` source attributes and the description as a To Do note. |
+| `list_research_tasks` | The tasks, in the Tasks view's order, with status, priority, tags, attributes and description; filtered by status, tag or attribute value. A private task is a redacted stub. |
+| `update_research_task` | Set a task's status, priority, privacy or attributes — each **replaced**, never appended beside the old value, which Gramps Web would not show — or add a paragraph to its description. A private task's description note is private too; making the task public leaves a private note private unless `private_note=false`. |
+
+A task made here and one made in Gramps Web are the same thing: either shows
+in the Tasks view, and in desktop Gramps' To Do gramplet through its note. A
+task is a to-do, not evidence, so it is never cited. These are not the
+background jobs `list_jobs` reports.
+
 **Ops**
 
 | Tool | Purpose |
@@ -541,11 +557,11 @@ unfiltered listing of the first 200 objects.
 | `export_backup` | Full-tree Gramps XML dump to a new file; never replaces one. **Run this before any bulk write.** |
 | `list_transactions` | Recent writes: what changed, when, by which user. Also how you check whether another session is writing. |
 | `undo_transaction` | Undo a transaction, after a conflict check. Dry-run by default. Returns a `task_id`. |
-| `list_tasks` | Recent background jobs for this tree, newest first. |
+| `list_jobs` | Recent background jobs for this tree, newest first. |
 | `get_transaction` | One transaction in full, including the objects it changed. Read before undoing. |
 | `get_record_history` | Who added, edited or deleted one record, and when — each change with its transaction. A deleted record by its handle. Needs gramps-webapi 3.22 or later. |
-| `get_task` | Whether a background job finished, and whether it worked. Undo, verification and reindex all dispatch to a worker. |
-| `reindex_search` | Rebuild the full-text index. Nothing refreshes it after writes, so `search_text` silently misses anything added since. |
+| `get_job` | Whether a background job finished, and whether it worked. Undo, verification and reindex all dispatch to a worker. |
+| `reindex_search` | Rebuild the full-text index behind Gramps Web's search box. The server updates it after each write; rebuild after a large import, or when search misses something the tree holds. |
 
 **Reference layer** (read-only, never touches the tree)
 
@@ -710,7 +726,7 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
 
 ```
 src/gramps_evidence_mcp/    the MCP server
-  server.py                 tool definitions (the 90 tools) and the entry point
+  server.py                 tool definitions (the 93 tools) and the entry point
   service.py                genealogy operations; edits go through _mutate()
   client.py                 gramps-webapi REST client
   mapping.py                Gramps object <-> JSON shapes

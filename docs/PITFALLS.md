@@ -530,3 +530,30 @@ already in a tree stays in its vocabulary, and the objects carrying it keep
 it until retyped (`update_event`, `update_url`, `update_place`, ...).
 Verified on 3.21.1, 3.22.3 and 3.23.1, where the contract tests also hold the fake's
 standard names to the server's.
+
+## 27. A research task is a tagged source, and Gramps Web reads its first Status
+
+Gramps Web's research task list (its Tasks view) has no object of its own. A
+task is a **Source** tagged `ToDo`, with two source attributes, `Priority`
+(`"1"` high, `"5"` medium, `"9"` low) and `Status` (`Open`, `In Progress`,
+`Blocked`, `Done`), and its description in a first note of type To Do that
+carries the same tags. The New Task form posts the source and the note to
+`POST /api/objects/` in one transaction, linked by handles it makes itself,
+which the server keeps; it creates the `ToDo` tag, by name alone, if the tree
+has none. The view lists sources matching the filter rule
+`{"name": "HasTag", "values": ["ToDo"]}`, which matches a tag by exact name.
+
+The view and the task page read a task's status and priority from the
+**first** attribute of that name. Setting one on the task page replaces that
+attribute in place; Set Status in the list removes every attribute of that
+name and appends one. Nothing in Gramps Web reads a second `Status`, so
+appending one -- which is all `add_attribute` can do -- changes nothing anyone
+sees.
+
+`add_research_task` writes the form's shape one object at a time (note, then
+source), so the stored objects are the same; `update_research_task` replaces
+the first attribute of a name in place and removes any further one; and
+`list_research_tasks` asks for the same rule. Read from the Gramps Web
+frontend source (`GrampsjsViewNewTask.js`, `GrampsjsViewTasks.js`,
+`GrampsjsTask.js`, 26.10.0) on 2026-10-05; the `HasTag` query and the kept
+handle are checked against the server by the live suite.

@@ -29,6 +29,7 @@ FILTERED_TOOLS = {
     "run_report",
     "consult_reference",
     "check_family_links",
+    "list_research_tasks",
 }
 
 

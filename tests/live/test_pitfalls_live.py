@@ -758,3 +758,43 @@ async def test_7_tilde_on_a_list_compares_the_list_and_any_reaches_the_items(liv
     assert await ids(
         'attribute_list.any.value ~ "nowhere" OR note_list.any.get_note.text.string ~ "blm"'
     ) == [linked["handle"]]
+
+
+# --------------------------------------------------------------------------- #
+# 27: research tasks
+# --------------------------------------------------------------------------- #
+async def test_27_objects_keeps_a_handle_the_request_makes(live):
+    """Gramps Web's New Task form links its source and note by its own handles."""
+    client = live.client
+    source_handle, note_handle = uuid.uuid4().hex, uuid.uuid4().hex
+    await client.create_objects(
+        [
+            {
+                "_class": "Source",
+                "title": "Order the probate file",
+                "handle": source_handle,
+                "note_list": [note_handle],
+            },
+            {"_class": "Note", "handle": note_handle, "text": {"string": "d"}, "type": "To Do"},
+        ]
+    )
+    source = await client.get_object("source", source_handle)
+    assert source["note_list"] == [note_handle]
+    assert (await client.get_object("note", note_handle))["type"] == "To Do"
+
+
+async def test_27_the_has_tag_rule_matches_a_tag_by_exact_name(live):
+    client = live.client
+    todo = await client.create_object("tag", {"_class": "Tag", "name": "ToDo"})
+    other = await client.create_object("tag", {"_class": "Tag", "name": "todo list"})
+    tagged = await client.create_object(
+        "source", {"_class": "Source", "title": "A task", "tag_list": [todo["handle"]]}
+    )
+    await client.create_object(
+        "source", {"_class": "Source", "title": "Not one", "tag_list": [other["handle"]]}
+    )
+    await client.create_object("source", {"_class": "Source", "title": "Evidence"})
+    rows = await client.list_objects(
+        "source", rules={"rules": [{"name": "HasTag", "values": ["ToDo"]}]}, keys="handle"
+    )
+    assert [r["handle"] for r in rows] == [tagged["handle"]]

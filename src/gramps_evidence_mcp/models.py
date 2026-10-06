@@ -35,6 +35,23 @@ class Confidence(str, Enum):
     very_high = "very_high"  # 4 - original record, primary information
 
 
+class TaskStatus(str, Enum):
+    """A research task's status: the four Gramps Web's Tasks view offers."""
+
+    open = "Open"
+    in_progress = "In Progress"
+    blocked = "Blocked"
+    done = "Done"
+
+
+class TaskPriority(str, Enum):
+    """A research task's priority. Stored as Gramps Web stores it: 1, 5 or 9."""
+
+    high = "high"  # "1"
+    medium = "medium"  # "5"
+    low = "low"  # "9"
+
+
 class _StrictInput(BaseModel):
     """Base for tool inputs: a key the model does not define is refused.
 

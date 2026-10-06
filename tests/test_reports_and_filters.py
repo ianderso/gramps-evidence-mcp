@@ -86,7 +86,7 @@ async def test_report_returns_a_task_and_a_filename(tools):
     out = await tools("run_report", report_id="ancestor_report")
     assert out["task_id"] == "report1"
     assert out["file_name"] == "ancestor_report.pdf"
-    assert "get_task" in out["message"]
+    assert "get_job" in out["message"]
 
 
 async def test_synchronous_report_reports_no_task(tools):
@@ -203,15 +203,15 @@ async def test_task_list_reports_recent_jobs(tools):
         {"task_id": "t1", "name": "verify", "state": "SUCCESS"},
         {"task_id": "t2", "name": "undo", "state": "PENDING"},
     ]
-    out = await tools("list_tasks")
-    assert out["task_count"] == 2
-    assert out["tasks"][1]["state"] == "PENDING"
+    out = await tools("list_jobs")
+    assert out["job_count"] == 2
+    assert out["jobs"][1]["state"] == "PENDING"
 
 
 async def test_empty_task_list_is_not_an_error(tools):
     """A tree where nothing has run is the normal state."""
-    out = await tools("list_tasks")
-    assert out["task_count"] == 0
+    out = await tools("list_jobs")
+    assert out["job_count"] == 0
 
 
 async def test_single_transaction_is_readable_before_undoing_it(tools):
@@ -229,7 +229,7 @@ async def test_unknown_transaction_is_an_error_envelope(tools):
     assert out["status"] == 404
 
 
-@pytest.mark.parametrize("tool_name", ["list_reports", "list_tasks", "list_custom_filters"])
+@pytest.mark.parametrize("tool_name", ["list_reports", "list_jobs", "list_custom_filters"])
 async def test_listing_tools_survive_an_empty_instance(tools, tool_name):
     """Nothing configured yet is a normal state, not a failure."""
     tools.fake.reports = []
