@@ -196,6 +196,18 @@ async def _building_and_reading(step: Recorder) -> None:
         select=["gramps_id", {"json_path": ["date", "dateval", 2], "as": "year"}],
         order_by=[{"column": "gramps_id", "direction": "asc"}],
     )
+    await step(
+        "query_objects",
+        object_type="person",
+        gql='alternate_names.any.surname_list.any.surname ~ "holt"',
+        keys="gramps_id",
+    )
+    await step(
+        "query_objects",
+        object_type="person",
+        gql='event_ref_list.any.ref.get_event.description ~ "parents" OR urls.length > 0',
+        keys="gramps_id",
+    )
 
 
 async def _editing_and_deleting(step: Recorder) -> None:

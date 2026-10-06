@@ -27,6 +27,28 @@ adding one is a minor release.
 - The REST client no longer takes `oql`, which gramps-webapi 3.23 removed.
   No tool used it.
 
+### Fixed
+
+- `query_objects` with `~` on a list field -- `urls ~ "http"`,
+  `attribute_list ~ "blm.gov"` -- returned no rows and no error: GrampsQL
+  compares the list itself, asking whether the value is one of its items.
+  Such a query is refused now, as `gql_list_field`, naming the form that
+  works: `urls.any.path ~ "http"`, `note_list.any.get_note.text.string ~ "x"`.
+  A test for one handle in a list of handles (`tag_list ~ "<handle>"`) still
+  runs, and says what it asked when it finds nothing. The tool's description
+  and `docs/PITFALLS.md` section 7 teach `.any.` and `get_<type>`.
+- An error with no message reached the caller as `{"error": "unexpected",
+  "message": ""}`. The commonest was a request that outran the timeout:
+  httpx's timeouts carry no text. A timeout is now `timeout`, and a failed
+  connection `connection`, each saying what to do, and any other error
+  names its kind when it has no message.
+- A GrampsQL read is allowed 120 seconds rather than the 30 every request
+  had. The server tests every object in the collection in Python, and an OR
+  of two list conditions over 6,092 citations took 29 to 38 seconds.
+- An API error reports the server's own message. gramps-webapi nests it
+  (`{"error": {"code": 422, "message": ...}}`), and the tools showed the
+  whole structure; an empty body is reported as such.
+
 ## [1.2.0] — 2026-10-03
 
 What an audit of the documentation and the live suite found open after 1.1.0.

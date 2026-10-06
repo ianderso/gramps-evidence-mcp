@@ -3251,6 +3251,9 @@ class GrampsService:
         fields the judgement needs are fetched whether or not they were asked
         for, and dropped again afterwards.
         """
+        refusal, membership = _gql_list_checks(gql) if gql else (None, [])
+        if refusal:
+            return refusal
         filtering = not self.exposing_private
         added: list[str] = []
         if filtering and keys:
@@ -3295,7 +3298,7 @@ class GrampsService:
                 else {k: v for k, v in r.items() if k not in added}
                 for r in rows
             ]
-        return {
+        out = {
             "object_type": object_type,
             "query": gql,
             "total_matched": total,
@@ -3305,6 +3308,11 @@ class GrampsService:
             "redacted_count": redacted,
             "note": "Filtered server-side. " + GQL_NOTES if gql else None,
         }
+        if membership and not total:
+            # Nothing matched a test of whether a handle is listed: say what
+            # was asked, since the usual intent was a search of the text.
+            out["warning"] = " ".join(membership)
+        return out
 
     async def _restricted_people(self, handles: Iterable[str | None]) -> set[str]:
         """Which of these people bulk output must withhold.
@@ -6498,6 +6506,112 @@ def _query_trap(
                 "holds an object use get_backlinks.",
             }
     return None
+
+
+#: List fields whose items are objects, each with the path to the item field
+#: a search usually means. GrampsQL compares such a list as a whole: ``~``
+#: asks whether the value is one of the items, which a string never is, so it
+#: matches nothing, and ``!~`` everything (docs/PITFALLS.md section 7).
+_GQL_OBJECT_LISTS = {
+    "address_list": "address_list.any.city",
+    "alt_loc": "alt_loc.any.city",
+    "alt_names": "alt_names.any.value",
+    "alternate_names": "alternate_names.any.first_name",
+    "attribute_list": "attribute_list.any.value",
+    "child_ref_list": "child_ref_list.any.ref",
+    "event_ref_list": "event_ref_list.any.ref.get_event.description",
+    "lds_ord_list": "lds_ord_list.any.temple",
+    "media_list": "media_list.any.ref.get_media.desc",
+    "person_ref_list": "person_ref_list.any.rel",
+    "placeref_list": "placeref_list.any.ref",
+    "reporef_list": "reporef_list.any.call_number",
+    "surname_list": "surname_list.any.surname",
+    "urls": "urls.any.path",
+}
+
+#: List fields of handles, each with the path to the text of what they point
+#: at. ``~ "<handle>"`` asks whether one object is listed, and is meant; any
+#: other comparison, or ``~`` with text, matches nothing.
+_GQL_HANDLE_LISTS = {
+    "citation_list": "citation_list.any.get_citation.page",
+    "family_list": "family_list.any.get_family.gramps_id",
+    "note_list": "note_list.any.get_note.text.string",
+    "parent_family_list": "parent_family_list.any.get_family.gramps_id",
+    "tag_list": "tag_list.any.get_tag.name",
+}
+
+#: One condition of a GrampsQL query: ``lhs op rhs``. Quoted strings are
+#: matched first and skipped, so text inside a value is never read as a field.
+_GQL_CONDITION = re.compile(
+    r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
+    r"|(?P<lhs>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[\d+\])*)\s*"
+    r"(?P<op>!=|<=|>=|!~|=|<|>|~)\s*(?P<rhs>\"[^\"]*\"|'[^']*'|[\w.-]+)?"
+)
+
+#: What a handle can look like: no spaces, dots, slashes or other punctuation.
+_HANDLE_LIKE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _gql_list_checks(gql: str) -> tuple[dict | None, list[str]]:
+    """Refuse a GrampsQL comparison of a whole list that can never be true.
+
+    ``urls ~ "http"`` reads as a search of the URLs and returns zero rows with
+    HTTP 200 (TOOL-REQUESTS #26); the server compares the list itself. A list
+    of objects is searched through its items, ``urls.any.path ~ "http"``, and
+    a list of handles through what they point at,
+    ``note_list.any.get_note.text.string ~ "x"``. A test for one handle in a
+    list of handles, ``tag_list ~ "<handle>"``, is allowed, and explained
+    when it matches nothing.
+
+    Returns
+    -------
+    (dict or None, list of str)
+        An error envelope for the first comparison that cannot match, and for
+        each handle test allowed through, what it asks.
+    """
+    membership: list[str] = []
+    for found in _GQL_CONDITION.finditer(gql):
+        lhs, op = found.group("lhs"), found.group("op")
+        if not lhs:
+            continue
+        rhs = (found.group("rhs") or "").strip("\"'")
+        parts = lhs.split(".")
+        if parts[-1] in ("any", "all") and len(parts) > 1:
+            parts = parts[:-1]
+        field = parts[-1]
+        prefix = ".".join(parts[:-1])
+
+        def at(path: str, prefix: str = prefix) -> str:
+            return f"{prefix}.{path}" if prefix else path
+
+        condition = " ".join(found.group(0).split())
+        if field in _GQL_OBJECT_LISTS:
+            outcome = "every record" if op.startswith("!") else "nothing"
+            return {
+                "error": "gql_list_field",
+                "message": f"The condition {condition} compares the list {field} as a "
+                f"whole, and its items are objects, so it matches {outcome}. Search the "
+                f'items instead: {at(_GQL_OBJECT_LISTS[field])} ~ "{rhs}" matches when '
+                f"any item does (.all. when every item does), and {at(field)}.length > 0 "
+                "when there are any.",
+            }, []
+        if field in _GQL_HANDLE_LISTS:
+            follow = at(_GQL_HANDLE_LISTS[field])
+            if op in ("~", "!~") and _HANDLE_LIKE.fullmatch(rhs):
+                membership.append(
+                    f"The condition {condition} asks whether the handle {rhs!r} is in "
+                    f'{field}. To search what {field} points at: {follow} ~ "{rhs}".'
+                )
+                continue
+            return {
+                "error": "gql_list_field",
+                "message": f"The condition {condition} cannot match as meant: {field} is "
+                f"a list of handles, and the one comparison it takes is "
+                f'{at(field)} ~ "<handle>", whether that object is listed. To search '
+                f'what it points at: {follow} ~ "{rhs}"; {at(field)}.length > 0 when '
+                "there are any.",
+            }, []
+    return None, membership
 
 
 def _person_merge_refusal(keep: dict, drop: dict) -> str | None:

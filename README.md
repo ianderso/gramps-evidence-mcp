@@ -571,13 +571,22 @@ gramps-webapi 3.21.1, 3.22.3 and 3.23.1:
   `get_backlinks` to find uncited sources. Querying `citation_list` on sources
   matches none, cited or not.
 - **Booleans compare as integers**: `private = 1`, not `private = true`.
+- **A list is searched through its items.** `~` on the list itself asks
+  whether the value *is* an item, so `urls ~ "http"` matches nothing.
+  `query_objects` refuses it and names the form that works: `.any.` (or
+  `.all.`) reaches the items, and `get_<type>` follows a handle.
+- **Every condition reads the whole collection**, object by object, so a
+  GrampsQL read is allowed 120 seconds: an OR of two list conditions took 29
+  seconds over 6,000 citations.
 
 Useful ones:
 
 ```
-citations   confidence >= 3 AND page = ""     high-confidence claims with no locator
-sources     media_list.length = 0             documents with no image attached
-media       desc = ""                         media nothing identifies
+citations   confidence >= 3 AND page = ""                high-confidence claims with no locator
+sources     media_list.length = 0                        documents with no image attached
+media       desc = ""                                    media nothing identifies
+person      urls.any.path ~ "findagrave"                 a URL anywhere among a person's links
+citation    note_list.any.get_note.text.string ~ "x"     a citation whose note mentions x
 ```
 
 Every tool has an LLM-facing docstring explaining when to use it, parameter

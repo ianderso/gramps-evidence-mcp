@@ -18,6 +18,7 @@ import logging
 import traceback
 from typing import Any
 
+import httpx
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -175,6 +176,25 @@ def _error(exc: Exception) -> dict:
                 "GRAMPS_MCP_USERNAME/PASSWORD and the user's role."
             )
         return {"error": "api", "status": exc.status, "message": exc.detail + hint}
+    if isinstance(exc, httpx.TimeoutException):
+        # httpx's timeouts carry no message, so this used to reach the caller
+        # as "unexpected" with an empty one (TOOL-REQUESTS #27).
+        return {
+            "error": "timeout",
+            "message": f"gramps-webapi did not answer in time ({type(exc).__name__}). "
+            "The server may be busy, or the request slow: a GrampsQL query reads "
+            "every object in the collection. Narrow it, or use query_records. A "
+            "write may still have landed: re-read before retrying one. The limit "
+            "is request_timeout in the TOML file.",
+        }
+    if isinstance(exc, httpx.TransportError):
+        return {
+            "error": "connection",
+            "message": f"Could not reach gramps-webapi ({type(exc).__name__}"
+            + (f": {exc}" if str(exc) else "")
+            + "). Check that it is running at GRAMPS_MCP_API_URL. A write may "
+            "have landed before the connection failed: re-read before retrying one.",
+        }
     # The stack, not the message: a message can quote record contents, and
     # the log holds ids and handles only.
     logger.error(
@@ -182,7 +202,10 @@ def _error(exc: Exception) -> dict:
         type(exc).__name__,
         "".join(traceback.format_tb(exc.__traceback__)),
     )
-    return {"error": "unexpected", "message": str(exc)}
+    return {
+        "error": "unexpected",
+        "message": str(exc) or f"{type(exc).__name__}, with no message.",
+    }
 
 
 def _include_private() -> Any:
@@ -1160,9 +1183,15 @@ async def query_objects(
         "'confidence >= 3 AND page = \"\"' (high-confidence citations with no "
         "locator), 'media_list.length = 0' (sources with no image), "
         "'desc = \"\"' (undescribed media), 'description ~ \"1871\"'. "
+        "A LIST is searched through its items with '.any.' (or '.all.'), and a "
+        "handle followed with 'get_<type>': 'urls.any.path ~ \"blm.gov\"', "
+        "'attribute_list.any.value ~ \"x\"', 'note_list.any.get_note.text.string "
+        "~ \"x\"'. '~' on the list itself asks whether the value IS an item, so it "
+        "is refused. "
         "TRAPS: a field the object lacks is not an error, it matches nothing "
         "-- event 'type' is one (use query_records). Booleans compare as 0/1: "
-        "'private = 1', never 'private = true'.",
+        "'private = 1', never 'private = true'. A query reads the whole "
+        "collection, so each OR'd condition adds time.",
     ),
     gramps_ids: list[str] | None = Field(
         default=None, description="Fetch these specific gramps_ids (e.g. ['S0001','S0002'])."
@@ -1193,6 +1222,8 @@ async def query_objects(
     * uncited high-confidence claims: citations where `confidence >= 3 AND page = ""`
     * documents with no image: sources where `media_list.length = 0`
     * anonymous media: media where `desc = ""`
+    * a URL anywhere: `urls.any.path ~ "blm.gov"`; a list is searched through
+      its items, never with `~` on the list itself
 
     To ask "what cites this source?" use get_backlinks -- a source has no
     citation_list, because citations point at IT, and reading citation_list on a

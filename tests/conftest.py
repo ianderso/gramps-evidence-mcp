@@ -13,6 +13,7 @@ import copy
 import ipaddress
 import itertools
 import json
+import operator
 import os
 import re
 import socket
@@ -1005,7 +1006,7 @@ class FakeGramps:
             wanted = set(params["handles"].split(","))
             objs = [o for o in objs if o["handle"] in wanted]
         if params.get("gql"):
-            objs = [o for o in objs if _gql_match(o, params["gql"])]
+            objs = [o for o in objs if _gql_match(o, params["gql"], self._served_by_handle)]
         if params.get("backlinks"):
             objs = [dict(o, backlinks=self._backlinks_for(o["handle"])) for o in objs]
         if params.get("keys"):
@@ -1017,6 +1018,11 @@ class FakeGramps:
         if params.get("pagesize") == "1":
             objs = objs[:1]
         return httpx.Response(200, json=objs, headers=headers)
+
+    def _served_by_handle(self, typ: str, handle: str) -> dict | None:
+        """An object as GrampsQL's ``get_<type>`` reaches it, or None."""
+        stored = self.store.get(typ, {}).get(handle)
+        return _served(stored) if stored else None
 
     def _stored_dna_matches(self, handle: str) -> list[dict]:
         """Matches as gramps-webapi 3.21.1 reads them from the tree.
@@ -1513,49 +1519,105 @@ def _type_name(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _gql_match(obj: dict, query: str) -> bool:
-    """A deliberately tiny GrampsQL subset: '<path> <op> <value>' joined by AND.
+#: One GrampsQL condition, or a quoted string to step over: AND and OR are
+#: found between conditions, never inside a value.
+_GQL_TOKEN = re.compile(
+    r'"[^"]*"|\'[^\']*\'|(?P<word>\b(?:and|or)\b)',
+    re.IGNORECASE,
+)
+_GQL_SINGLE = re.compile(
+    r"^\s*(?P<lhs>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[\d+\])*)\s*"
+    r"(?:(?P<op>!=|<=|>=|!~|=|<|>|~)\s*(?P<rhs>\"[^\"]*\"|'[^']*'|\S+))?\s*$"
+)
 
-    Enough to exercise the call path and the single-'=' syntax; the real parser
-    lives on the server.
+
+def _gql_split(query: str, keyword: str) -> list[str]:
+    """Split a query on AND or OR outside quoted values."""
+    parts, last = [], 0
+    for token in _GQL_TOKEN.finditer(query):
+        if (token.group("word") or "").lower() == keyword:
+            parts.append(query[last : token.start()])
+            last = token.end()
+    return [*parts, query[last:]]
+
+
+def _gql_match(obj: dict, query: str, resolve=None) -> bool:
+    """GrampsQL as gramps-ql 0.5.0 evaluates it, less parentheses.
+
+    What gramps-webapi 3.21.1 to 3.23.1 install (``gramps_ql/gql.py``): OR of
+    ANDs; a path through fields, ``[n]`` indexes, ``.length``, ``.any`` and
+    ``.all`` over a list's items, and ``get_<type>`` following a handle; a
+    missing field matches nothing; strings compare ignoring case, and ``~``
+    on a list asks whether the value is one of its items.
     """
-    for clause in query.split(" AND "):
-        parts = clause.strip().split(None, 2)
-        if len(parts) != 3:
-            return False
-        path, op, raw = parts
-        value: Any = raw.strip('"')
-        try:
-            value = int(value)
-        except ValueError:
-            pass
-        current: Any = obj
-        for segment in path.split("."):
-            if segment == "length":
-                current = len(current or [])
-            elif isinstance(current, dict):
-                current = current.get(segment)
-            else:
-                current = None
-        if current is None:
-            current = "" if isinstance(value, str) else 0
-        if op == "=":
-            ok = current == value
-        elif op == ">":
-            ok = current > value
-        elif op == ">=":
-            ok = current >= value
-        elif op == "<":
-            ok = current < value
-        elif op == "<=":
-            ok = current <= value
-        elif op == "~":
-            ok = str(value) in str(current)
+    return any(
+        all(_gql_single(obj, clause, resolve) for clause in _gql_split(branch, "and"))
+        for branch in _gql_split(query, "or")
+    )
+
+
+def _gql_single(obj: Any, clause: str, resolve) -> bool:
+    found = _GQL_SINGLE.match(clause)
+    if not found:
+        raise ValueError(f"the fake cannot parse {clause!r}")
+    path = re.findall(r"[A-Za-z_]\w*|\d+", found.group("lhs"))
+    return _gql_path(obj, path, found.group("op") or "", found.group("rhs") or "", resolve)
+
+
+def _gql_path(obj: Any, path: list[str], op: str, rhs: str, resolve) -> bool:
+    result: Any = obj
+    for i, part in enumerate(path):
+        if part == "length":
+            result = len(result)
+        elif part in ("any", "all"):
+            rest = path[i + 1 :]
+            results = [
+                _gql_path(item, rest, op, rhs, resolve) if rest else _gql_values(item, op, rhs)
+                for item in result or []
+            ]
+            return any(results) if part == "any" else bool(results) and all(results)
+        elif part.startswith("get_"):
+            result = resolve(part[4:], result) if resolve and isinstance(result, str) else None
+        elif part.isdigit():
+            try:
+                result = result[int(part)]
+            except (IndexError, KeyError, TypeError):
+                return False
+        elif isinstance(result, dict):
+            result = result.get(part)
         else:
-            ok = False
-        if not ok:
             return False
-    return True
+        if result is None:
+            return False
+    return _gql_values(result, op, rhs)
+
+
+def _gql_values(result: Any, op: str, rhs: str) -> bool:
+    if not op:
+        return bool(result)
+    value: Any = int(rhs) if rhs.isdigit() else rhs.strip("\"'")
+    if op in ("=", "!="):
+        same = (
+            result.casefold() == str(value).casefold()
+            if isinstance(result, str)
+            else result == value
+        )
+        return same if op == "=" else not same
+    if op in ("~", "!~"):
+        try:
+            held = (
+                str(value).casefold() in result.casefold()
+                if isinstance(result, str)
+                else value in result
+            )
+        except TypeError:
+            return False
+        return held if op == "~" else not held
+    compare = {"<": operator.lt, ">": operator.gt, "<=": operator.le, ">=": operator.ge}[op]
+    try:
+        return bool(compare(result, value))
+    except TypeError:
+        return False
 
 
 def _parse_segments(text: str) -> list[dict]:
@@ -1761,6 +1823,7 @@ LOCAL_VALIDATION_ERRORS = frozenset(
         "unsupported_format",
         "unsupported_media_type",
         "invalid_identifier",
+        "gql_list_field",
     }
 )
 

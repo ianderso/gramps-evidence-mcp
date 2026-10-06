@@ -108,9 +108,32 @@ GrampsQL runs over raw object JSON, not the profile view.
     `backlinks`.
 - Booleans compare as integers. `private = 1` finds private records;
   `private = true` matches nothing.
+- **`~` on a list compares the list itself.** It asks whether the value *is*
+  one of the items (`"http" in urls`), never whether an item contains it, so
+  `urls ~ "http"` matched no person on a tree where 298 have a URL, and
+  `media_list !~ "x"` matched all 1,538 sources. A list of objects is
+  searched through its items with `.any.` (or `.all.`), and a handle is
+  followed to its object with `get_<type>`:
+  - `urls.any.path ~ "blm.gov"`, `attribute_list.any.value ~ "blm.gov"`;
+  - `note_list.any.get_note.text.string ~ "blm.gov"`;
+  - `alternate_names.any.surname_list.any.surname ~ "Ray"`.
+
+  On a list of handles `~` is a real test: `tag_list ~ "<handle>"` finds what
+  carries that tag. `query_objects` refuses every other comparison of a whole
+  list, and names the form that works.
+- **Every condition reads the whole collection, in Python, on the server.**
+  On 3.21.1 against 6,092 citations, on 2026-10-05: one condition on a list
+  13 s, two joined by OR 29 s, the same two following each note 38 s.
+  `query_objects` allows a GrampsQL read 120 s (`GQL_TIMEOUT`); other
+  requests keep `request_timeout`, 30 s by default.
 
 Queryable fields verified: `gramps_id`, `page`, `confidence`, `description`,
-`desc`, `title`, `checksum`, `private`, `change`, and `<list>.length`.
+`desc`, `title`, `checksum`, `private`, `change`, `<list>.length`, and
+`<list>.any.<field>` with `get_<type>`.
+
+The list semantics are gramps-ql's (`_match_values` in `gramps_ql/gql.py`,
+0.5.0, read on 2026-10-05) and were seen on a live 3.21.1 tree the same day;
+the live suite checks them.
 
 ## 8. A hand-rolled merge must move every list
 

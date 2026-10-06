@@ -722,3 +722,39 @@ async def test_26_every_vocabulary_the_tools_match_is_served(live):
     assert types["default"]["source_attribute_types"] == ["Unknown"]
     assert "Web Home" in types["default"]["url_types"]
     assert "Web Home Page" not in types["default"]["url_types"]
+
+
+# --------------------------------------------------------------------------- #
+# 7: GrampsQL over a list
+# --------------------------------------------------------------------------- #
+async def test_7_tilde_on_a_list_compares_the_list_and_any_reaches_the_items(live):
+    client = live.client
+    note = await client.create_object(
+        "note", {"_class": "Note", "text": {"string": "Patent at glorecords.blm.gov"}}
+    )
+    linked = await client.create_object(
+        "source",
+        {
+            "_class": "Source",
+            "title": "Linked",
+            "note_list": [note["handle"]],
+            "attribute_list": [
+                {"_class": "SrcAttribute", "type": "URL", "value": "https://blm.gov/x"}
+            ],
+        },
+    )
+    await client.create_object("source", {"_class": "Source", "title": "Plain"})
+
+    async def ids(gql: str) -> list[str]:
+        rows = await client.list_objects("source", gql=gql, keys="handle")
+        return [r["handle"] for r in rows]
+
+    assert await ids('attribute_list ~ "blm.gov"') == []
+    assert await ids('note_list ~ "blm.gov"') == []
+    assert len(await ids('media_list !~ "x"')) == 2, "negated, it matches everything"
+    assert await ids('attribute_list.any.value ~ "BLM.GOV"') == [linked["handle"]]
+    assert await ids('note_list.any.get_note.text.string ~ "glorecords"') == [linked["handle"]]
+    assert await ids(f'note_list ~ "{note["handle"]}"') == [linked["handle"]]
+    assert await ids(
+        'attribute_list.any.value ~ "nowhere" OR note_list.any.get_note.text.string ~ "blm"'
+    ) == [linked["handle"]]

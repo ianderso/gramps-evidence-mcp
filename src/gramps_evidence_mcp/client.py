@@ -48,9 +48,12 @@ GQL_NOTES = """GrampsQL runs over the raw object JSON. Use a single '=' for \
 equality (not '=='), '~' for substring, and '<field>.length' for list sizes; \
 combine with AND/OR. A field the object does not have matches nothing rather \
 than raising, so a zero count can mean a misspelt field. Event 'type' is such a \
-field -- use query_records, which reaches it through type.value. Sources have \
-no citation_list; find uncited sources via backlinks. Booleans compare as \
-integers: 'private = 1', not 'private = true'."""
+field -- use query_records, which reaches it through type.value. A list field \
+is searched through its items, 'urls.any.path ~ "x"', and a handle followed \
+with get_<type>, 'note_list.any.get_note.text.string ~ "x"'; '~' on the list \
+itself asks whether the value IS an item. Sources have no citation_list; find \
+uncited sources via backlinks. Booleans compare as integers: 'private = 1', \
+not 'private = true'."""
 
 #: Seconds allowed for ``GET /api/facts/``, whatever the configured default.
 #: The server computes every statistic on each call, and excluding living
@@ -58,6 +61,15 @@ integers: 'private = 1', not 'private = true'."""
 #: gramps-webapi 3.21.1 against a tree of about 900 people: 21 s as is,
 #: 42 s with living people excluded -- both past the 30 s default.
 FACTS_TIMEOUT = 180.0
+
+#: Seconds allowed for a list filtered with GrampsQL, whatever the configured
+#: default. The server reads every object of the collection and tests each one
+#: in Python, the more slowly the more conditions there are. Measured on
+#: gramps-webapi 3.21.1 against a tree of 6,092 citations on 2026-10-05: one
+#: condition on a list field 13 s, two joined by OR 29 s, and the same two
+#: following each note's handle 38 s -- the last two at or past the 30 s
+#: default, which failed as a timeout with no message (TOOL-REQUESTS #27).
+GQL_TIMEOUT = 120.0
 
 # gramps-webapi object type -> Gramps _class name (used to pick the right change
 # record out of a write response that may cascade across several objects).
@@ -421,8 +433,8 @@ class GrampsWebClient:
         rules : dict, optional
             Gramps filter-rule object, JSON-encoded into the query.
         gql : str, optional
-            A GrampsQL expression. (gramps-webapi 3.23 removed ``oql``, which
-            no tool used.)
+            A GrampsQL expression, allowed :data:`GQL_TIMEOUT` seconds.
+            (gramps-webapi 3.23 removed ``oql``, which no tool used.)
         handles : list of str or str, optional
             Explicit handles to fetch.
         gramps_id, dates, filter_name, sort, locale : str, optional
@@ -465,7 +477,12 @@ class GrampsWebClient:
         for k, flag in (("backlinks", backlinks), ("strip", strip), ("filemissing", filemissing)):
             if flag:
                 params[k] = "1"
-        resp = await self._request("GET", self._collection(object_type), params=params or None)
+        resp = await self._request(
+            "GET",
+            self._collection(object_type),
+            params=params or None,
+            timeout=max(self._timeout, GQL_TIMEOUT) if gql else None,
+        )
         data = resp.json()
         return data if isinstance(data, list) else [data]
 
@@ -1444,14 +1461,24 @@ class GrampsWebClient:
 
 
 def _detail(resp: httpx.Response) -> str:
-    """Pull a human-readable explanation out of an error response body."""
+    """Pull a human-readable explanation out of an error response body.
+
+    gramps-webapi answers most errors ``{"error": {"code": 422, "message":
+    "..."}}``; the message inside is what a caller can act on. A body with no
+    explanation at all says so, rather than leaving the caller an empty string.
+    """
     try:
         body = resp.json()
         if isinstance(body, dict):
-            return str(body.get("message") or body.get("error") or body)
-        return str(body)
+            inner = body.get("error")
+            if isinstance(inner, dict) and inner.get("message"):
+                return str(inner["message"])
+            text = str(body.get("message") or inner or body)
+        else:
+            text = str(body)
     except Exception:
-        return resp.text[:300]
+        text = resp.text[:300]
+    return text.strip() or f"HTTP {resp.status_code} with no explanation in the body."
 
 
 def _normalize_write_response(data: Any, expected_class: str | None = None) -> dict:
