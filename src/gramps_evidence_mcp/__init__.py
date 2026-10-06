@@ -5,4 +5,4 @@ database files, so the API server serializes concurrent access. See
 ``docs/ARCHITECTURE.md``.
 """
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"

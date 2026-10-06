@@ -8,6 +8,8 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-10-05
+
 ### Added
 
 - gramps-webapi 3.23.1 is tested on every CI run, beside 3.21.1 and 3.22.3.
@@ -341,7 +343,9 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.2.0...v2.0.0
+[1.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/ianderso/gramps-evidence-mcp/releases/tag/v1.0.0
