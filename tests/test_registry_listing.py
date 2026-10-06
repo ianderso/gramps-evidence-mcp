@@ -67,3 +67,8 @@ def test_the_server_reports_its_version_when_a_session_starts():
 
     options = mcp._lowlevel_server.create_initialization_options()
     assert options.server_version == __version__
+
+
+def test_the_description_fits_the_registry_limit():
+    """The MCP Registry refuses a description over 100 characters, after PyPI has the release."""
+    assert len(SERVER_JSON["description"]) <= 100
