@@ -8,6 +8,8 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-06
+
 ### Added
 
 - `set_family_parent`: set, replace or remove the father or mother of an
@@ -409,7 +411,8 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...v1.1.0
