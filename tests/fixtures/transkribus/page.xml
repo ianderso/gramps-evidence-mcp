@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<PcGts xmlns="http://schema.primaresearch.org/PAGE/gts/pagecontent/2013-07-15" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schema.primaresearch.org/PAGE/gts/pagecontent/2013-07-15 http://schema.primaresearch.org/PAGE/gts/pagecontent/2013-07-15/pagecontent.xsd">
+    <Metadata>
+        <Creator>Transkribus</Creator>
+        <Created>2026-10-06T10:00:00.000+02:00</Created>
+        <LastChange>2026-10-06T10:00:30.000+02:00</LastChange>
+    </Metadata>
+    <Page imageFilename="image.jpg" imageWidth="1200" imageHeight="1600">
+        <TextRegion id="region_1" custom="readingOrder {index:0;}">
+            <Coords points="40,60 1160,60 1160,420 40,420"/>
+            <TextLine id="line_1" custom="readingOrder {index:0;}">
+                <Coords points="48,70 1150,70 1150,170 48,170"/>
+                <Baseline points="52,150 1146,152"/>
+                <TextEquiv>
+                    <Unicode>Johann Georg Wendler Bauer</Unicode>
+                </TextEquiv>
+            </TextLine>
+            <TextLine id="line_2" custom="readingOrder {index:1;}">
+                <Coords points="48,190 1150,190 1150,300 48,300"/>
+                <Baseline points="52,280 1146,282"/>
+                <TextEquiv>
+                    <Unicode>zu Oberhausen geb. d. 3t. Mertz 1791</Unicode>
+                </TextEquiv>
+            </TextLine>
+        </TextRegion>
+        <TextRegion id="region_2" custom="readingOrder {index:1;}">
+            <Coords points="40,500 1160,500 1160,620 40,620"/>
+            <TextLine id="line_3" custom="readingOrder {index:0;}">
+                <Coords points="48,510 1150,510 1150,600 48,600"/>
+                <Baseline points="52,590 1146,590"/>
+                <TextEquiv>
+                    <Unicode>Pathe: Anna Maria Kölbl</Unicode>
+                </TextEquiv>
+            </TextLine>
+        </TextRegion>
+    </Page>
+</PcGts>

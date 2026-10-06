@@ -55,10 +55,10 @@ def test_server_json_declares_every_setting_the_server_reads():
     assert declared == read - _HTTP_ONLY
 
 
-def test_only_the_password_is_secret():
-    """A client masks a secret; the URL and user name are not."""
+def test_only_the_passwords_are_secret():
+    """A client masks a secret; the URLs and user names are not."""
     secret = {v["name"] for v in PACKAGE["environmentVariables"] if v.get("isSecret")}
-    assert secret == {"GRAMPS_MCP_PASSWORD"}
+    assert secret == {"GRAMPS_MCP_PASSWORD", "GRAMPS_MCP_TRANSKRIBUS_PASSWORD"}
 
 
 def test_the_server_reports_its_version_when_a_session_starts():

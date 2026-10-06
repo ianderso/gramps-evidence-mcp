@@ -10,6 +10,7 @@ GrampsWebClient + GrampsService orchestration end-to-end.
 from __future__ import annotations
 
 import copy
+import io
 import ipaddress
 import itertools
 import json
@@ -322,7 +323,27 @@ class FakeGramps:
         self.metadata: dict = {
             "gramps": {"version": "6.0.4"},
             "gramps_webapi": {"version": "3.21.1"},
+            # What 3.21.1 reports with Tesseract installed (seen 2026-10-06).
+            "server": {
+                "ocr": True,
+                "ocr_languages": ["dan", "deu", "eng", "fra", "lat", "nld", "nor", "swe"],
+                "task_queue": False,
+            },
         }
+        #: handle -> (bytes, Content-Type) of each media file uploaded.
+        self.files: dict[str, tuple[bytes, str]] = {}
+        #: What Tesseract reads off any image, and the query of each OCR request.
+        self.ocr_text = "OCRED TEXT"
+        self.ocr_requests: list[dict[str, str]] = []
+        #: When set, OCR answers 202 and a task, as a server with a task queue does.
+        self.ocr_queued = False
+        #: When set, OCR fails 501 with this message, as it does without Tesseract.
+        self.ocr_unavailable: str | None = None
+        #: Sizes each thumbnail was asked for, by media handle.
+        self.thumbnails: list[tuple[str, int]] = []
+        #: The respx router the fixtures serve the fake through; a test adds
+        #: routes to it to answer for another host (Transkribus, an archive).
+        self.router: Any = None
         #: The tree's custom type names, served by GET /api/types/ under
         #: "custom" beside the standard names recorded from a real server.
         #: Gramps adds a name when it stores an object carrying it and never
@@ -723,9 +744,21 @@ class FakeGramps:
             if len(parts) >= 3 and parts[1] == "merge" and method == "POST":
                 return self._merge(typ, handle, parts[2])
             if rest.endswith("/ocr") and method == "POST":
-                return httpx.Response(200, json="OCRED TEXT")
-            if rest.endswith("/file"):
-                return httpx.Response(200, json={"handle": handle})
+                return self._ocr(handle, request)
+            if rest.endswith("/file") and method == "PUT":
+                self.files[handle] = (
+                    request.content,
+                    request.headers.get("content-type", "application/octet-stream"),
+                )
+                return httpx.Response(200, json=[])
+            if rest.endswith("/file") and method == "GET":
+                if handle not in self.store["media"] or handle not in self.files:
+                    return httpx.Response(404, json={"message": "not found"})
+                content, mime = self.files[handle]
+                return httpx.Response(200, content=content, headers={"content-type": mime})
+            m_thumb = re.match(r"^[^/]+/thumbnail/(\d+)$", rest)
+            if m_thumb and method == "GET":
+                return self._thumbnail(handle, int(m_thumb.group(1)))
             if method == "GET":
                 return self._get(typ, handle, request.url.params)
             if method == "PUT":
@@ -745,6 +778,69 @@ class FakeGramps:
                     )
                 return httpx.Response(200, json=[])
         return httpx.Response(405, json={"message": "method not allowed"})
+
+    def _ocr(self, handle: str, request: httpx.Request) -> httpx.Response:
+        """POST /api/media/{handle}/ocr, as 3.21.1 to 3.23.1 answer it.
+
+        ``lang`` is required (422 without it); a missing media object is 404;
+        without Tesseract, 501. A file that is not an image is answered
+        ``{}``. ``string`` text comes back as the task's own return value,
+        which Flask serves as ``text/html``; with a task queue, 202 and a task
+        whose ``result_object`` is the text (``api/resources/ocr.py``,
+        ``api/tasks.py``; the queued form seen on a live 3.21.1, 2026-10-06).
+        """
+        params = dict(request.url.params)
+        self.ocr_requests.append(params)
+        if not params.get("lang"):
+            return httpx.Response(422, json={"code": 422, "status": "Unprocessable Entity"})
+        media = self.store["media"].get(handle)
+        if media is None:
+            return httpx.Response(404, json={"message": "not found"})
+        if self.ocr_unavailable:
+            return httpx.Response(
+                501, json={"error": {"code": 501, "message": self.ocr_unavailable}}
+            )
+        result: Any = self.ocr_text
+        if not str(media.get("mime") or "").startswith("image"):
+            result = {}
+        if self.ocr_queued:
+            task_id = f"ocr-{len(self.ocr_requests)}"
+            self.tasks[task_id] = {
+                "state": "SUCCESS",
+                "result_object": result,
+                "result": json.dumps(result),
+                "info": json.dumps(result),
+                "task_id": task_id,
+                "name": "media_ocr",
+            }
+            return httpx.Response(
+                202, json={"task": {"href": f"/api/tasks/{task_id}", "id": task_id}}
+            )
+        if isinstance(result, str):
+            return httpx.Response(201, text=result, headers={"content-type": "text/html"})
+        return httpx.Response(201, json=result)
+
+    def _thumbnail(self, handle: str, size: int) -> httpx.Response:
+        """GET .../thumbnail/{size}: the file scaled to ``size`` on its long edge, as AVIF.
+
+        Every version from 3.21.1 to 3.23.1 answers AVIF (``send_thumbnail``
+        in ``api/file.py``); a PDF is rendered from its first page, which the
+        fake draws as a blank sheet.
+        """
+        from PIL import Image
+
+        self.thumbnails.append((handle, size))
+        if handle not in self.files:
+            return httpx.Response(404, json={"message": "not found"})
+        content, mime = self.files[handle]
+        if mime == "application/pdf":
+            img = Image.new("L", (850, 1100), 255)
+        else:
+            img = Image.open(io.BytesIO(content))
+        img.thumbnail((size, size))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="AVIF")
+        return httpx.Response(200, content=buf.getvalue(), headers={"content-type": "image/avif"})
 
     def _create(self, typ: str, request: httpx.Request) -> httpx.Response:
         if self.write_forbidden:
@@ -1882,12 +1978,15 @@ def fake() -> FakeGramps:
 
 
 @pytest.fixture
-async def service(fake: FakeGramps):
-    with respx.mock(base_url="http://testserver") as router:
+async def service(fake: FakeGramps, tmp_path):
+    # A test may add a route for another host that it means never to be
+    # called -- Transkribus when no credits are spent -- and asserts that itself.
+    with respx.mock(base_url="http://testserver", assert_all_called=False) as router:
         router.route().mock(side_effect=fake.handle)
+        fake.router = router  # so a test can answer for another host, too
         client = GrampsWebClient("http://testserver", "mcp", "pw")
         await client.login()
-        cfg = Config(api_url="http://testserver", username="mcp", password="pw")
+        cfg = Config(api_url="http://testserver", username="mcp", password="pw", cache_dir=tmp_path)
         yield GrampsService(client, cfg)
         await client.aclose()
 
@@ -1904,8 +2003,11 @@ async def tools(fake: FakeGramps, tmp_path):
 
     from gramps_evidence_mcp import server
 
-    with respx.mock(base_url="http://testserver") as router:
+    # A test may add a route for another host that it means never to be
+    # called -- Transkribus when no credits are spent -- and asserts that itself.
+    with respx.mock(base_url="http://testserver", assert_all_called=False) as router:
         router.route().mock(side_effect=fake.handle)
+        fake.router = router  # so a test can answer for another host, too
         client = GrampsWebClient("http://testserver", "mcp", "pw")
         await client.login()
         cfg = Config(
@@ -1976,6 +2078,8 @@ LOCAL_VALIDATION_ERRORS = frozenset(
         "unsupported_media_type",
         "invalid_identifier",
         "gql_list_field",
+        "bad_region",
+        "bad_page",
     }
 )
 

@@ -354,8 +354,15 @@
     "to_family"
   ],
   "ocr_media": [
+    "doc_type",
+    "engine",
     "lang",
-    "media"
+    "media",
+    "page",
+    "region",
+    "second_witness",
+    "spend_credits",
+    "store"
   ],
   "parse_dna_segments": [
     "data"

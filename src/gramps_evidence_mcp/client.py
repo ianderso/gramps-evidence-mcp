@@ -73,6 +73,11 @@ FACTS_TIMEOUT = 180.0
 #: default, which failed as a timeout with no message (TOOL-REQUESTS #27).
 GQL_TIMEOUT = 120.0
 
+#: Seconds between polls of a background task the client waits on itself:
+#: Tesseract's reading of one page, which a server with a task queue answers
+#: with a task rather than the text.
+TASK_POLL_SECONDS = 1.0
+
 # gramps-webapi object type -> Gramps _class name (used to pick the right change
 # record out of a write response that may cascade across several objects).
 _CLASS_NAMES = {
@@ -963,34 +968,120 @@ class GrampsWebClient:
         return resp.content
 
     # ----- media extras -----
+    async def media_file(self, handle: str) -> tuple[bytes, str]:
+        """Download a media object's file.
+
+        Parameters
+        ----------
+        handle : str
+            Handle of the Media object.
+
+        Returns
+        -------
+        tuple of (bytes, str)
+            The file and the Content-Type it was served with.
+        """
+        resp = await self._request("GET", f"/api/media/{_seg(handle)}/file", timeout=120.0)
+        return resp.content, resp.headers.get("content-type", "").split(";")[0].strip()
+
+    async def media_thumbnail(self, handle: str, size: int) -> bytes:
+        """A media file rendered at ``size`` pixels on its long edge, as AVIF.
+
+        The server renders a PDF's first page and a video's first frame;
+        every version from 3.21.1 to 3.23.1 answers AVIF (``send_thumbnail``
+        in ``api/file.py``).
+        """
+        resp = await self._request(
+            "GET", f"/api/media/{_seg(handle)}/thumbnail/{int(size)}", timeout=120.0
+        )
+        return resp.content
+
     async def ocr_media(
-        self, handle: str, *, lang: str = "eng", output_format: str = "string"
+        self,
+        handle: str,
+        *,
+        lang: str = "eng",
+        output_format: str = "string",
+        wait: float = 120.0,
     ) -> Any:
-        """Run OCR on a media object's file, server-side.
+        """Run Gramps Web's Tesseract OCR on a media object's file.
+
+        The endpoint is a POST, but it opens the tree read-only
+        (``media_ocr`` in ``api/tasks.py``). A server with a task queue
+        answers 202 and a task to poll; one without answers 201 with the
+        text. Both are handled here, so the caller gets the text either way.
+        ``string`` text is served as ``text/html``: it is read as text, never
+        parsed as JSON, so a page reading "1850" stays a string.
 
         Parameters
         ----------
         handle : str
             Handle of the Media object.
         lang : str, optional
-            Tesseract language code.
+            Tesseract language code, or several joined by ``+``.
         output_format : str, optional
-            Tesseract output format.
+            ``string``, ``data``, ``boxes`` or ``hocr``.
+        wait : float, optional
+            Seconds to poll a queued task before giving up.
 
         Returns
         -------
         Any
-            Parsed JSON if the server sends it, else the raw text.
+            The text for ``string`` and ``hocr``, a dict for the others. The
+            server answers ``{}`` for a file that is not an image.
+
+        Raises
+        ------
+        GrampsApiError
+            On an error status, or a task that failed or did not finish.
         """
+        path = f"/api/media/{_seg(handle)}/ocr"
         resp = await self._request(
-            "POST",
-            f"/api/media/{_seg(handle)}/ocr",
-            params={"lang": lang, "format": output_format},
+            "POST", path, params={"lang": lang, "format": output_format}, timeout=wait
         )
-        try:
+        if resp.status_code == 202:
+            task_id = ((resp.json() or {}).get("task") or {}).get("id")
+            if not task_id:
+                raise GrampsApiError(
+                    202, "OCR was queued with no task id", method="POST", path=path
+                )
+            return await self._task_result(str(task_id), wait=wait, path=path)
+        if "json" in resp.headers.get("content-type", ""):
             return resp.json()
-        except Exception:
-            return resp.text
+        return resp.text
+
+    async def _task_result(self, task_id: str, *, wait: float, path: str) -> Any:
+        """Poll a background task to its end, and return what it produced."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while True:
+            status = await self.task(task_id)
+            state = str(status.get("state") or "").upper()
+            if state == "SUCCESS":
+                result = status.get("result_object")
+                if result is None and isinstance(status.get("result"), str):
+                    try:
+                        result = json.loads(status["result"])
+                    except ValueError:
+                        result = status["result"]
+                return result
+            if state in ("FAILURE", "REVOKED"):
+                raise GrampsApiError(
+                    500,
+                    f"The server's OCR task {task_id} ended {state}: "
+                    f"{status.get('info') or status.get('result') or 'no detail'}",
+                    method="POST",
+                    path=path,
+                )
+            if loop.time() >= deadline:
+                raise GrampsApiError(
+                    504,
+                    f"The server's OCR task {task_id} had not finished after {wait:.0f} s; "
+                    f"get_job('{task_id}') reports it.",
+                    method="POST",
+                    path=path,
+                )
+            await asyncio.sleep(TASK_POLL_SECONDS)
 
     # ----- reports -----
     async def reports(self, report_id: str | None = None) -> Any:

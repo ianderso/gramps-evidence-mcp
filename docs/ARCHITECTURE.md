@@ -16,11 +16,14 @@ mapping.py    Gramps object JSON <-> the dict shapes tools return.
 models.py     Pydantic input models shared by the tool signatures.
 privacy.py    Living-person assessment and redaction.
 gedcom_ref.py Read-only reference layer over legacy GEDCOM files.
+ocr.py        ocr_media's routing table, image and PDF handling, the Library
+              of Congress and Internet Archive lookups, and Transkribus.
 config.py     Environment variables and TOML.
 ```
 
 Tools call the service; the service calls the client. No layer reaches past the
-one below it.
+one below it. `ocr.py` sits beside the client: the service calls it for what
+is not Gramps Web.
 
 ## A REST client, never a database client
 
@@ -129,9 +132,29 @@ sensitive.
 
 ## Scope
 
-This server talks to Gramps Web and to local GEDCOM files. Nothing else. Tools
-for external record repositories belong in their own MCP servers, which a client
-can run alongside this one.
+This server talks to Gramps Web and to local GEDCOM files. Tools for external
+record repositories belong in their own MCP servers, which a client can run
+alongside this one.
+
+`ocr_media` is the one exception, because reading a document the tree already
+holds is this server's business, and the right reader is not always Gramps
+Web's. It reaches three services, each only for that document:
+
+- **The Library of Congress and the Internet Archive**, keyless and read-only,
+  for OCR text they already hold for a page a URL in the media's sources
+  names. Only their own hosts are fetched; a redirect elsewhere is refused.
+- **Transkribus**, only when an account is configured, for handwriting
+  recognition. A page costs credits, so it is sent only with the caller's
+  per-call `spend_credits` or within a monthly page budget, and a private
+  media object is never sent. The client is built to the published
+  Metagrapho v1 API and READ-COOP's OpenID Connect login, and has not yet
+  been run against the live service.
+
+For an English hand, the reader is the calling model itself: the server holds
+no model key, so it returns the image, scaled, with an instruction for a
+diplomatic transcription. That is also why German handwriting goes to
+Transkribus only: published benchmarks put vision models at about half the
+characters wrong on historical German.
 
 ### API coverage
 
@@ -166,8 +189,10 @@ Everything genealogically useful is covered. What is left out, and why:
 - `/api/places/coordinates/` (3.23) — every place's name and coordinates, a
   map's feed; the place tools read the same coordinates per place.
 - `/api/chat/` — Gramps Web's own assistant endpoint.
-- `/api/media/{handle}/thumbnail|cropped|tile`, `/api/anniversaries.ics` —
-  binary and calendar formats that a stdio tool surface cannot usefully carry.
+- `/api/media/{handle}/cropped|tile`, `/api/anniversaries.ics` — binary and
+  calendar formats with no tool to carry them. `ocr_media` reads
+  `/api/media/{handle}/file`, and `thumbnail` to have a page Pillow cannot open
+  rendered, and returns the image itself, cropped and scaled here.
 
 **Excluded — not planned.** Face detection and the importers, with or without
 their dry run. [ROADMAP.md](ROADMAP.md#not-planned) says why.

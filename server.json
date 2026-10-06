@@ -44,6 +44,25 @@
           "name": "GRAMPS_MCP_EXPOSE_PRIVATE",
           "description": "Set true to turn off living-person and private-record filtering of bulk output.",
           "default": "false"
+        },
+        {
+          "name": "GRAMPS_MCP_TRANSKRIBUS_USERNAME",
+          "description": "Optional. A Transkribus account (Scholar plan or above), for ocr_media's handwriting routes. Every page costs credits."
+        },
+        {
+          "name": "GRAMPS_MCP_TRANSKRIBUS_PASSWORD",
+          "description": "That Transkribus account's password.",
+          "isSecret": true
+        },
+        {
+          "name": "GRAMPS_MCP_TRANSKRIBUS_PAGE_BUDGET",
+          "description": "Pages a calendar month ocr_media may send to Transkribus without the caller's per-call spend_credits. 0 asks every time.",
+          "default": "0"
+        },
+        {
+          "name": "GRAMPS_MCP_TRANSKRIBUS_API_URL",
+          "description": "Transkribus' processing API.",
+          "default": "https://transkribus.eu/processing/v1"
         }
       ]
     }

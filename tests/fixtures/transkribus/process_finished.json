@@ -1,0 +1,43 @@
+{
+  "config": {"textRecognition": {"htrId": 36508}},
+  "processId": 47725,
+  "status": "FINISHED",
+  "content": {
+    "text": "Johann Georg Wendler Bauer\nzu Oberhausen geb. d. 3t. Mertz 1791\n\nPathe: Anna Maria Kölbl",
+    "regions": [
+      {
+        "id": "region_1",
+        "coords": {"points": "40,60 1160,60 1160,420 40,420"},
+        "lines": [
+          {
+            "id": "line_1",
+            "coords": {"points": "48,70 1150,70 1150,170 48,170"},
+            "baseline": {"points": "52,150 1146,152"},
+            "text": "Johann Georg Wendler Bauer",
+            "words": [
+              {"id": "line_1_w1", "coords": {"points": "52,80 260,80 260,160 52,160"}, "text": "Johann"}
+            ]
+          },
+          {
+            "id": "line_2",
+            "coords": {"points": "48,190 1150,190 1150,300 48,300"},
+            "baseline": {"points": "52,280 1146,282"},
+            "text": "zu Oberhausen geb. d. 3t. Mertz 1791"
+          }
+        ]
+      },
+      {
+        "id": "region_2",
+        "coords": {"points": "40,500 1160,500 1160,620 40,620"},
+        "lines": [
+          {
+            "id": "line_3",
+            "coords": {"points": "48,510 1150,510 1150,600 48,600"},
+            "baseline": {"points": "52,590 1146,590"},
+            "text": "Pathe: Anna Maria Kölbl"
+          }
+        ]
+      }
+    ]
+  }
+}

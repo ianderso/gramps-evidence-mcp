@@ -56,7 +56,7 @@ async def _seed(tools) -> dict:
     }
 
 
-async def test_no_editing_tool_ever_sends_a_partial_object(tools):
+async def test_no_editing_tool_ever_sends_a_partial_object(tools, tmp_path):
     """Drive every edit path, then assert nothing dropped a field.
 
     This is the structural guard. A new tool that builds its payload from a
@@ -224,6 +224,16 @@ async def test_no_editing_tool_ever_sends_a_partial_object(tools):
         ),
     ]
     assert all(e.get("changed") is True for e in later), later
+
+    # Added with the ocr_media router: a stored reading's note is attached to
+    # the media object.
+    from PIL import Image
+
+    scan = tmp_path / "register.png"
+    Image.new("L", (400, 500), 255).save(scan)
+    media = await tools("add_media", file_path=str(scan), description="Register page")
+    read = await tools("ocr_media", media=media["gramps_id"], store=True)
+    assert read["stored"]["stored"] is True, read
 
     assert fake.partial_writes == [], (
         f"a tool sent a partial object; every write must go through _mutate: {fake.partial_writes}"

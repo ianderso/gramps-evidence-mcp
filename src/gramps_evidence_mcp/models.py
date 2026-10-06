@@ -52,6 +52,25 @@ class TaskPriority(str, Enum):
     low = "low"  # "9"
 
 
+class DocType(str, Enum):
+    """What the document is, which decides how ocr_media reads it."""
+
+    print = "print"  # typeset or typed
+    hand = "hand"  # one handwritten document
+    table = "table"  # a census page or other ruled form
+    volume = "volume"  # a page of a whole register, deed book or will book
+
+
+class OcrEngine(str, Enum):
+    """Which reader ocr_media uses; auto routes by doc_type and lang."""
+
+    auto = "auto"
+    existing = "existing"  # text the media or its sources already carry
+    tesseract = "tesseract"  # Gramps Web's own OCR
+    vision = "vision"  # the image, for the calling model to read
+    transkribus = "transkribus"  # handwriting recognition, paid by the page
+
+
 class _StrictInput(BaseModel):
     """Base for tool inputs: a key the model does not define is refused.
 

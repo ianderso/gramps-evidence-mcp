@@ -42,6 +42,7 @@ Gramps project.
 - [The evidence model & transactions](#the-evidence-model--transactions)
 - [Privacy](#privacy)
 - [Tool reference](#tool-reference)
+- [Reading documents: `ocr_media`](#reading-documents-ocr_media)
 - [Reference layer (legacy GEDCOMs)](#reference-layer-legacy-gedcoms)
 - [Worked example](#worked-example-a-person-with-a-cited-birth)
 - [Development](#development)
@@ -145,6 +146,9 @@ variables win over the file.
 | `GRAMPS_MCP_EXPOSE_PRIVATE` | Override the TOML `expose_private` flag |
 | `GRAMPS_MCP_TRANSPORT` | `stdio` (default) or `http` — see [Remote access](#remote-access-claude-web--mobile) |
 | `GRAMPS_MCP_HOST`, `GRAMPS_MCP_PORT` | Where `http` listens (default `127.0.0.1:8090`) |
+| `GRAMPS_MCP_TRANSKRIBUS_USERNAME`, `GRAMPS_MCP_TRANSKRIBUS_PASSWORD` | Optional. A Transkribus account (Scholar plan or above), for `ocr_media`'s handwriting routes. Both or neither. See [Reading documents](#reading-documents-ocr_media) |
+| `GRAMPS_MCP_TRANSKRIBUS_PAGE_BUDGET` | Pages a calendar month `ocr_media` may send to Transkribus without the caller's per-call `spend_credits`. Default `0`: every page asks |
+| `GRAMPS_MCP_TRANSKRIBUS_API_URL` | Transkribus' processing API (default `https://transkribus.eu/processing/v1`, Metagrapho v1) |
 
 ### TOML file (see [`gramps_mcp.example.toml`](gramps_mcp.example.toml))
 
@@ -403,6 +407,10 @@ Each use is logged with the tool's name, never the records.
   such a task private.
 - Timeline entries are judged by their person, not by the event's own private
   flag, which the timeline endpoint does not report.
+- `ocr_media` reads the media object you name, as a lookup by id does, private
+  or not. It never sends a private one to Transkribus, a third party; a
+  public image of a living person's record would go, so mark such a record
+  private.
 - A stub still says that a record matched. A query for a name and a birth year
   that returns a stub confirms that the id is a person fitting both. The filter
   prevents accidental disclosure, not a determined search.
@@ -425,7 +433,9 @@ before PUTting it back — edits through `service._mutate()` — see
 
 **Every tool declares MCP annotations** saying whether it only reads, adds, or
 changes and removes, so a client can approve reads automatically and ask before
-the rest. 46 tools only read.
+the rest. 45 tools only read. `ocr_media` reads, but is annotated as neither
+read-only nor closed-world: it can fetch from the Library of Congress and the
+Internet Archive, spend Transkribus credits, and store a transcript note.
 
 **Unknown parameters are refused.** A misspelt or invented argument is an error
 that lists the parameters the tool does take. It is not silently dropped, which
@@ -538,7 +548,7 @@ unfiltered listing of the first 200 objects.
 | `create_filter` | Save a reusable selection built from those rules. |
 | `delete_filter` | Delete a saved filter. Touches the definition only. |
 | `verify_tree` | Gramps' own genealogical plausibility checks — a mother at nine, a 120-year marriage, an unparseable date. A different audit from the citation sweeps. |
-| `ocr_media` | OCR a document image server-side (tesseract, 43 languages). **A finding aid, not evidence** — read the image before citing it. |
+| `ocr_media` | Read a document image with the engine that suits it: existing OCR text or Tesseract for print, the image itself for an English hand, Transkribus for German and Norwegian handwriting, FamilySearch's index for census tables. **A finding aid, not evidence** — read the image before citing it. See [Reading documents](#reading-documents-ocr_media). |
 
 **Research tasks** — Gramps Web's own task list
 
@@ -610,6 +620,62 @@ citation    note_list.any.get_note.text.string ~ "x"     a citation whose note m
 
 Every tool has an LLM-facing docstring explaining when to use it, parameter
 semantics, and good citation practice.
+
+---
+
+## Reading documents: `ocr_media`
+
+Gramps Web's own OCR is Tesseract, which reads print. The documents a family
+history turns on are handwritten — wills, deeds, letters, German church books
+in Kurrent, Norwegian parish registers — and which reader to trust depends on
+the hand and the language. `ocr_media` routes by what the caller says the
+document is (`doc_type`) and its language (`lang`):
+
+| Document | Read by | Why |
+| --- | --- | --- |
+| `print` | Text the media already carries — a Transcript note, a PDF's text layer — or the Library of Congress's or the Internet Archive's OCR for a page a URL in its sources names; otherwise Tesseract, through Gramps Web | Existing text costs nothing; Tesseract reads print well |
+| `hand`, English | The image, returned as MCP image content with a *diplomatic transcription* instruction for the calling model: spelling as written, line breaks and abbreviations kept, `[?]` where unsure. `second_witness` adds Transkribus, and the result asks for every name and number where the two readings differ | Vision models read 18th- and 19th-century English hands at 5.7–7 % character error, better than dedicated engines (Humphries et al.) |
+| `hand`, German | Transkribus only (its German Kurrent model). Without Transkribus, refused — never a vision read, even when asked, and not for a German table or volume either | Vision models measure **48.8 %** character error on historical German (METATR, May 2026, READ-2016) |
+| `hand`, Norwegian | Transkribus (NorHand 1820–1940), with the image to check it; without Transkribus, the image and a warning of its error rate | Vision models measure about 10 % on Norwegian (METATR, NorHand) |
+| `hand`, other languages | Transkribus' general model (Text Titan II), with the image; without it, the image and a warning | No benchmark known for a vision read |
+| `table` | Not read: FamilySearch's index (`get_records_on_image` in familysearch-mcp) | An engine reads across a row and loses which cell belongs to which person |
+| `volume` | FamilySearch Full-Text Search first, then Transkribus page by page | Searching a volume beats reading it |
+
+`engine` asks for one reader outright: `existing`, `tesseract`, `vision` (refused
+for German handwriting) or `transkribus`. A returned image is scaled to what a
+current Claude model reads without scaling it again (2576 pixels on the long
+edge, 3.75 megapixels); `region=[x1, y1, x2, y2]`, in percent, returns part of
+the page at full detail. A PDF is read a page at a time (`page`): its text
+layer, and the scan embedded in the page; a page with no scan is rendered by
+Gramps Web, which renders only the first.
+
+Every result carries its provenance — `{engine, model, date}` — and the same
+caveat: **the transcript is never the evidence; the citation stays on the
+image.** `store=true` keeps a machine reading as a Transcript note on the media
+object, headed with its engine, model and date, and Transkribus' PAGE XML in a
+second, preformatted note, since Transkribus deletes it a day after the job. A
+vision reading is the calling model's to keep, with `add_note`. A later call
+for print finds a stored reading and returns it rather than reading again.
+
+**Transkribus is optional, and costs money.** API jobs are charged half the
+app's rate — about 0.5 credits, roughly €0.12, a page — so a page is sent only
+when the call passes `spend_credits=true` or this month's
+`GRAMPS_MCP_TRANSKRIBUS_PAGE_BUDGET` has room. Each result says what it spent
+and how many pages the month has used; the count is kept in
+`transkribus-usage.json` in the cache directory; a page is counted before it is
+sent, and not sent if it cannot be counted. A job for the same file, page and
+model within a day is fetched again, not paid for again; a failed one is
+dropped, so the next call can try afresh. A private media object is never
+sent, nor a page in a language no model here covers. Images go to READ-COOP in Austria; its documentation says
+an image is used for its job only and not stored, and its terms let it use
+submitted material to improve its products.
+
+**The Transkribus path is built to the published API and has not yet been
+exercised live.** It follows the Metagrapho v1 OpenAPI document and READ-COOP's
+documented login, and is tested against fixtures of those shapes; no account
+was used to build it. The Library of Congress and Internet Archive paths, the
+image and PDF handling and Tesseract through a task queue were checked against
+a live tree and the live archives on 2026-10-06.
 
 ---
 
@@ -722,6 +788,9 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
   built for very large databases.
 - `get_facts` is computed by the server on every call and takes tens of seconds
   on a tree of under a thousand people; the call is allowed three minutes.
+- `ocr_media`'s Transkribus path has not been run against the live service.
+  Gramps Web renders only a PDF's first page, so a later page with no scan
+  embedded in it cannot be read as an image.
 
 ---
 
@@ -736,6 +805,7 @@ src/gramps_evidence_mcp/    the MCP server
   models.py                 Pydantic input models shared by the tools
   privacy.py                living-person assessment and redaction
   gedcom_ref.py             read-only reference layer over legacy GEDCOMs
+  ocr.py                    ocr_media's routing, images, archives and Transkribus
   config.py                 env vars + TOML
 tests/                      against an in-memory fake; no live server needed
   live/                     against a throwaway gramps-webapi (CI: 3.21.1, 3.22.3, 3.23.1)

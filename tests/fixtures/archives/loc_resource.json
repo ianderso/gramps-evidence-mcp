@@ -1,0 +1,16 @@
+{
+  "item": {
+    "title": "The Cedar Flat weekly courier (Cedar Flat, Ohio), May 1, 1908",
+    "date": "1908-05-01"
+  },
+  "page": [
+    {"mimetype": "image/jp2", "url": "https://tile.loc.gov/storage-services/service/ndnp/oh/batch_oh_invented_ver01/data/sn99999999/00000000000/1908050101/0001.jp2"},
+    {"mimetype": "text/xml", "url": "https://tile.loc.gov/storage-services/service/ndnp/oh/batch_oh_invented_ver01/data/sn99999999/00000000000/1908050101/0001.xml"}
+  ],
+  "resource": {
+    "fulltext_file": "https://tile.loc.gov/text-services/word-coordinates-service?segment=/service/ndnp/oh/batch_oh_invented_ver01/data/sn99999999/00000000000/1908050101/0001.xml&format=alto_xml&full_text=1",
+    "url": "https://www.loc.gov/resource/sn99999999/1908-05-01/ed-1/"
+  },
+  "fulltext_service": "https://tile.loc.gov/text-services/word-coordinates-service?segment=/service/ndnp/oh/batch_oh_invented_ver01/data/sn99999999/00000000000/1908050101/0001.xml&format=alto_xml&full_text=1",
+  "segment_id": "/service/ndnp/oh/batch_oh_invented_ver01/data/sn99999999/00000000000/1908050101/0001.xml"
+}

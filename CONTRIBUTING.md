@@ -76,6 +76,7 @@ echo "gramps-webapi==X.Y.Z" | uv pip compile --python-version 3.12 \
 | `src/gramps_evidence_mcp/client.py` | The `gramps-webapi` REST client: authentication, retries, the endpoints. |
 | `src/gramps_evidence_mcp/privacy.py` | The living-person rule and the redacted stub. |
 | `src/gramps_evidence_mcp/gedcom_ref.py` | The read-only reference layer over GEDCOM files. |
+| `src/gramps_evidence_mcp/ocr.py` | `ocr_media`'s routing table and what it reaches besides Gramps Web: page images and PDFs, the Library of Congress and Internet Archive lookups, and the Transkribus client. Its tests answer for those services through respx, from recorded shapes in `tests/fixtures/transkribus` and `tests/fixtures/archives`. |
 | `docs/PITFALLS.md` | Where `gramps-webapi` behaves in ways its schema does not say, with the version each was seen on. |
 | `docs/ROADMAP.md` | What is planned (nothing), how a new tool is judged, and what will not be built. |
 | `tests/conftest.py` | The fake `gramps-webapi`, and the argument builder the whole-surface sweeps use. |

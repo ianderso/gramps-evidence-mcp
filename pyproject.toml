@@ -34,6 +34,13 @@ dependencies = [
     # install of this release runs a PyJWT before 2.15.0, which let a deeply
     # nested token payload raise RecursionError instead of DecodeError.
     "pyjwt>=2.15.0",
+    # ocr_media scales, crops and converts page images. 12.3.0 is a security
+    # floor (heap writes in crop and paste, GHSA-6r8x-57c9-28j4) and decodes
+    # the AVIF that Gramps Web renders thumbnails as, which 11.2 cannot.
+    "pillow>=12.3.0",
+    # ocr_media reads a PDF's text layer and the scan on each page. 6.19.0 is
+    # a security floor: earlier releases can be made to run for minutes.
+    "pypdf>=6.19.0",
 ]
 
 [project.urls]

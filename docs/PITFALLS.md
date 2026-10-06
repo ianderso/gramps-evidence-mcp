@@ -17,9 +17,10 @@ needs an upload; the 500s on every write under prolonged concurrent writing,
 and the 500 a commit answers when SQLite's lock wait runs out (section 6),
 which need a second client holding the database; how a server on Gramps
 older than 5.2 stores "from X" (section 20), since no supported server runs
-one; and what 3.23 does with a stray key or a `year` an older server stored
+one; what 3.23 does with a stray key or a `year` an older server stored
 (sections 18 and 24), which needs a tree written by one version and served by
-another. Each says where it came from.
+another; and OCR answered as a task (section 31), which needs a task queue
+the throwaway server does not run. Each says where it came from.
 
 The sections were first found on gramps-webapi 3.20.1 and 3.21.1, in research
 sessions against a live tree, and explained from the gramps-webapi and Gramps
@@ -660,3 +661,35 @@ a record created long ago costs most of a minute. With `field`, each change
 found is read again with its states. 3.22's endpoint also returns a change no
 transaction recorded -- a write that failed at its commit, section 6 -- with
 no transaction id; the log does not.
+
+## 31. OCR answers with a task, reads image files only, and thumbnails are AVIF
+
+`POST /api/media/{handle}/ocr?lang=eng` runs Tesseract on the media file. It
+is a POST, but it writes nothing: the task opens the tree read-only
+(`media_ocr` in `api/tasks.py`). Four things about it are not in its schema:
+
+- **On a server with a task queue it answers 202 and a task**, `{"task":
+  {"href": ..., "id": ...}}`, and the text arrives as the task's
+  `result_object` from `GET /api/tasks/{id}` once its state is `SUCCESS`
+  (`result` holds the same, JSON-encoded). Without a queue it answers 201 with
+  the text. A client that reads the 202 body as the answer has no text, and
+  `ocr_media` did exactly that, handing back `{"task": ...}` as the text,
+  until a live 3.21.1 with a queue was seen to answer so on 2026-10-06.
+- **`string` text is served as `text/html`**, the task's bare return value.
+  Parsed as JSON, a page reading `1850` becomes the number 1850.
+- **Anything that is not an image file is answered `{}`**, before Tesseract is
+  looked for: a PDF, the commonest kind of scan, is never read (`get_ocr` in
+  `api/file.py`). `lang` is required (422 without); without Tesseract the
+  answer is 501. `GET /api/metadata/` says which in advance: `server.ocr` is
+  whether Tesseract runs and `server.ocr_languages` its models, `osd` left out.
+- **A thumbnail is AVIF, whatever the file** (`send_thumbnail`, 3.21.1 to
+  3.23.1). That is not a format a vision model accepts, so `ocr_media`
+  converts it, and asks for one only for what it cannot open itself -- a PDF
+  page with no scan embedded, a HEIC photograph. A PDF's thumbnail is its
+  first page; there is no way to ask for another.
+
+Read from the 3.21.1 and 3.23.1 source on 2026-10-06, and seen on a live 3.21.1
+tree the same day, read-only: a printed page's OCR came back as a task, a
+PDF's as `{}`, and both thumbnails as AVIF. The live suite checks the 422, the
+`{}`, the 501 or the text, and the AVIF; `ocr_media` polls the task, reads
+`string` as text, and does not send a PDF.

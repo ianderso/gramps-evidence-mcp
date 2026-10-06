@@ -10,6 +10,7 @@ Nothing here logs record *contents*: only handles, ids, and operation names.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import copy
@@ -23,7 +24,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import mapping
+import httpx
+
+from . import mapping, ocr
 from .client import (
     _CLASS_NAMES,
     ENDPOINTS,
@@ -39,10 +42,12 @@ from .models import (
     CitationEdit,
     CitationInput,
     Confidence,
+    DocType,
     EventInput,
     Gender,
     NameMatch,
     NameParts,
+    OcrEngine,
     RepositoryLink,
     TaskPriority,
     TaskStatus,
@@ -193,6 +198,8 @@ class GrampsService:
         self._place_cache: dict[str, str] = {}  # lower(name) -> place handle
         self._event_types: dict[str, int] | None = None  # label -> stored int
         self._open_spans: bool | None = None  # server stores "from X" / "to X"
+        self._transkribus_api: ocr.TranskribusClient | None = None  # made on first use
+        self._ledger_lock = asyncio.Lock()  # one Transkribus ledger change at a time
 
     @property
     def exposing_private(self) -> bool:
@@ -5452,22 +5459,807 @@ class GrampsService:
             f"Attach it with attach_media(media_ref=...).",
         }
 
-    async def ocr_media(self, ref: str, lang: str = "eng", output_format: str = "string") -> dict:
-        """Run OCR on a document image, server-side.
+    # ------------------------------------------------------------------ #
+    # ocr_media: the router
+    # ------------------------------------------------------------------ #
+    async def ocr_media(
+        self,
+        ref: str,
+        lang: str = "eng",
+        output_format: str = "string",
+        doc_type: DocType | str = DocType.print,
+        engine: OcrEngine | str = OcrEngine.auto,
+        second_witness: bool = False,
+        spend_credits: bool = False,
+        store: bool = False,
+        page: int = 1,
+        region: list[float] | None = None,
+    ) -> dict:
+        """Read the text of a document image with the engine that suits it.
 
-        Useful for locating a name or date in a long scan -- but OCR output is a
-        machine's guess at the text, not the record. It is a finding aid, not
-        evidence: read the image before citing what it says.
+        The route is chosen by what the document is and its language
+        (:mod:`gramps_evidence_mcp.ocr` gives the evidence for each):
+
+        ========================  ==============================================
+        print                     Text the media already carries -- a
+                                  Transcript note, a PDF's text layer -- or the
+                                  Library of Congress's or the Internet
+                                  Archive's OCR for a page its sources name;
+                                  otherwise Gramps Web's Tesseract.
+        hand, English             The image, returned for the calling model to
+                                  transcribe diplomatically; Transkribus as a
+                                  second witness when asked.
+        hand, German              Transkribus only. Never a vision read, even
+                                  when asked.
+        hand, Norwegian / other   Transkribus with the image for a cross-check;
+                                  without Transkribus, the image and a warning.
+        table                     Not read: FamilySearch's index.
+        volume                    FamilySearch Full-Text Search, then
+                                  Transkribus page by page.
+        ========================  ==============================================
+
+        ``engine`` other than ``auto`` asks for one reader outright.
+
+        A transcript is never the evidence; the citation stays on the image.
+        ``store`` keeps a machine reading as a Transcript note on the media
+        object -- with Transkribus' PAGE XML in a second note, since
+        Transkribus deletes it a day after the job -- through ``_mutate()``.
+
+        Parameters
+        ----------
+        ref : str
+            Handle or gramps_id of the media object.
+        lang : str, optional
+            Tesseract-style code: ``eng``, ``deu``, ``nor``; ``+`` joins several.
+        output_format : str, optional
+            Tesseract's output format, for the Tesseract route only.
+        doc_type, engine : str, optional
+            What the document is, and which reader to use.
+        second_witness : bool, optional
+            Also run Transkribus beside a vision read, to compare.
+        spend_credits : bool, optional
+            Consent to Transkribus credits for this call, past any budget.
+        store : bool, optional
+            Keep a machine reading on the media object as a Transcript note.
+        page : int, optional
+            Page of a PDF, from 1.
+        region : list of float, optional
+            ``[x1, y1, x2, y2]`` in percent: the part of the page to return.
+
+        Returns
+        -------
+        dict
+            The text and its ``provenance`` (``engine``, ``model``, ``date``),
+            or the image under ``_image_jpeg`` with an ``instruction``, or
+            guidance; ``error`` when no route can read the media.
         """
-        handle = await self._resolve_handle("media", ref)
-        text = await self.client.ocr_media(handle, lang=lang, output_format=output_format)
-        return {
-            "handle": handle,
-            "media": ref,
+        doc_type = DocType(doc_type)
+        engine = OcrEngine(engine)
+        if refusal := ocr.region_refusal(region):
+            return {"error": "bad_region", "message": refusal}
+        if page < 1:
+            return {"error": "bad_page", "message": "page counts from 1."}
+        media = await self._resolve("media", ref, backlinks=True)
+        doc = _OcrDocument(self, media, page)
+        base = ocr.base_language(lang)
+        route = doc_type.value
+        if doc_type is DocType.hand:
+            route = {"eng": "hand_english", "deu": "hand_german", "nor": "hand_norwegian"}.get(
+                base, "hand_other"
+            )
+        result: dict[str, Any] = {
+            "media": media.get("gramps_id"),
+            "handle": media["handle"],
+            "description": media.get("desc"),
+            "mime": media.get("mime"),
             "lang": lang,
-            "text": text,
-            "caveat": "OCR output is a transcription guess. Verify against the "
-            "image before citing anything from it.",
+            "doc_type": doc_type.value,
+            "route": route,
+        }
+        try:
+            if doc.is_pdf:
+                result["page"] = page
+                result["pages"] = (await doc.pdf()).pages
+            transcripts = await doc.transcripts()
+            if transcripts:
+                result["existing_transcripts"] = [
+                    {k: v for k, v in t.items() if k != "text"} for t in transcripts
+                ]
+            await self._ocr_route(
+                doc,
+                result,
+                transcripts,
+                engine,
+                route,
+                lang,
+                base,
+                output_format,
+                second_witness,
+                spend_credits,
+                store,
+                region,
+            )
+        except ocr.ImageError as exc:
+            return {
+                **result,
+                "error": "unreadable_media",
+                "message": f"Media {doc.gid} cannot be read: {exc}.",
+            }
+
+        if "error" in result:
+            return result
+        if store:
+            result["stored"] = await self._store_reading(doc, result)
+        result.pop("_page_xml", None)
+        result["caveat"] = (
+            "A machine reading is a finding aid, never the evidence: the citation stays "
+            "on the image. Read the image before citing anything any engine says."
+        )
+        logger.info(
+            "ocr_media %s route=%s engine=%s", media.get("gramps_id"), route, result.get("engine")
+        )
+        return result
+
+    async def _ocr_route(
+        self,
+        doc: _OcrDocument,
+        result: dict,
+        transcripts: list[dict],
+        engine: OcrEngine,
+        route: str,
+        lang: str,
+        base: str,
+        output_format: str,
+        second_witness: bool,
+        spend_credits: bool,
+        store: bool,
+        region: list[float] | None,
+    ) -> None:
+        """Send the media down the route ``ocr_media`` chose, filling ``result``."""
+        if engine is OcrEngine.existing:
+            await self._ocr_existing(doc, result, transcripts)
+        elif engine is OcrEngine.tesseract:
+            await self._ocr_tesseract(doc, result, lang, output_format, route)
+        elif engine is OcrEngine.vision:
+            if base == "deu" and route != "print":
+                result.update(_GERMAN_VISION_REFUSAL)
+                return
+            await self._ocr_vision(doc, result, region, base, second_witness, spend_credits)
+        elif engine is OcrEngine.transkribus:
+            await self._ocr_transkribus_only(doc, result, base, spend_credits, store)
+        elif route == "print":
+            if not await self._ocr_existing(doc, result, transcripts, quiet=True):
+                await self._ocr_tesseract(doc, result, lang, output_format, route)
+        elif route == "hand_english":
+            await self._ocr_vision(doc, result, region, base, second_witness, spend_credits)
+        elif route == "hand_german":
+            await self._ocr_transkribus_only(doc, result, base, spend_credits, store)
+        elif route in ("hand_norwegian", "hand_other"):
+            await self._ocr_transkribus_with_image(doc, result, region, base, spend_credits, store)
+        elif route == "table":
+            result["engine"] = None
+            result["text"] = None
+            result["guidance"] = ocr.TABLE_GUIDANCE
+            if base != "deu":
+                result["guidance"] += " " + ocr.TABLE_LOOK
+        else:  # volume
+            result["engine"] = None
+            result["text"] = None
+            result["guidance"] = ocr.VOLUME_GUIDANCE.format(
+                credits=ocr.CREDITS_PER_PAGE, eur=ocr.EUR_PER_PAGE
+            )
+            if not self.config.transkribus_configured:
+                result["guidance"] += " (Transkribus is not configured on this server.)"
+
+    async def _ocr_existing(
+        self, doc: _OcrDocument, result: dict, transcripts: list[dict], *, quiet: bool = False
+    ) -> bool:
+        """Text the media already carries, or that an archive its sources name holds.
+
+        In order: a Transcript note on the media (for a PDF of several pages,
+        only one this tool stored for this page), the PDF's own text layer,
+        and the Library of Congress's or the Internet Archive's OCR for a page
+        a URL names. Returns whether any was found; when ``quiet`` is false,
+        finding none is reported in ``result``.
+        """
+        layer = await doc.pdf()
+        single = layer is None or layer.pages <= 1
+        usable = [t for t in transcripts if single or t.get("page") == doc.page]
+        if usable:
+            chosen = usable[0]
+            result.update(
+                engine="existing",
+                text=chosen["text"],
+                provenance=chosen.get("provenance")
+                or {"engine": "transcript_note", "model": None, "date": chosen.get("changed")},
+                source_note=chosen["note"],
+            )
+            return True
+        if layer is not None and layer.text and len(layer.text) < _PDF_LAYER_MIN_CHARS:
+            result.setdefault("warnings", []).append(
+                f"The PDF's text layer holds only {len(layer.text)} characters, beginning "
+                f"{layer.text[:60]!r}: too little to be the page's text, so it is not used. "
+                "A website's download often carries just a caption."
+            )
+        if layer is not None:
+            if len(layer.text) >= _PDF_LAYER_MIN_CHARS:
+                result.update(
+                    engine="existing",
+                    text=layer.text,
+                    provenance={
+                        "engine": "pdf_text_layer",
+                        "model": "the PDF's own text layer",
+                        "date": ocr.today(),
+                    },
+                )
+                return True
+        # An archive URL names one page; a PDF of several cannot say which is it.
+        urls = [] if not single else await self._archive_urls(doc.media)
+        looked: list[dict] = []
+        if urls:
+            async with ocr.archive_client() as http:
+                for url in urls[:_ARCHIVE_URL_LIMIT]:
+                    lookup = await ocr.archive_text(http, url, ocr.today())
+                    if lookup.found:
+                        found = lookup.found
+                        result.update(
+                            engine="existing", text=found.text, provenance=found.provenance
+                        )
+                        if found.note:
+                            result.setdefault("warnings", []).append(found.note)
+                        if looked:
+                            result["looked_at"] = looked
+                        return True
+                    looked.append({"url": url, "reason": lookup.reason})
+        if looked:
+            result["looked_at"] = looked
+        if not quiet:
+            result.update(
+                engine=None,
+                text=None,
+                message="No Transcript note is attached to this media object"
+                + (", its PDF has no text layer of a page's length" if layer else "")
+                + ", and no Library of Congress or Internet Archive page named in its "
+                "sources has OCR text. Read it with engine='tesseract' (print in an image "
+                "file), engine='vision' or engine='transkribus'.",
+            )
+        return False
+
+    async def _archive_urls(self, media: dict) -> list[str]:
+        """Library of Congress and Internet Archive URLs the media and its sources name.
+
+        Looked for in the media's description, path and attributes; in every
+        source holding the media (its attributes, title and publication
+        information); and in every citation holding it (its page and
+        attributes) and that citation's source.
+        """
+        texts: list[str] = [media.get("desc") or "", media.get("path") or ""]
+        texts += [str(a.get("value") or "") for a in media.get("attribute_list") or []]
+        backlinks = media.get("backlinks") or {}
+        source_handles = list(backlinks.get("source") or [])
+        for handle in backlinks.get("citation") or []:
+            with contextlib.suppress(GrampsApiError):
+                citation = await self.client.get_object("citation", handle)
+                texts.append(citation.get("page") or "")
+                texts += [str(a.get("value") or "") for a in citation.get("attribute_list") or []]
+                if citation.get("source_handle"):
+                    source_handles.append(citation["source_handle"])
+        for handle in dict.fromkeys(source_handles):
+            with contextlib.suppress(GrampsApiError):
+                source = await self.client.get_object("source", handle)
+                texts += [str(a.get("value") or "") for a in source.get("attribute_list") or []]
+                texts += [source.get("pubinfo") or "", source.get("title") or ""]
+        urls = [u for u in ocr.find_urls(texts) if ocr.archive_kind(u)]
+        # A URL naming a page comes before one naming a whole item.
+        return sorted(urls, key=lambda u: 0 if ("sp=" in u or "/page/" in u or "seq-" in u) else 1)
+
+    async def _ocr_tesseract(
+        self, doc: _OcrDocument, result: dict, lang: str, output_format: str, route: str
+    ) -> None:
+        """Gramps Web's Tesseract, which reads an image file's print."""
+        if not (doc.mime or "").startswith("image/"):
+            result.update(
+                error="tesseract_cannot_read",
+                message=f"Gramps Web's Tesseract reads image files only, and this is "
+                f"{doc.mime or 'not an image'}: it would answer with nothing. "
+                + (
+                    "This PDF has no usable text layer either. Read the page with "
+                    "engine='vision', or engine='transkribus'."
+                    if doc.is_pdf
+                    else "Nothing here can read it."
+                ),
+            )
+            return
+        tess_lang = ocr.tesseract_language(lang)
+        meta = await self.client.metadata()
+        server = meta.get("server") if isinstance(meta, dict) else None
+        if isinstance(server, dict) and "ocr" in server:
+            if not server.get("ocr"):
+                result.update(
+                    error="tesseract_unavailable",
+                    message="This Gramps Web server has no Tesseract (its metadata says "
+                    "ocr: false). Read the page with engine='vision'.",
+                )
+                return
+            installed = set(server.get("ocr_languages") or [])
+            missing = [p for p in tess_lang.split("+") if installed and p not in installed]
+            if missing:
+                result.update(
+                    error="language_not_installed",
+                    message=f"Tesseract on this server has no {', '.join(missing)} model. "
+                    f"It has: {', '.join(sorted(installed))}.",
+                )
+                return
+        try:
+            text = await self.client.ocr_media(
+                doc.handle, lang=tess_lang, output_format=output_format
+            )
+        except GrampsApiError as exc:
+            if exc.status == 501:
+                result.update(
+                    error="tesseract_unavailable",
+                    message=f"Gramps Web cannot run OCR: {exc.detail}. Read the page "
+                    "with engine='vision'.",
+                )
+                return
+            raise
+        result.update(
+            engine="tesseract",
+            text=text,
+            provenance={
+                "engine": "tesseract",
+                "model": "Tesseract, through Gramps Web",
+                "lang": tess_lang,
+                "date": ocr.today(),
+            },
+        )
+        if route != "print":
+            result.setdefault("warnings", []).append(
+                "Tesseract reads print. On handwriting its output is mostly noise."
+            )
+        elif isinstance(text, str) and not text.strip():
+            result.setdefault("warnings", []).append(
+                "Tesseract found no text. If the page is handwritten, call again with "
+                "doc_type='hand'."
+            )
+
+    async def _ocr_vision(
+        self,
+        doc: _OcrDocument,
+        result: dict,
+        region: list[float] | None,
+        base: str,
+        second_witness: bool,
+        spend_credits: bool,
+    ) -> None:
+        """Return the image for the calling model to transcribe diplomatically."""
+        if not await self._attach_image(doc, result, region):
+            return
+        result.update(engine="vision", text=None, instruction=ocr.DIPLOMATIC_INSTRUCTION)
+        result["after_reading"] = ocr.KEEPING_A_READING
+        if base != "eng" and result.get("doc_type") == DocType.hand.value:
+            name = ocr.LANGUAGE_NAMES.get(base, base)
+            rate = ocr.CER_VISION_NORWEGIAN if base == "nor" else None
+            result.setdefault("warnings", []).append(
+                f"A vision read of {name} handwriting is error-prone: "
+                + (
+                    f"the best model measured {rate} character error on Norwegian "
+                    "(METATR 2026), about one character in ten. "
+                    if rate
+                    else "no published benchmark measures it for this language; on "
+                    "Norwegian the best model is wrong on one character in ten. "
+                )
+                + "Check every name, date and number letter by letter against the image."
+            )
+        if second_witness:
+            witness = await self._transkribus(doc, base, spend_credits, store=False)
+            if witness.get("text") is not None:
+                result["witnesses"] = [
+                    {
+                        "engine": "transkribus",
+                        "text": witness["text"],
+                        "provenance": witness["provenance"],
+                    }
+                ]
+                result["instruction"] += " " + ocr.COMPARE_WITNESSES
+            result["transkribus"] = witness["transkribus"]
+            if witness.get("credits"):
+                result["credits"] = witness["credits"]
+
+    async def _ocr_transkribus_only(
+        self, doc: _OcrDocument, result: dict, base: str, spend_credits: bool, store: bool
+    ) -> None:
+        """Transkribus, and nothing else: German handwriting, or when asked for."""
+        reading = await self._transkribus(doc, base, spend_credits, store)
+        result["transkribus"] = reading["transkribus"]
+        if reading.get("credits"):
+            result["credits"] = reading["credits"]
+        if reading.get("text") is not None:
+            result.update(engine="transkribus", text=reading["text"])
+            result["provenance"] = reading["provenance"]
+            if reading.get("xml"):
+                result["_page_xml"] = reading["xml"]
+            result.setdefault("warnings", []).append(
+                f"{reading['provenance']['model']}: {reading['covers']}. Check every name, "
+                "date and number against the image."
+            )
+            return
+        status = reading["transkribus"]
+        if status.get("status") == "RUNNING":
+            result.update(engine="transkribus", text=None)
+            return
+        german = result["route"] == "hand_german"
+        code = {
+            "not_configured": "transkribus_required",
+            "needs_consent": "spend_not_approved",
+            "private": "private_media",
+            "no_model": "no_transkribus_model",
+        }.get(status.get("reason_code", ""), "transkribus")
+        message = status.get("message", "Transkribus did not read the page.")
+        if german:
+            message = (
+                "German handwriting (Kurrent, Sütterlin) is read here by Transkribus only: "
+                f"vision models measure {ocr.CER_VISION_GERMAN} character error on historical "
+                "German (METATR 2026, READ-2016), so a vision read is not offered as a "
+                f"fallback. {message} Meanwhile FamilySearch's index may hold the entry "
+                "(get_records_on_image)."
+            )
+        result.update(error=code, message=message)
+
+    async def _ocr_transkribus_with_image(
+        self,
+        doc: _OcrDocument,
+        result: dict,
+        region: list[float] | None,
+        base: str,
+        spend_credits: bool,
+        store: bool,
+    ) -> None:
+        """Transkribus' reading with the image to check it; the image alone without it."""
+        reading = await self._transkribus(doc, base, spend_credits, store)
+        result["transkribus"] = reading["transkribus"]
+        if reading.get("credits"):
+            result["credits"] = reading["credits"]
+        if reading.get("text") is None:
+            await self._ocr_vision(doc, result, region, base, False, spend_credits)
+            if "error" not in result:
+                result["warnings"].append(
+                    "Transkribus did not read this page: "
+                    + reading["transkribus"].get("message", "")
+                )
+            return
+        if not await self._attach_image(doc, result, region):
+            return
+        result.update(engine="transkribus", text=reading["text"])
+        result["provenance"] = reading["provenance"]
+        if reading.get("xml"):
+            result["_page_xml"] = reading["xml"]
+        result["instruction"] = (
+            "Check the Transkribus reading against the image. Read the image yourself, "
+            "diplomatically as below, and list every name, date and number where your "
+            "reading and Transkribus' differ; settle each from the image or mark it [?]. "
+            + ocr.DIPLOMATIC_INSTRUCTION
+        )
+
+    async def _attach_image(
+        self, doc: _OcrDocument, result: dict, region: list[float] | None
+    ) -> bool:
+        """Put the page image, scaled for a vision model, under ``_image_jpeg``."""
+        try:
+            img, how = await doc.page_pil()
+            original = img.size
+            jpeg, size = ocr.vision_jpeg(ocr.crop_region(img, region))
+        except ocr.ImageError as exc:
+            result.update(
+                error="not_an_image",
+                message=f"Media {doc.gid} could not be read as an image: {exc}.",
+            )
+            return False
+        result["_image_jpeg"] = jpeg
+        result["image"] = {
+            "media": doc.gid,
+            "page": doc.page if doc.is_pdf else None,
+            "region": region,
+            "sent": list(size),
+            "original": list(original),
+            "from": how,
+        }
+        result.setdefault("warnings", [])
+        if region is None and max(original) > max(size) * 1.5:
+            result["warnings"].append(
+                f"The page is {original[0]}x{original[1]} and was scaled to "
+                f"{size[0]}x{size[1]}. Where the writing is too small to read, call again "
+                "with region=[x1, y1, x2, y2] (percent) to see that part at full detail."
+            )
+        return True
+
+    async def _transkribus(
+        self, doc: _OcrDocument, base: str, spend_credits: bool, store: bool
+    ) -> dict:
+        """Run, or reuse, a Transkribus job on the page, within the caller's consent.
+
+        A page is sent only when the caller passed ``spend_credits`` or the
+        month's page budget has room; a job submitted for the same file, page
+        and model within the day Transkribus keeps results is fetched again
+        rather than paid for again. A private media object is never sent.
+
+        Returns
+        -------
+        dict
+            ``transkribus`` (what happened), and when it read the page
+            ``text``, ``provenance``, ``covers``, ``credits`` and, if asked
+            to store, ``xml``.
+        """
+        model = ocr.transkribus_model(base)
+        cfg = self.config
+        if not cfg.transkribus_configured:
+            return {
+                "transkribus": {
+                    "ran": False,
+                    "reason_code": "not_configured",
+                    "message": "Transkribus is not configured on this server: set "
+                    "GRAMPS_MCP_TRANSKRIBUS_USERNAME and GRAMPS_MCP_TRANSKRIBUS_PASSWORD "
+                    "(a Scholar account or above).",
+                }
+            }
+        if doc.media.get("private"):
+            return {
+                "transkribus": {
+                    "ran": False,
+                    "reason_code": "private",
+                    "message": f"Media {doc.gid} is private, and a private record is never "
+                    "sent to a third party.",
+                }
+            }
+        if model is None:
+            return {
+                "transkribus": {
+                    "ran": False,
+                    "reason_code": "no_model",
+                    "message": f"No Transkribus model here covers {base!r}: German and "
+                    "Norwegian have their own, and Text Titan II covers "
+                    f"{', '.join(sorted(ocr.TEXT_TITAN_LANGUAGES))}. No page was sent.",
+                }
+            }
+        now = datetime.now(UTC)
+        path = cfg.transkribus_ledger
+        key = f"{doc.handle}:{doc.media.get('checksum') or ''}:{doc.page}:{model.id}"
+        async with self._ledger_lock:
+            ledger = ocr.Ledger.load(path)
+            job, used = ledger.job(key, now), ledger.pages_in(now)
+        credits: dict[str, Any] = {
+            "pages_sent": 0,
+            "estimated_credits": 0.0,
+            "pages_this_month": used,
+            "monthly_page_budget": cfg.transkribus_page_budget,
+            "basis": f"about {ocr.CREDITS_PER_PAGE} credits (EUR {ocr.EUR_PER_PAGE}) a page: "
+            "the app's 1 credit a page, at the API's half rate. Transkribus reports no "
+            "charge; the account shows the balance.",
+        }
+
+        def not_run(code: str, message: str, **extra: Any) -> dict:
+            return {
+                "transkribus": {"ran": False, "reason_code": code, "message": message, **extra},
+                "credits": credits,
+            }
+
+        def no_consent(used: int) -> dict:
+            budget = (
+                f"This month's budget of {cfg.transkribus_page_budget} pages is used up "
+                f"({used} sent)."
+                if cfg.transkribus_page_budget
+                else "No monthly page budget is set (GRAMPS_MCP_TRANSKRIBUS_PAGE_BUDGET), "
+                "so every page needs consent."
+            )
+            return not_run(
+                "needs_consent",
+                f"Reading this page with Transkribus ({model.name}) costs about "
+                f"{ocr.CREDITS_PER_PAGE} credits (EUR {ocr.EUR_PER_PAGE}). {budget} Call "
+                "again with spend_credits=true to pay for it.",
+            )
+
+        client = self._transkribus_client()
+        state: dict | None = None
+        process_id: Any = None
+        try:
+            if job is not None:
+                process_id = job["process_id"]
+                try:
+                    state = await client.wait(process_id)
+                    credits["reused_job"] = process_id
+                except ocr.TranskribusError as exc:
+                    if exc.status != 404:
+                        raise
+                    # Transkribus no longer has it: forget it, and read afresh.
+                    await self._ledger_update(path, lambda ledger: ledger.forget(key))
+            if state is None:
+                if not (spend_credits or used < cfg.transkribus_page_budget):
+                    return no_consent(used)
+                data, mime, _how = await doc.page_image()
+                image = ocr.transkribus_image(data, mime)
+                # Counted before it is sent, under a lock: a page the ledger
+                # cannot record is never sent, and two calls cannot both take
+                # the budget's last page.
+                async with self._ledger_lock:
+                    ledger = ocr.Ledger.load(path)
+                    used = ledger.pages_in(now)
+                    if not (spend_credits or used < cfg.transkribus_page_budget):
+                        return no_consent(used)
+                    try:
+                        ledger.reserve(key, model.id, now)
+                    except OSError as exc:
+                        return not_run(
+                            "ledger",
+                            f"The page count could not be written to {path} "
+                            f"({type(exc).__name__}), so no page was sent: a page that is "
+                            "not counted could be paid for again.",
+                        )
+                try:
+                    submitted = await client.submit(image, model.id)
+                except ocr.TranskribusError:
+                    # Refused, so not charged: give the page back.
+                    await self._ledger_update(path, lambda ledger: ledger.release(key, now))
+                    raise
+                process_id = submitted["processId"]
+                await self._ledger_update(path, lambda ledger: ledger.assign(key, process_id))
+                credits.update(
+                    pages_sent=1, estimated_credits=ocr.CREDITS_PER_PAGE, pages_this_month=used + 1
+                )
+                logger.info("transkribus job %s submitted for media %s", process_id, doc.gid)
+                state = await client.wait(process_id)
+        except ocr.TranskribusError as exc:
+            message = exc.message
+            if exc.status == 429:
+                message = (
+                    f"Transkribus refused the job: {exc.message} The account's credits "
+                    "are used up, or a usage limit applies."
+                )
+            return not_run("api", message, status_code=exc.status)
+        except ocr.ImageError as exc:
+            return not_run("image", f"The page could not be prepared for Transkribus: {exc}.")
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            detail = f": {exc}" if str(exc) else ""
+            return not_run(
+                "network",
+                f"Transkribus could not be reached, or answered in a way it should not "
+                f"({type(exc).__name__}{detail}).",
+            )
+        status = str(state.get("status") or "").upper()
+        info = {"ran": True, "status": status, "process_id": process_id, "model": model.id}
+        if status != "FINISHED":
+            if status in ("FAILED", "CANCELLED"):
+                # Not kept: a failed job must not stand in for a fresh one.
+                await self._ledger_update(path, lambda ledger: ledger.forget(key))
+                info["message"] = f"Transkribus job {process_id} ended {status}."
+            else:
+                info["status"] = "RUNNING"
+                info["message"] = (
+                    f"Transkribus job {process_id} is still {status or 'running'}. Call "
+                    "ocr_media again with the same arguments: the job is remembered for a "
+                    "day and is not paid for twice."
+                )
+            return {"transkribus": info, "credits": credits}
+        provenance = {
+            "engine": "transkribus",
+            "model": model.name,
+            "model_id": model.id,
+            "date": ocr.today(now),
+            "process_id": process_id,
+        }
+        out = {
+            "transkribus": info,
+            "text": ocr.content_text(state.get("content")),
+            "provenance": provenance,
+            "covers": model.covers,
+            "credits": credits,
+        }
+        if store:
+            try:
+                out["xml"] = await client.page_xml(process_id)
+            except (ocr.TranskribusError, httpx.HTTPError) as exc:
+                info["xml_message"] = f"The PAGE XML could not be fetched: {exc}"
+        return out
+
+    async def _ledger_update(self, path: Path, change: Any) -> None:
+        """Apply one change to the Transkribus ledger, read afresh, under its lock.
+
+        A failure to write after a page was sent is logged, not raised: the
+        reading it paid for still reaches the caller.
+        """
+        async with self._ledger_lock:
+            try:
+                change(ocr.Ledger.load(path))
+            except OSError:
+                logger.warning("the Transkribus ledger could not be written")
+
+    def _transkribus_client(self) -> ocr.TranskribusClient:
+        """The Transkribus client, made on first use and kept for its token."""
+        if self._transkribus_api is None:
+            cfg = self.config
+            self._transkribus_api = ocr.TranskribusClient(
+                cfg.transkribus_username or "",
+                cfg.transkribus_password or "",
+                cfg.transkribus_api_url,
+            )
+        return self._transkribus_api
+
+    async def _store_reading(self, doc: _OcrDocument, result: dict) -> dict:
+        """Keep a machine reading on the media object as a Transcript note.
+
+        One note holds the text under a header line naming the engine, model
+        and date; a second, preformatted, holds Transkribus' PAGE XML, which
+        Transkribus deletes a day after the job. Both are attached in one
+        write through ``_mutate()``, and the attachment is re-read. A private
+        media object's notes are private. A reading the media already holds
+        is not stored twice.
+        """
+        xml = result.pop("_page_xml", None)
+        provenance = result.get("provenance") or {}
+        text = result.get("text")
+        if result.get("engine") == "vision":
+            return {
+                "stored": False,
+                "message": "Nothing to store: the reading is yours to make. "
+                + ocr.KEEPING_A_READING,
+            }
+        if not isinstance(text, str) or not text.strip():
+            return {"stored": False, "message": "No machine reading to store."}
+        if provenance.get("engine") == "transcript_note" or result.get("source_note"):
+            return {"stored": False, "message": "The reading is already a note on the media."}
+        for existing in await doc.transcripts():
+            if existing["text"].strip() == text.strip():
+                return {
+                    "stored": False,
+                    "note": existing["note"],
+                    "message": f"This reading is already stored, in note {existing['note']}.",
+                }
+        note_type = await self._canonical_type("note_types", "Transcript")
+        private = bool(doc.media.get("private"))
+        stored_provenance = {**provenance}
+        if doc.is_pdf:
+            stored_provenance["page_of"] = (doc.page, doc.pages)
+        body = ocr.header(stored_provenance) + "\n\n" + text.strip()
+        payloads = [
+            {
+                "_class": "Note",
+                "text": {"string": body},
+                "type": note_type,
+                "format": 0,
+                "private": private,
+            }
+        ]
+        if xml:
+            payloads.append(
+                {
+                    "_class": "Note",
+                    "text": {"string": ocr.xml_with_provenance(xml, provenance)},
+                    "type": note_type,
+                    "format": 1,
+                    "private": private,
+                }
+            )
+        notes = [await self.client.create_object("note", p) for p in payloads]
+        handles = [n["handle"] for n in notes]
+
+        def edit(obj: dict) -> str:
+            obj.setdefault("note_list", []).extend(handles)
+            return f"{len(handles)} transcript note{'s' * (len(handles) > 1)} attached"
+
+        await self._mutate("media", doc.handle, edit, label="transcribed")
+        verified = all(
+            [await self._verify_in_list("media", doc.handle, "note_list", h) for h in handles]
+        )
+        return {
+            "stored": True,
+            "notes": [n.get("gramps_id") for n in notes],
+            "verified": verified,
+            "message": (
+                f"Stored the reading as note {notes[0].get('gramps_id')}"
+                + (f" and its PAGE XML as {notes[1].get('gramps_id')}" if xml else "")
+                + f" on media {doc.gid}."
+                if verified
+                else "The notes were created but did NOT attach to the media: re-read it."
+            ),
         }
 
     # ------------------------------------------------------------------ #
@@ -7615,6 +8407,171 @@ def _timeline_entry(raw: dict) -> dict:
 
 #: Celery states that mean a task will not change again.
 _TERMINAL_TASK_STATES = {"SUCCESS", "FAILURE", "REVOKED"}
+
+
+# --------------------------------------------------------------------------- #
+# ocr_media
+# --------------------------------------------------------------------------- #
+#: A PDF text layer shorter than this is not a page's text. A website's
+#: download often carries only a caption -- a Newspapers.com clipping's held
+#: its URL and title, 212 characters, on a live tree on 2026-10-06 -- while
+#: a page of print runs to thousands.
+_PDF_LAYER_MIN_CHARS = 300
+#: Archive URLs tried for existing text, page URLs first: each costs requests.
+_ARCHIVE_URL_LIMIT = 4
+#: Long edge, in pixels, Gramps Web is asked to render a file Pillow cannot
+#: open (a PDF page with no embedded scan, a HEIC photograph) at.
+_RENDER_SIZE = 3000
+
+_GERMAN_VISION_REFUSAL = {
+    "error": "vision_refused",
+    "message": "German handwriting is not read by vision here, even when asked: vision "
+    f"models measure {ocr.CER_VISION_GERMAN} character error on historical German "
+    "(METATR 2026, READ-2016), half the characters, names among them. Use "
+    "engine='transkribus' (or auto), or a person who reads Kurrent; FamilySearch's "
+    "index may hold the entry (get_records_on_image).",
+}
+
+
+class _OcrDocument:
+    """One media object being read: its file, fetched once, its page, its notes.
+
+    Parameters
+    ----------
+    service : GrampsService
+        The service whose client fetches the file and notes.
+    media : dict
+        The whole media object, with its backlinks.
+    page : int
+        The page wanted, from 1; only a PDF has more than one.
+    """
+
+    def __init__(self, service: GrampsService, media: dict, page: int):
+        self.service = service
+        self.media = media
+        self.page = page
+        self.handle: str = media["handle"]
+        self.gid: str = media.get("gramps_id") or media["handle"]
+        self.mime: str = (media.get("mime") or "").lower()
+        self._file: tuple[bytes, str] | None = None
+        self._pdf: ocr.PdfPage | None = None
+        self._pdf_read = False
+        self._pil: tuple[Any, str] | None = None
+        self._transcripts: list[dict] | None = None
+
+    @property
+    def is_pdf(self) -> bool:
+        """bool: Whether the media file is a PDF."""
+        return self.mime == "application/pdf"
+
+    @property
+    def pages(self) -> int:
+        """int: The PDF's page count once read; 1 for anything else."""
+        return self._pdf.pages if self._pdf else 1
+
+    async def file(self) -> tuple[bytes, str]:
+        """The media file and the type it was served as, downloaded once."""
+        if self._file is None:
+            self._file = await self.service.client.media_file(self.handle)
+        return self._file
+
+    async def pdf(self) -> ocr.PdfPage | None:
+        """The PDF's page: its text layer and scan. None for anything not a PDF.
+
+        Raises
+        ------
+        ocr.ImageError
+            When the PDF cannot be read or has no such page.
+        """
+        if not self.is_pdf:
+            return None
+        if not self._pdf_read:
+            data, _served = await self.file()
+            self._pdf = ocr.pdf_page(data, self.page)
+            self._pdf_read = True
+        return self._pdf
+
+    async def page_image(self) -> tuple[bytes, str, str]:
+        """The page as image bytes: ``(bytes, mime, where it came from)``.
+
+        An image file is itself; a PDF's page is the scan embedded in it. What
+        Pillow cannot open -- a PDF page with no scan, a HEIC photograph --
+        Gramps Web renders, as AVIF, though only a PDF's first page.
+
+        Raises
+        ------
+        ocr.ImageError
+            For a page that does not exist or a file that is no image.
+        """
+        if self.mime.startswith("image/"):
+            if self.page != 1:
+                raise ocr.ImageError("an image file has one page; page is for a PDF")
+            data, served = await self.file()
+            try:
+                # Opened here to prove it is an image; kept, so it is opened once.
+                self._pil = (ocr.open_image(data), "the media file")
+                return data, served or self.mime, "the media file"
+            except ocr.ImageError:
+                pass
+            return await self._rendered("the media file, rendered by Gramps Web")
+        if self.is_pdf:
+            pdf = await self.pdf()
+            if pdf and pdf.image:
+                return (
+                    pdf.image,
+                    pdf.image_mime or "image/jpeg",
+                    (f"the scan embedded in page {self.page} of the PDF"),
+                )
+            if self.page == 1:
+                return await self._rendered("page 1 of the PDF, rendered by Gramps Web")
+            raise ocr.ImageError(
+                f"page {self.page} of the PDF holds no scanned image, and Gramps Web "
+                "renders only a PDF's first page"
+            )
+        raise ocr.ImageError(f"{self.mime or 'its file'} is neither an image nor a PDF")
+
+    async def _rendered(self, how: str) -> tuple[bytes, str, str]:
+        data = await self.service.client.media_thumbnail(self.handle, _RENDER_SIZE)
+        return data, "image/avif", how
+
+    async def page_pil(self) -> tuple[Any, str]:
+        """The page as a Pillow image, opened once, and where it came from."""
+        if self._pil is None:
+            data, _mime, how = await self.page_image()
+        if self._pil is None:
+            self._pil = (ocr.open_image(data), how)
+        return self._pil
+
+    async def transcripts(self) -> list[dict]:
+        """The Transcript notes on the media that hold a reading (not layout XML)."""
+        if self._transcripts is None:
+            found = []
+            for handle in self.media.get("note_list") or []:
+                try:
+                    note = await self.service.client.get_object("note", handle)
+                except GrampsApiError:
+                    continue
+                kind = note.get("type")
+                kind = kind.get("string") if isinstance(kind, dict) else kind
+                text = ((note.get("text") or {}).get("string")) or ""
+                if kind != "Transcript" or not text.strip() or ocr.is_layout_xml(text):
+                    continue
+                provenance = ocr.parse_header(text)
+                changed = note.get("change")
+                found.append(
+                    {
+                        "note": note.get("gramps_id"),
+                        "chars": len(text),
+                        "provenance": provenance,
+                        "page": (provenance or {}).get("page"),
+                        "changed": ocr.today(datetime.fromtimestamp(changed, UTC))
+                        if isinstance(changed, int | float) and changed
+                        else None,
+                        "text": ocr.body_of(text),
+                    }
+                )
+            self._transcripts = found
+        return self._transcripts
 
 
 def _task_id_from(payload: Any) -> str | None:

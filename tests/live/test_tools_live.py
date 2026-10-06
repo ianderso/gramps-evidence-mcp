@@ -722,3 +722,28 @@ async def test_a_private_tasks_note_is_private_and_stays_so(live):
     public = await live("update_research_task", task=made["gramps_id"], private=False)
     assert public["description_note_private"] is True, public
     assert (await _raw(live, "note", stored["note_list"][0]))["private"] is True
+
+
+async def test_ocr_media_routes_print_handwriting_and_a_scanned_pdf(live, tmp_path):
+    import io
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 1200), "white")
+    ImageDraw.Draw(img).text((40, 40), "INVENTORY OF THE ESTATE", fill="black")
+    jpg, pdf = io.BytesIO(), io.BytesIO()
+    img.save(jpg, format="JPEG")
+    img.save(pdf, format="PDF")
+    (tmp_path / "page.jpg").write_bytes(jpg.getvalue())
+    (tmp_path / "scan.pdf").write_bytes(pdf.getvalue())
+    page = await live("add_media", file_path=str(tmp_path / "page.jpg"), description="Page")
+    scan = await live("add_media", file_path=str(tmp_path / "scan.pdf"), description="Scan")
+
+    hand = await live("ocr_media", media=page["gramps_id"], doc_type="hand")
+    assert hand["engine"] == "vision", hand
+    assert hand["image"]["sent"] == [900, 1200]
+    printed = await live("ocr_media", media=page["gramps_id"])
+    assert printed.get("engine") == "tesseract" or printed["error"] == "tesseract_unavailable"
+    from_pdf = await live("ocr_media", media=scan["gramps_id"], doc_type="hand")
+    assert from_pdf["image"]["sent"] == [900, 1200], from_pdf
+    assert (await live("ocr_media", media=scan["gramps_id"]))["error"] == "tesseract_cannot_read"

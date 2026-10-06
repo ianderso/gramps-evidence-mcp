@@ -887,3 +887,59 @@ async def test_30_the_log_names_each_changes_record_and_pages_by_id(live):
     assert older["id"] == create["id"]
     (change,) = (await client.transaction(edit["id"], old=True, new=True))["changes"]
     assert (change["old_data"]["gender"], change["new_data"]["gender"]) == (0, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 31: Gramps Web's OCR and thumbnails
+# --------------------------------------------------------------------------- #
+def _drawn(fmt: str) -> bytes:
+    """A blank page with a line of print, as PNG or as a scanner's one-image PDF."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (600, 300), "white")
+    ImageDraw.Draw(img).text((20, 20), "INVENTORY OF THE ESTATE", fill="black")
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+async def _upload(client, content: bytes, mime: str, name: str) -> str:
+    media = await client.create_object(
+        "media", {"_class": "Media", "path": name, "mime": mime, "desc": name}
+    )
+    await client.upload_media_bytes(media["handle"], content, mime)
+    return media["handle"]
+
+
+async def test_31_ocr_needs_a_language_and_answers_a_pdf_with_nothing(live):
+    client = live.client
+    pdf = await _upload(client, _drawn("PDF"), "application/pdf", "scan.pdf")
+    with pytest.raises(GrampsApiError) as exc:
+        await client._request("POST", f"/api/media/{pdf}/ocr")
+    assert exc.value.status == 422
+    assert await client.ocr_media(pdf, lang="eng") == {}
+
+
+async def test_31_ocr_reads_an_image_with_tesseract_and_is_501_without(live):
+    """The metadata says which: ``server.ocr`` is whether Tesseract runs."""
+    client = live.client
+    png = await _upload(client, _drawn("PNG"), "image/png", "page.png")
+    server = (await client.metadata()).get("server") or {}
+    assert isinstance(server.get("ocr"), bool)
+    if server["ocr"]:
+        text = await client.ocr_media(png, lang="eng")
+        assert isinstance(text, str) and "ESTATE" in text.upper()
+    else:
+        assert server.get("ocr_languages") == []
+        with pytest.raises(GrampsApiError) as exc:
+            await client.ocr_media(png, lang="eng")
+        assert exc.value.status == 501
+
+
+async def test_31_a_thumbnail_is_avif_whatever_the_file(live):
+    client = live.client
+    png = await _upload(client, _drawn("PNG"), "image/png", "page.png")
+    data = await client.media_thumbnail(png, 200)
+    assert data[4:12] == b"ftypavif"

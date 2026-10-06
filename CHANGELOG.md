@@ -8,6 +8,79 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- `ocr_media` is a router. It reads a document image with the engine that
+  suits it, chosen by the new `doc_type` (`print`, `hand`, `table`, `volume`)
+  and the existing `lang`, and returns the text with `provenance`
+  (`engine`, `model`, `date`):
+  - **print**: text the media already carries -- a Transcript note, a PDF's
+    text layer -- or the Library of Congress's or the Internet Archive's OCR
+    for a page a URL in its sources names; otherwise Tesseract, through Gramps
+    Web.
+  - **English handwriting**: the image itself, as MCP image content scaled to
+    what a current Claude model reads whole, with a diplomatic-transcription
+    instruction (spelling as written, line breaks and abbreviations kept,
+    `[?]` where unsure). `second_witness` adds a Transkribus reading and asks
+    for every name and number where the two differ.
+  - **German handwriting**: Transkribus only. Without it, refused; never a
+    vision read, even when asked (48.8 % character error on historical
+    German, METATR 2026).
+  - **Norwegian and other handwriting**: Transkribus (NorHand, or Text Titan
+    II), with the image to check it; without Transkribus, the image and a
+    warning of its error rate.
+  - **table**: not read; the result says to use FamilySearch's index
+    (`get_records_on_image`), and why. **volume**: FamilySearch Full-Text
+    Search first, then Transkribus page by page.
+
+  New parameters, all optional: `doc_type`, `engine` (`auto`, `existing`,
+  `tesseract`, `vision`, `transkribus`), `second_witness`, `spend_credits`,
+  `store`, `page` (of a PDF) and `region` (part of the page, at full detail).
+  `store` keeps a machine reading on the media object as a Transcript note
+  headed with its provenance, and Transkribus' PAGE XML in a second note,
+  through `_mutate()`; a later print read returns the stored one.
+- Transkribus, optional, configured from the environment:
+  `GRAMPS_MCP_TRANSKRIBUS_USERNAME`, `GRAMPS_MCP_TRANSKRIBUS_PASSWORD`,
+  `GRAMPS_MCP_TRANSKRIBUS_PAGE_BUDGET` and `GRAMPS_MCP_TRANSKRIBUS_API_URL`,
+  declared in `server.json`. Every page costs credits (about 0.5, EUR 0.12),
+  so a page is sent only with `spend_credits` or within the monthly page
+  budget, which defaults to none; a page is counted before it is sent, and
+  not sent if it cannot be counted. Each result reports what it spent, and a
+  job is reused, not paid for twice, within the day Transkribus keeps it; a
+  failed job is dropped. A private media object is never sent, nor a page in
+  a language no model here covers. **The Transkribus path is built to the
+  published Metagrapho v1 API and its READ-COOP login, and tested against
+  fixtures of those shapes; it has not been exercised against the live
+  service.**
+- `docs/PITFALLS.md` section 31: Gramps Web's OCR answers with a task on a
+  server with a task queue, reads image files only, and serves thumbnails as
+  AVIF. The live suite checks the last two; the first needs a task queue,
+  which its throwaway server does not run.
+- Dependencies: Pillow (12.3.0 or later) to scale, crop and convert page
+  images, and pypdf (6.19.0 or later) to read a PDF's text layer and scans.
+
+### Changed
+
+- `ocr_media` is annotated as neither read-only nor closed-world: it can fetch
+  from the Library of Congress and the Internet Archive, spend Transkribus
+  credits, and with `store` add a note. A client that approved it
+  automatically as a read now asks. Today's calls, `ocr_media(media, lang)`,
+  work as before and answer the same keys (`handle`, `media`, `lang`, `text`,
+  `caveat`) and more; `media` in the answer is now the gramps_id. A print
+  read now returns text the media already carries before running Tesseract.
+- The unit tests' fake stores an uploaded media file and serves it back,
+  renders thumbnails as AVIF, and answers OCR as the server does: text served
+  as `text/html`, `{}` for a file that is not an image, 422 without `lang`,
+  501 without Tesseract, and a task when it plays a server with a task queue.
+
+### Fixed
+
+- `ocr_media` returned no text on a server with a task queue, as a live
+  gramps-webapi 3.21.1 was seen to be: the server answers 202 with a task to
+  poll, and the tool handed back `{"task": {...}}` as the text. It now polls
+  the task. And a page whose text was a bare number, such as "1850", came
+  back as the integer, because text served as `text/html` was parsed as JSON.
+
 ## [2.1.0] — 2026-10-06
 
 ### Added

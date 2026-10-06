@@ -52,8 +52,8 @@ where the tools stopped you.
   a hint that leads to a record, and the record is what gets cited. Imports
   remain possible through the Gramps Web interface, as a deliberate act.
 - **Face detection** (`/api/media/{handle}/face_detection`). It returns
-  rectangles on an image the model cannot see through this server, and Gramps
-  Web's own interface already offers it where a person can look.
+  rectangles, not who is in them, and Gramps Web's own interface already
+  offers it where a person can look.
 - **Single-entry composite undo** through `POST /api/transactions/`. That
   endpoint bypasses the server's allocation of handles and gramps_ids and its
   translation of type names, which this client would have to reimplement. One

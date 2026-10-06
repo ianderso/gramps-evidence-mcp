@@ -15,6 +15,16 @@ Environment variables, all prefixed ``GRAMPS_MCP_``:
 ``HOST``, ``PORT``   Where ``http`` listens. Default ``127.0.0.1:8090``.
 ===================  =========================================================
 
+Optional, for ``ocr_media``'s handwriting routes (Transkribus):
+
+==============================  ==============================================
+``TRANSKRIBUS_USERNAME``        A Transkribus account, Scholar plan or above.
+``TRANSKRIBUS_PASSWORD``        Its password.
+``TRANSKRIBUS_PAGE_BUDGET``     Pages a calendar month sent without a per-call
+                                ``spend_credits``. Default 0: every page asks.
+``TRANSKRIBUS_API_URL``         The processing API. Default Metagrapho v1.
+==============================  ==============================================
+
 The TOML file holds non-secret settings: the reference GEDCOM list, the privacy
 flag, cache location, request timeout. See ``gramps_mcp.example.toml``.
 """
@@ -29,6 +39,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ENV_PREFIX = "GRAMPS_MCP_"
+
+#: Transkribus' processing API: Metagrapho v1, the documented live API. The
+#: v2 developer platform serves the same bodies under ``/v2/processes``.
+TRANSKRIBUS_API_URL = "https://transkribus.eu/processing/v1"
 
 
 @dataclass
@@ -68,6 +82,13 @@ class Config:
         Attribute name stamped on events recorded without a citation.
     request_timeout : float
         HTTP timeout in seconds for gramps-webapi calls.
+    transkribus_username, transkribus_password : str or None
+        A Transkribus account, from the environment. Both or neither.
+    transkribus_api_url : str
+        Transkribus' processing API.
+    transkribus_page_budget : int
+        Pages a calendar month ``ocr_media`` may send to Transkribus without
+        the caller's per-call ``spend_credits``. Every page costs credits.
     """
 
     api_url: str
@@ -79,11 +100,25 @@ class Config:
     reference_files: list[ReferenceFileConfig] = field(default_factory=list)
     unsourced_attribute: str = "UNSOURCED"
     request_timeout: float = 30.0
+    transkribus_username: str | None = None
+    transkribus_password: str | None = field(default=None, repr=False)
+    transkribus_api_url: str = TRANSKRIBUS_API_URL
+    transkribus_page_budget: int = 0
 
     @property
     def gedcom_cache_dir(self) -> Path:
         """Path: Directory holding parsed-GEDCOM caches."""
         return self.cache_dir / "gedcom"
+
+    @property
+    def transkribus_configured(self) -> bool:
+        """bool: Whether a Transkribus account is set."""
+        return bool(self.transkribus_username and self.transkribus_password)
+
+    @property
+    def transkribus_ledger(self) -> Path:
+        """Path: The pages sent to Transkribus each month, and its recent jobs."""
+        return self.cache_dir / "transkribus-usage.json"
 
 
 def _env(name: str) -> str | None:
@@ -205,6 +240,7 @@ def load_config(config_path: Path | None = None) -> Config:
         cfg.cache_dir = Path(server["cache_dir"]).expanduser()
     cfg.unsourced_attribute = server.get("unsourced_attribute", cfg.unsourced_attribute)
     cfg.request_timeout = float(server.get("request_timeout", cfg.request_timeout))
+    _load_transkribus(cfg)
 
     base = path.parent if path.exists() else Path.cwd()
     for entry in data.get("reference", []):
@@ -221,6 +257,33 @@ def load_config(config_path: Path | None = None) -> Config:
             )
         )
     return cfg
+
+
+def _load_transkribus(cfg: Config) -> None:
+    """Read the optional Transkribus account and page budget.
+
+    Raises
+    ------
+    ConfigError
+        On a user name without a password or the reverse, or a budget that is
+        not a whole number of pages.
+    """
+    username = _env("TRANSKRIBUS_USERNAME")
+    password = _env("TRANSKRIBUS_PASSWORD")
+    if bool(username) != bool(password):
+        raise ConfigError(
+            f"Set both {ENV_PREFIX}TRANSKRIBUS_USERNAME and {ENV_PREFIX}TRANSKRIBUS_PASSWORD, "
+            "or neither: Transkribus is optional."
+        )
+    cfg.transkribus_username, cfg.transkribus_password = username, password
+    cfg.transkribus_api_url = (_env("TRANSKRIBUS_API_URL") or TRANSKRIBUS_API_URL).rstrip("/")
+    budget = (_env("TRANSKRIBUS_PAGE_BUDGET") or "0").strip()
+    if not budget.isdigit():
+        raise ConfigError(
+            f"{ENV_PREFIX}TRANSKRIBUS_PAGE_BUDGET={budget!r} is not a number of pages. "
+            "Give a whole number, 0 to ask on every page."
+        )
+    cfg.transkribus_page_budget = int(budget)
 
 
 class ConfigError(RuntimeError):

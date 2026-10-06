@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 import httpx
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -40,15 +41,18 @@ from .models import (
     CitationEdit,
     CitationInput,
     Confidence,
+    DocType,
     EventInput,
     Gender,
     NameMatch,
     NameParts,
+    OcrEngine,
     RepositoryLink,
     TaskPriority,
     TaskStatus,
     VitalEventInput,
 )
+from .ocr import TranskribusError
 from .service import (
     AmbiguousPlaceError,
     CitationRequiredError,
@@ -91,6 +95,17 @@ WRITES_LOCAL_FILE = ToolAnnotations(
     destructive_hint=False,
     idempotent_hint=False,
     open_world_hint=False,
+)
+#: ocr_media: reads, but not only the tree. It fetches OCR text the Library
+#: of Congress or the Internet Archive holds, and, when Transkribus is
+#: configured, sends a page there at a cost in credits; with ``store`` it adds
+#: a transcript note. So it is neither read-only nor closed-world, and a
+#: client should ask before it.
+READS_OUTSIDE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
 )
 #: Leaves the tree alone but makes the server do work: a report file, an index.
 RUNS_ON_SERVER = ToolAnnotations(
@@ -173,6 +188,8 @@ def _error(exc: Exception) -> dict:
         return {"error": "invalid_carry_to", "message": str(exc)}
     if isinstance(exc, UnsupportedServerError):
         return {"error": "unsupported_server", "message": str(exc)}
+    if isinstance(exc, TranskribusError):
+        return {"error": "transkribus", "status": exc.status, "message": exc.message}
     if isinstance(exc, FailedWriteError):
         # A 5xx from a write, and what a re-read showed it did (TOOL-REQUESTS #28).
         return {"error": "api", "status": exc.status, "written": exc.written, "message": exc.detail}
@@ -1918,25 +1935,85 @@ async def add_media(
         return _error(exc)
 
 
-@mcp.tool(annotations=READS)
+@mcp.tool(annotations=READS_OUTSIDE)
 async def ocr_media(
     media: str = Field(description="Media handle or gramps_id."),
     lang: str = Field(
-        default="eng", description="Tesseract language code ('eng', 'deu', 'swe', 'nor', ...)."
+        default="eng",
+        description="The document's language, as a Tesseract code: 'eng', 'deu', 'nor', "
+        "'swe', 'dan', 'lat'; 'eng+deu' for several. Chooses the handwriting route and "
+        "Tesseract's model.",
     ),
-) -> dict:
-    """Run OCR on a document image, server-side, to locate text within it.
+    doc_type: DocType = Field(
+        default=DocType.print,
+        description="What the document is. 'print': typeset or typed. 'hand': one "
+        "handwritten document -- will, deed, letter, register entry. 'table': a census "
+        "page or other ruled form. 'volume': a page of a register or deed book you mean "
+        "to search whole.",
+    ),
+    engine: OcrEngine = Field(
+        default=OcrEngine.auto,
+        description="'auto' routes by doc_type and lang. Or one reader: 'existing' (text "
+        "the media or its sources already carry), 'tesseract', 'vision' (the image, for "
+        "you to read; refused for German handwriting), 'transkribus'.",
+    ),
+    second_witness: bool = Field(
+        default=False,
+        description="With a vision read, also run Transkribus and compare -- for a "
+        "document that will carry a proof argument. Costs credits.",
+    ),
+    spend_credits: bool = Field(
+        default=False,
+        description="Consent to Transkribus credits (about 0.5, EUR 0.12, a page) for this "
+        "call, past the configured monthly page budget. Only when the user agreed.",
+    ),
+    store: bool = Field(
+        default=False,
+        description="Keep a machine reading on the media object as a Transcript note "
+        "headed with its engine, model and date, plus Transkribus' PAGE XML. A vision "
+        "read is yours to store, with add_note.",
+    ),
+    page: int = Field(default=1, ge=1, description="Page of a PDF, from 1."),
+    region: list[float] | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        description="Return only [x1, y1, x2, y2] of the page, in percent of width and "
+        "height, at full detail: to read small or faint writing. [0, 50, 100, 100] is "
+        "the bottom half.",
+    ),
+) -> Any:
+    """Read a document image with the reader that suits it; doc_type and lang
+    choose. print: text the media or its sources already carry, else Tesseract.
+    hand: an English hand returns the image for you to transcribe as the result
+    instructs; German goes to Transkribus only, never a vision read; Norwegian
+    and others to Transkribus, with the image to check. table: FamilySearch's
+    index (get_records_on_image). volume: full-text search first.
 
-    A finding aid, not evidence. OCR output is a machine's guess at the writing,
-    and it is at its worst on exactly the handwritten records that matter most.
-    Use it to find WHERE something appears in a long scan; read the image before
-    citing what it says.
+    Transkribus costs credits: within the monthly budget, or with spend_credits.
+    The transcript is never the evidence; the citation stays on the image.
     """
     try:
         svc = await state.service_()
-        return await svc.ocr_media(media, lang=lang)
+        result = await svc.ocr_media(
+            media,
+            lang=lang,
+            doc_type=doc_type,
+            engine=engine,
+            second_witness=second_witness,
+            spend_credits=spend_credits,
+            store=store,
+            page=page,
+            region=region,
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
+    image = result.pop("_image_jpeg", None)
+    result.pop("_page_xml", None)
+    if image is None:
+        return result
+    # The JSON first, so a client reading only the first block still gets it.
+    return [result, Image(data=image, format="jpeg")]
 
 
 # ==========================================================================  #
