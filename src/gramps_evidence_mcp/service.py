@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import difflib
 import hashlib
 import logging
@@ -23,9 +24,18 @@ from pathlib import Path
 from typing import Any
 
 from . import mapping
-from .client import ENDPOINTS, GQL_NOTES, GrampsApiError, GrampsWebClient
+from .client import (
+    _CLASS_NAMES,
+    ENDPOINTS,
+    GQL_NOTES,
+    FailedWriteError,
+    GrampsApiError,
+    GrampsWebClient,
+    UnsupportedServerError,
+)
 from .config import Config
 from .models import (
+    ChildLink,
     CitationEdit,
     CitationInput,
     Confidence,
@@ -72,6 +82,19 @@ _PRIVACY_PATHS: dict[str, tuple[tuple[str, list[str]], ...]] = {
 #: What export_backup can write: Gramps XML (lossless) and three interchange
 #: formats. The name becomes part of a URL and a file name, so it is checked.
 _EXPORT_FORMATS = ("gramps", "ged", "json", "csv")
+
+#: Transactions per request when the log is read for one record's history on
+#: gramps-webapi 3.21: 2,000 took 1.7 s and 1 MB on a tree with 54,000
+#: transactions (2026-10-06), as do the changes of one record on 3.22.
+_HISTORY_PAGE = 2000
+
+#: How far back the log is read for one record on 3.21 before stopping and
+#: saying so: about 85 s at that rate.
+_HISTORY_SCAN_LIMIT = 100_000
+
+#: How many of an event's other participants are read for the attribute
+#: names on their references to it.
+_REF_NAME_SOURCES = 50
 
 #: The ids a redacted stub is built from, selected under names the caller
 #: cannot use: a caller's own column aliased ``gramps_id`` could otherwise
@@ -971,13 +994,20 @@ class GrampsService:
         return await self._mutate("event", event_handle, edit, label="updated")
 
     async def add_event_ref(
-        self, person_ref: str, event_ref: str, role: str = "Primary", allow_new_type: bool = False
+        self,
+        person_ref: str,
+        event_ref: str,
+        role: str = "Primary",
+        allow_new_type: bool = False,
+        attributes: dict[str, str] | None = None,
     ) -> dict:
         """Add an existing event to a person, in a role.
 
         One census entry, burial or residence that several people took part
         in is one event, referenced by each of them; a copy per person would
-        split its citations and let the copies drift apart.
+        split its citations and let the copies drift apart. What is the
+        person's own -- their line on a census sheet, their age -- goes on the
+        reference as attributes (TOOL-REQUESTS #7).
 
         Parameters
         ----------
@@ -987,6 +1017,9 @@ class GrampsService:
             Handle or gramps_id of the existing event.
         role : str, optional
             The person's role, matched against the tree's role types.
+        attributes : dict, optional
+            Attribute name to value, set on the reference. Names are matched
+            by :meth:`_ref_attribute_names`.
 
         Returns
         -------
@@ -997,10 +1030,14 @@ class GrampsService:
         Raises
         ------
         UnknownTypeError
-            If the role is not in the tree's vocabulary.
+            If the role is not in the tree's vocabulary, or an attribute name
+            is close to a known one without being it.
         """
         event = await self._resolve("event", event_ref, keys="handle,gramps_id,type")
         role_name = await self._canonical_type("event_role_types", role, allow_new_type)
+        names, new_names = await self._ref_attribute_names(
+            event["handle"], list(attributes or {}), allow_new_type
+        )
         event_type = _type_string(event.get("type"))
         event_label = event.get("gramps_id") or event["handle"]
         state = {"present": False}
@@ -1009,21 +1046,194 @@ class GrampsService:
             if any(r.get("ref") == event["handle"] for r in person.get("event_ref_list") or []):
                 state["present"] = True
                 return False
-            _append_event_ref(
-                person, mapping.event_ref(event["handle"], role=role_name), event_type
+            ref = mapping.event_ref(event["handle"], role=role_name)
+            ref["attribute_list"] = [
+                {"_class": "Attribute", "type": names[given], "value": value}
+                for given, value in (attributes or {}).items()
+            ]
+            _append_event_ref(person, ref, event_type)
+            return f"{event_type} {event_label} added as {role_name}" + (
+                f", with {', '.join(names[a] for a in attributes)}" if attributes else ""
             )
-            return f"{event_type} {event_label} added as {role_name}"
 
         result = await self._mutate("person", person_ref, edit, label="shared an event with")
         if state["present"]:
             return {
                 "error": "already_referenced",
                 "message": f"Person {result.get('gramps_id')} already references event "
-                f"{event_label}; nothing was added.",
+                f"{event_label}; nothing was added. update_event_ref changes that "
+                "reference's role or attributes.",
                 **({"repaired": result["repaired"]} if result.get("repaired") else {}),
             }
         result.update({"event_handle": event["handle"], "event": event_label, "role": role_name})
-        return result
+        if attributes:
+            result["attributes"] = {names[a]: v for a, v in attributes.items()}
+        return _with_new_names(result, new_names)
+
+    async def update_event_ref(
+        self,
+        person_ref: str,
+        event_ref: str,
+        role: str | None = None,
+        attributes: dict[str, str | None] | None = None,
+        allow_new_type: bool = False,
+    ) -> dict:
+        """Change a person's reference to an event in place: its role, its attributes.
+
+        An attribute is set by name: the first of that name on the reference
+        takes the value, keeping its citations, notes and privacy, and any
+        further one of the same name is removed; a name the reference lacks
+        is added. A value of None removes every attribute of that name.
+
+        Parameters
+        ----------
+        person_ref : str
+            Handle or gramps_id of the person.
+        event_ref : str
+            Handle or gramps_id of the event the person references.
+        role : str, optional
+            The new role, matched against the tree's role types.
+        attributes : dict, optional
+            Attribute name to its new value, or to None to remove it.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id and a message, or an ``error`` key.
+        """
+        if role is None and not attributes:
+            return {"error": "nothing_to_do", "message": "Pass role, attributes, or both."}
+        event = await self._resolve("event", event_ref, keys="handle,gramps_id")
+        event_label = event.get("gramps_id") or event["handle"]
+        role_name = (
+            await self._canonical_type("event_role_types", role, allow_new_type)
+            if role is not None
+            else None
+        )
+        setting = [name for name, value in (attributes or {}).items() if value is not None]
+        names, new_names = await self._ref_attribute_names(event["handle"], setting, allow_new_type)
+        state = {"refs": 0}
+
+        def edit(person: dict) -> str | bool:
+            refs = [
+                r for r in person.get("event_ref_list") or [] if r.get("ref") == event["handle"]
+            ]
+            state["refs"] = len(refs)
+            if len(refs) != 1:
+                return False
+            ref, changed = refs[0], []
+            if role_name is not None and _type_string(ref.get("role")) != role_name:
+                changed.append(f"role {_type_string(ref.get('role')) or 'unset'} -> {role_name}")
+                ref["role"] = role_name
+            for given, value in (attributes or {}).items():
+                name = names.get(given) or given
+                attrs = ref.setdefault("attribute_list", [])
+                same = [
+                    a for a in attrs if _type_key(_type_string(a.get("type"))) == _type_key(name)
+                ]
+                if value is None:
+                    if same:
+                        ref["attribute_list"] = [a for a in attrs if not any(a is b for b in same)]
+                        changed.append(f"{_type_string(same[0].get('type'))} removed")
+                    continue
+                if not same:
+                    attrs.append({"_class": "Attribute", "type": name, "value": value})
+                    changed.append(f"{name} added")
+                    continue
+                if same[0].get("value") != value:
+                    same[0]["value"] = value
+                    changed.append(f"{_type_string(same[0].get('type'))} set")
+                if len(same) > 1:
+                    extra = same[1:]
+                    ref["attribute_list"] = [a for a in attrs if not any(a is b for b in extra)]
+                    changed.append(f"{len(extra)} more {name} removed")
+            return ", ".join(changed) if changed else False
+
+        result = await self._mutate(
+            "person", person_ref, edit, label="updated the event reference on"
+        )
+        if state["refs"] != 1:
+            who = f"Person {result.get('gramps_id')}"
+            return {
+                "error": "not_referenced" if not state["refs"] else "ambiguous_reference",
+                "message": (
+                    f"{who} does not reference event {event_label}; add_event_ref adds a reference."
+                    if not state["refs"]
+                    else f"{who} references event {event_label} {state['refs']} times, so "
+                    "which to change is unclear. detach_object(child_kind='event') removes "
+                    "them all; add_event_ref then adds one back."
+                )
+                + " Nothing was changed.",
+                **({"repaired": result["repaired"]} if result.get("repaired") else {}),
+            }
+        result.update({"event_handle": event["handle"], "event": event_label})
+        return _with_new_names(result, new_names)
+
+    async def _ref_attribute_names(
+        self, event_handle: str, given: list[str], allow_new_type: bool
+    ) -> tuple[dict[str, str], list[str]]:
+        """Spell attribute names for a reference to this event.
+
+        Matched like any type name (``docs/PITFALLS.md`` section 26): Gramps'
+        standard attribute names, the tree's custom ones, and -- since Gramps
+        keeps no list of the names used on event references (section 29) --
+        the names on every other reference to the same event. A name matching
+        none of them is accepted as new and reported; one close to a known
+        name is refused as a likely typo unless ``allow_new_type``.
+
+        Returns
+        -------
+        tuple
+            The spelling to write for each given name, and the names new to
+            all of those lists.
+        """
+        if not given:
+            return {}, []
+        types = await self.client.types()
+        holder = await self.client.get_object(
+            "event", event_handle, keys="handle,backlinks", backlinks=True
+        )
+        people = ((holder.get("backlinks") or {}).get("person") or [])[:_REF_NAME_SOURCES]
+        used: list[str] = []
+        if people:
+            for row in await self.client.list_objects(
+                "person", handles=list(people), keys="handle,event_ref_list"
+            ):
+                for ref in row.get("event_ref_list") or []:
+                    if ref.get("ref") == event_handle:
+                        used += [
+                            _type_string(a.get("type")) for a in ref.get("attribute_list") or []
+                        ]
+        types = {**types, "custom": {**(types.get("custom") or {}), "_event_refs": used}}
+        lists = (
+            "_event_refs",
+            *(f"{k}_attribute_types" for k in ("event", "person", "family", "media")),
+        )
+        known = {
+            _type_key(n): n
+            for n in [
+                *((types.get("default") or {}).get("attribute_types") or []),
+                *(n for key in lists for n in (types["custom"].get(key) or [])),
+            ]
+            if n
+        }
+        names: dict[str, str] = {}
+        new: list[str] = []
+        for name in given:
+            spelt = await self._canonical_type(
+                "attribute_types", name, True, types=types, custom_keys=lists
+            )
+            if _type_key(spelt) not in known:
+                close = difflib.get_close_matches(_type_key(spelt), list(known), n=2, cutoff=0.8)
+                if close and not allow_new_type:
+                    raise UnknownTypeError(
+                        f"{spelt!r} is not an attribute name on this event's references or in "
+                        f"this tree. Did you mean {' or '.join(repr(known[c]) for c in close)}? "
+                        "Pass allow_new_type=True to use it as written."
+                    )
+                new.append(spelt)
+            names[name] = spelt
+        return names, new
 
     async def delete_object(self, object_type: str, ref: str, carry_to: str | None = None) -> dict:
         """Delete an object by handle-or-gramps_id, without stranding evidence.
@@ -1229,7 +1439,7 @@ class GrampsService:
         self,
         father_ref: str | None,
         mother_ref: str | None,
-        child_refs: list[str] | None,
+        child_refs: list[str | ChildLink] | None,
         marriage: EventInput | None = None,
         relationship: str = "Married",
         require_citation: bool = True,
@@ -1241,8 +1451,9 @@ class GrampsService:
         ----------
         father_ref, mother_ref : str or None
             Handle or gramps_id of an existing person.
-        child_refs : list of str or None
-            Handles or gramps_ids of existing children.
+        child_refs : list of str or ChildLink, or None
+            Existing children: a handle or gramps_id is a birth child of both
+            parents; a :class:`ChildLink` says how each is related.
         marriage : EventInput, optional
             Marriage event to create and attach; type defaults to
             ``"Marriage"``.
@@ -1265,14 +1476,25 @@ class GrampsService:
         """
         father_handle = await self._resolve_handle("person", father_ref) if father_ref else None
         mother_handle = await self._resolve_handle("person", mother_ref) if mother_ref else None
-        child_handles = list(
-            dict.fromkeys([await self._resolve_handle("person", c) for c in (child_refs or [])])
-        )
+        vocabulary = await self.client.types()
+        child_refs_out: list[dict] = []
+        for entry in child_refs or []:
+            link = entry if isinstance(entry, ChildLink) else ChildLink(person=entry)
+            handle = await self._resolve_handle("person", link.person)
+            if any(c["ref"] == handle for c in child_refs_out):
+                continue
+            rels = {
+                key: await self._canonical_type(
+                    "child_reference_types", value, allow_new_type, types=vocabulary
+                )
+                for key, value in (("frel", link.frel), ("mrel", link.mrel))
+            }
+            child_refs_out.append({"_class": "ChildRef", "ref": handle, **rels})
 
         event_refs: list[dict] = []
         unsourced = False
         relationship = await self._canonical_type(
-            "family_relation_types", relationship, allow_new_type
+            "family_relation_types", relationship, allow_new_type, types=vocabulary
         )
         if marriage is not None:
             marriage.type = marriage.type or "Marriage"
@@ -1285,10 +1507,7 @@ class GrampsService:
             "type": relationship,
             "father_handle": father_handle,
             "mother_handle": mother_handle,
-            "child_ref_list": [
-                {"_class": "ChildRef", "ref": h, "frel": "Birth", "mrel": "Birth"}
-                for h in child_handles
-            ],
+            "child_ref_list": child_refs_out,
             "event_ref_list": event_refs,
         }
         created = await self.client.create_object("family", payload)
@@ -1413,6 +1632,12 @@ class GrampsService:
         The attach is re-read afterwards, because this write has been seen to
         report success without landing.
 
+        A 5xx is never taken at its word (TOOL-REQUESTS #28). The client
+        makes the note's handle, so a failed create is looked up: absent, the
+        error says nothing was written. A failed attach that left the target
+        as it was removes the new note again, so the call writes all or
+        nothing. Neither the server nor the tool limits a note's length.
+
         Parameters
         ----------
         target_ref : str or None
@@ -1429,6 +1654,11 @@ class GrampsService:
         dict
             Handle, gramps_id, what it attached to, and ``verified`` -- False
             when the attachment could not be demonstrated by re-reading.
+
+        Raises
+        ------
+        FailedWriteError
+            When the server answered a 5xx, saying what was written.
         """
         # Resolved first, so a bad target fails before an orphan note exists.
         target_handle = (
@@ -1449,12 +1679,20 @@ class GrampsService:
                 obj.setdefault("note_list", []).append(note_handle)
                 return "note attached"
 
-            result = await self._mutate(target_type, target_handle, edit, label="noted")
+            try:
+                result = await self._mutate(target_type, target_handle, edit, label="noted")
+            except FailedWriteError as exc:
+                raise await self._unattached_note(note, target_type, exc) from exc
             attached_to = result.get("gramps_id")
             verified = await self._verify_in_list(
                 target_type, target_handle, "note_list", note_handle
             )
         message = f"Created {note_type} note"
+        if note.get("late_error"):
+            message += (
+                f" (the server answered HTTP {note['late_error']} after creating it; "
+                "a re-read found it)"
+            )
         if attached_to:
             message += (
                 f", attached to {target_type} {attached_to}"
@@ -1470,6 +1708,36 @@ class GrampsService:
             "verified": verified,
             "message": message,
         }
+
+    async def _unattached_note(
+        self, note: dict, target_type: str, exc: FailedWriteError
+    ) -> FailedWriteError:
+        """Account for a note created whose attach answered 5xx.
+
+        When the target was left as it was, the note is removed again, so the
+        call wrote nothing; when the target changed, the attach may have
+        landed and the note is kept.
+        """
+        label = note.get("gramps_id") or note["handle"]
+        if exc.written is False:
+            try:
+                await self.client.delete_object("note", note["handle"])
+                what = f"the {target_type} was left as it was, and the new note was removed again"
+            except GrampsApiError:
+                logger.warning("could not remove unattached note %s", note["handle"])
+                return FailedWriteError(
+                    exc,
+                    None,
+                    f"note {label} was created but not attached, and could not be removed "
+                    "again: attach it by retrying, or delete it with delete_object",
+                )
+            return FailedWriteError(exc, False, what)
+        return FailedWriteError(
+            exc,
+            None,
+            f"note {label} was created; whether it was attached is unknown, because the "
+            f"{target_type} changed meanwhile",
+        )
 
     async def attach_media(
         self,
@@ -2502,6 +2770,320 @@ class GrampsService:
         result["child"] = child_ref
         return result
 
+    async def set_family_parent(
+        self,
+        family_ref: str,
+        role: str,
+        person_ref: str | None = None,
+        replace: bool = False,
+    ) -> dict:
+        """Set, replace or remove the father or mother of an existing family.
+
+        Both sides of each link are kept. Writing the family makes the server
+        take the family off the old parent and add it to the new one
+        (``docs/PITFALLS.md`` section 15), with two defects handled here: it
+        appends to the new parent's ``family_list`` without looking, so a
+        family the person already listed would be listed twice; and it takes
+        the family off the old parent with ``list.remove``, which refuses the
+        write (400) when the old parent does not list it and leaves a second
+        entry when they list it twice. So an old parent's missing link is
+        restored first, and both people are written afterwards to hold the
+        family exactly once, or not at all.
+
+        Parameters
+        ----------
+        family_ref : str
+            Handle or gramps_id of the family.
+        role : str
+            ``"father"`` or ``"mother"``.
+        person_ref : str, optional
+            The new parent. None removes the parent in that role.
+        replace : bool, optional
+            Put the person in place of a different parent the role already
+            has; refused otherwise, naming that parent.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id, the parent before and after, and a message, or
+            an ``error`` key.
+        """
+        key = f"{role}_handle"
+        other = "mother" if role == "father" else "father"
+        family = await self._resolve("family", family_ref)
+        family_handle = family["handle"]
+        label = family.get("gramps_id") or family_handle
+        new = await self._resolve("person", person_ref) if person_ref else None
+        new_handle = new["handle"] if new else ""
+        old_handle = family.get(key) or ""
+        old = None
+        if old_handle:
+            with contextlib.suppress(NotFoundError):
+                old = await self._resolve("person", old_handle)
+        old_label = (old or {}).get("gramps_id") or old_handle or None
+        new_label = (new or {}).get("gramps_id") or new_handle or None
+        if old_handle == new_handle:
+            return {
+                "handle": family_handle,
+                "gramps_id": family.get("gramps_id"),
+                "object_type": "family",
+                "changed": False,
+                "message": f"Family {label} already has "
+                + (f"{new_label} as its {role}" if new_handle else f"no {role}")
+                + "; nothing changed.",
+            }
+        if new_handle and new_handle == family.get(f"{other}_handle"):
+            return {
+                "error": "already_a_parent",
+                "message": f"{new_label} is the {other} of family {label}; nothing changed.",
+            }
+        if new_handle and any(
+            c.get("ref") == new_handle for c in family.get("child_ref_list") or []
+        ):
+            return {
+                "error": "child_of_family",
+                "message": f"{new_label} is a child of family {label}, so cannot be its "
+                f"{role}; nothing changed.",
+            }
+        if old_handle and new_handle and not replace:
+            return {
+                "error": "parent_already_set",
+                "message": f"Family {label} already has a {role}, {old_label} "
+                f"({_name_from_person(old) if old else 'a person who no longer exists'}). "
+                f"Pass replace=True to put {new_label} in their place, or set_family_parent "
+                f"without a person to remove them; nothing changed.",
+            }
+        repairs: list[str] = []
+        if old is not None and family_handle not in (old.get("family_list") or []):
+            # The server's list.remove would refuse the family write.
+
+            def restore(person: dict) -> str:
+                person.setdefault("family_list", []).append(family_handle)
+                return "link to the family restored, for the server to remove"
+
+            await self._mutate("person", old_handle, restore, label="linked")
+            repairs.append(f"restored {old_label}'s missing link, so the server could remove it")
+
+        def edit(fam: dict) -> str | bool:
+            if (fam.get(key) or "") != old_handle:
+                raise _ConcurrentChange(f"the {role} of family {label} changed meanwhile")
+            fam[key] = new_handle
+            return f"{role} {old_label or 'none'} -> {new_label or 'none'}"
+
+        result = await self._mutate("family", family_handle, edit, label="updated")
+        if new_handle:
+
+            def link(person: dict) -> str | bool:
+                listed = person.setdefault("family_list", [])
+                if family_handle in listed:
+                    return False  # _normalize drops a second entry
+                listed.append(family_handle)
+                return "link to the family added"
+
+            if (await self._mutate("person", new_handle, link, label="linked")).get("changed"):
+                repairs.append(f"{new_label} now lists the family once")
+        if old is not None:
+
+            def unlink(person: dict) -> str | bool:
+                links = person.get("family_list") or []
+                kept = [f for f in links if f != family_handle]
+                if len(kept) == len(links):
+                    return False
+                person["family_list"] = kept
+                return "remaining link to the family removed"
+
+            if (await self._mutate("person", old_handle, unlink, label="unlinked")).get("changed"):
+                repairs.append(f"removed {old_label}'s remaining link to the family")
+        out = {
+            "handle": family_handle,
+            "gramps_id": family.get("gramps_id"),
+            "object_type": "family",
+            "changed": True,
+            "role": role,
+            "parent": new_label,
+            "previous": old_label,
+            "message": result["message"] + (f" ({'; '.join(repairs)})" if repairs else ""),
+        }
+        gender = (new or {}).get("gender")
+        if (role, gender) in (("father", 0), ("mother", 1)):
+            out["warning"] = (
+                f"{new_label} is recorded as {'female' if gender == 0 else 'male'}, and is "
+                f"now this family's {role}."
+            )
+        return out
+
+    async def move_child(
+        self,
+        child_ref: str,
+        from_family_ref: str,
+        to_family_ref: str,
+        frel: str | None = None,
+        mrel: str | None = None,
+        allow_new_type: bool = False,
+    ) -> dict:
+        """Move a child from one family to another, keeping the link's evidence.
+
+        The ChildRef moves whole: its citations, notes and privacy, and its
+        relationships unless ``frel`` or ``mrel`` changes one. In the new
+        family it goes into birth order, before the first sibling born after
+        the child; an undated child goes last. The new family is written
+        first, so a failure part-way leaves the child in both families rather
+        than in neither. Then every link from the child to the old family is
+        removed (a duplicated one too, ``docs/PITFALLS.md`` section 15), and
+        the new family takes the old one's place in the child's own list,
+        whose first entry Gramps reads as the main parents.
+
+        Parameters
+        ----------
+        child_ref : str
+            Handle or gramps_id of the child.
+        from_family_ref, to_family_ref : str
+            Handles or gramps_ids of the families.
+        frel, mrel : str, optional
+            A new relationship to the father or mother; omitted, kept.
+
+        Returns
+        -------
+        dict
+            The child, both families, the child's position and the new
+            family's children in order, or an ``error`` key.
+        """
+        child = await self._resolve("person", child_ref)
+        child_handle = child["handle"]
+        child_label = child.get("gramps_id") or child_handle
+        source = await self._resolve("family", from_family_ref)
+        target = await self._resolve("family", to_family_ref)
+        source_label = source.get("gramps_id") or source["handle"]
+        target_label = target.get("gramps_id") or target["handle"]
+        if source["handle"] == target["handle"]:
+            return {
+                "error": "same_family",
+                "message": "from_family and to_family are the same family; update_child_ref "
+                "changes a child's relationships in place.",
+            }
+        refs = [c for c in source.get("child_ref_list") or [] if c.get("ref") == child_handle]
+        if not refs:
+            return {
+                "error": "not_a_child",
+                "message": f"{child_label} is not a child of family {source_label}; "
+                "add_child_to_family adds a child.",
+            }
+        if any(c.get("ref") == child_handle for c in target.get("child_ref_list") or []):
+            return {
+                "error": "already_a_child",
+                "message": f"{child_label} is already a child of family {target_label}. "
+                f"detach_object(parent_type='family', parent='{source_label}', "
+                f"child_kind='child', child='{child_label}') takes them out of the other.",
+            }
+        if child_handle in (target.get("father_handle"), target.get("mother_handle")):
+            return {
+                "error": "parent_of_family",
+                "message": f"{child_label} is a parent in family {target_label}, so cannot be "
+                "its child.",
+            }
+        moved = copy.deepcopy(refs[0])
+        for extra in refs[1:]:  # a child listed twice keeps the evidence of both
+            for key in ("citation_list", "note_list"):
+                held = moved.setdefault(key, [])
+                held += [h for h in extra.get(key) or [] if h not in held]
+        vocabulary = await self.client.types()
+        for key, value in (("frel", frel), ("mrel", mrel)):
+            if value is not None:
+                moved[key] = await self._canonical_type(
+                    "child_reference_types", value, allow_new_type, types=vocabulary
+                )
+        births = await self._birth_sortvals(
+            [c.get("ref") for c in target.get("child_ref_list") or []] + [child_handle]
+        )
+        placed: dict[str, Any] = {}
+
+        def add(fam: dict) -> str | bool:
+            crefs = fam.setdefault("child_ref_list", [])
+            if any(c.get("ref") == child_handle for c in crefs):
+                return False
+            index = _birth_position(crefs, births, child_handle)
+            crefs.insert(index, moved)
+            placed.update(position=index + 1, order=[c.get("ref") for c in crefs])
+            return f"child {child_label} added, {index + 1} of {len(crefs)} in birth order"
+
+        await self._mutate("family", target["handle"], add, label="updated")
+        if not placed:
+            raise _ConcurrentChange(f"{child_label} was added to {target_label} meanwhile")
+
+        def remove(fam: dict) -> str | bool:
+            crefs = fam.get("child_ref_list") or []
+            kept = [c for c in crefs if c.get("ref") != child_handle]
+            if len(kept) == len(crefs):
+                return False
+            fam["child_ref_list"] = kept
+            return f"child {child_label} removed"
+
+        try:
+            await self._mutate("family", source["handle"], remove, label="updated")
+        except Exception as exc:  # noqa: BLE001 - reported with the half that landed
+            return {
+                "error": "partly_moved",
+                "message": f"{child_label} was added to family {target_label} with the link's "
+                f"evidence, but could not be taken out of {source_label} ({exc}). Finish with "
+                f"detach_object(parent_type='family', parent='{source_label}', "
+                f"child_kind='child', child='{child_label}').",
+            }
+        before = child.get("parent_family_list") or []
+        slot = before.index(source["handle"]) if source["handle"] in before else len(before)
+
+        def settle(person: dict) -> str | bool:
+            links = person.get("parent_family_list") or []
+            others = [f for f in links if f not in (source["handle"], target["handle"])]
+            wanted = others[:slot] + [target["handle"]] + others[slot:]
+            if links == wanted:
+                return False
+            person["parent_family_list"] = wanted
+            return "links to the families settled"
+
+        settled = await self._mutate("person", child_handle, settle, label="linked")
+        ids = {
+            row["handle"]: row.get("gramps_id")
+            for row in await self.client.list_objects(
+                "person", handles=[h for h in placed["order"] if h], keys="handle,gramps_id"
+            )
+        }
+        out = {
+            "handle": child_handle,
+            "gramps_id": child.get("gramps_id"),
+            "object_type": "person",
+            "changed": True,
+            "from_family": source_label,
+            "to_family": target_label,
+            "frel": _type_string(moved.get("frel")),
+            "mrel": _type_string(moved.get("mrel")),
+            "kept": {
+                "citations": len(moved.get("citation_list") or []),
+                "notes": len(moved.get("note_list") or []),
+            },
+            "position": placed["position"],
+            "children": [ids.get(h) or h for h in placed["order"]],
+            "message": f"Moved {child_label} from family {source_label} to {target_label}, "
+            f"{placed['position']} of {len(placed['order'])} in birth order, with the link's "
+            f"{len(moved.get('citation_list') or [])} citation(s) and "
+            f"{len(moved.get('note_list') or [])} note(s)",
+        }
+        if settled.get("changed"):
+            out["message"] += f"; {child_label}'s own links settled"
+        return _with_repairs(out, settled)
+
+    async def _birth_sortvals(self, handles: list[str | None]) -> dict[str, int]:
+        """Each person's birth date as a day number, 0 when undated, in one query."""
+        wanted = list(dict.fromkeys(h for h in handles if h))
+        rows, _, _ = await self.client.structured_query(
+            "person",
+            {
+                "select": ["handle", {"json_path": ["birth", "date", "sortval"], "as": "sortval"}],
+                "where": [{"column": "handle", "op": "in", "value": wanted}],
+                "limit": len(wanted),
+            },
+        )
+        return {row.get("handle"): row.get("sortval") or 0 for row in rows}
+
     async def check_family_links(self, limit: int = 200) -> dict:
         """Audit the links between people and families, in both directions.
 
@@ -3181,6 +3763,7 @@ class GrampsService:
         # stored. Writing them back would persist a snapshot of derived data.
         for computed in ("profile", "extended", "backlinks"):
             obj.pop(computed, None)
+        before = copy.deepcopy(obj)
         result = fn(obj)
         repaired = _normalize(object_type, obj)
         label_id = obj.get("gramps_id") or obj["handle"]
@@ -3192,7 +3775,12 @@ class GrampsService:
                 "changed": False,
                 "message": f"No change needed on {object_type} {label_id}",
             }
-        await self.client.update_object(object_type, obj["handle"], obj)
+        try:
+            await self.client.update_object(object_type, obj["handle"], obj)
+        except GrampsApiError as exc:
+            if exc.status < 500:
+                raise
+            raise await self._failed_write(object_type, before, exc) from exc
         logger.info("%s %s %s", label, object_type, obj.get("gramps_id"))
         if result is False:
             message = f"Repaired {object_type} {label_id}: {'; '.join(repaired)}"
@@ -3212,6 +3800,25 @@ class GrampsService:
         if repaired:
             out["repaired"] = repaired
         return out
+
+    async def _failed_write(self, object_type: str, before: dict, exc: GrampsApiError) -> Exception:
+        """Say what a PUT answered with a 5xx did, from a fresh read.
+
+        The record read again exactly as it was read for the write means
+        nothing was written; anything else means the write may have landed --
+        or another session wrote meanwhile (``docs/PITFALLS.md`` sections 6
+        and 17).
+        """
+        label = f"{object_type} {before.get('gramps_id') or before['handle']}"
+        try:
+            again = await self.client.get_object(object_type, before["handle"])
+        except GrampsApiError:
+            return FailedWriteError(exc, None, f"{label} could not be read again afterwards")
+        for computed in ("profile", "extended", "backlinks"):
+            again.pop(computed, None)
+        if again == before:
+            return FailedWriteError(exc, False, f"{label} reads exactly as it did before")
+        return FailedWriteError(exc, None, f"{label} has changed since it was read")
 
     async def _verify_in_list(
         self, object_type: str, handle: str, list_key: str, needle: str
@@ -4762,7 +5369,7 @@ class GrampsService:
             how = "detach_object(parent_type='family', child_kind='child')"
         else:
             held = person_handle in (family.get("father_handle"), family.get("mother_handle"))
-            how = "Gramps Web, where the family's parents are set"
+            how = "set_family_parent without a person removes a parent"
         if held:
             return (
                 {
@@ -4939,8 +5546,17 @@ class GrampsService:
             )
         return {"count": len(rows), "transactions": rows}
 
-    async def record_history(self, object_type: str, ref: str, limit: int = 20) -> dict:
+    async def record_history(
+        self, object_type: str, ref: str, limit: int = 20, field: str | None = None
+    ) -> dict:
         """Who added, edited or deleted one record, and when, newest first.
+
+        gramps-webapi 3.22 serves one record's changes. 3.21 does not, but
+        its transaction log names the record each change touched, so there
+        the log is read instead, newest first, until the record's creation
+        (TOOL-REQUESTS #29): slow on a large log, and the result says it was
+        used. A record deleted and later restored by an undo is read back to
+        the restore.
 
         Parameters
         ----------
@@ -4951,6 +5567,11 @@ class GrampsService:
             so its history is reached by handle.
         limit : int, optional
             The most recent changes to return.
+        field : str, optional
+            A field of the stored record, dotted for a nested one
+            (``parent_family_list``, ``primary_name.first_name``): only the
+            changes that changed its value are reported, each with the value
+            before and after.
 
         Returns
         -------
@@ -4962,8 +5583,6 @@ class GrampsService:
         ------
         NotFoundError
             If the record neither exists nor has any history.
-        UnsupportedServerError
-            On a gramps-webapi older than 3.22.
         """
         if object_type not in ENDPOINTS:
             return {
@@ -4971,31 +5590,64 @@ class GrampsService:
                 "message": f"Unknown object type {object_type!r}. "
                 f"Known: {', '.join(sorted(ENDPOINTS))}.",
             }
+        path = _field_path(field) if field else None
+        if field and not path:
+            return {
+                "error": "unsupported_field",
+                "message": f"{field!r} is not a field path: name a field of the stored "
+                "record, dotted for a nested one, e.g. 'parent_family_list' or "
+                "'primary_name.first_name'.",
+            }
         try:
             obj = await self._resolve(object_type, ref)
             handle, gramps_id = obj["handle"], obj.get("gramps_id")
         except NotFoundError:
             handle, gramps_id = ref, None
-        changes, total = await self.client.object_history(
-            object_type, handle, pagesize=max(1, min(limit, 200))
-        )
+        from_log: dict | None = None
+        try:
+            if path is None:
+                changes, total = await self.client.object_history(
+                    object_type, handle, pagesize=max(1, min(limit, 200))
+                )
+            else:
+                # A change no transaction covers is a write rolled back at its
+                # commit (docs/PITFALLS.md sections 6 and 30): it did not happen.
+                changes = [
+                    c
+                    for c in await self._all_object_changes(object_type, handle)
+                    if c.get("transaction_id") is not None
+                ]
+                total = len(changes)
+        except UnsupportedServerError:
+            changes, from_log = await self._changes_from_log(
+                object_type, handle, with_states=path is not None
+            )
+            total = len(changes)
         if gramps_id is None and not changes:
             raise NotFoundError(
                 f"No {object_type} '{ref}' exists, and no history is recorded under that "
                 "handle. A deleted record's history is found by its handle, not its gramps_id."
             )
         kinds = {0: "added", 1: "edited", 2: "deleted"}
-        rows = [
-            {
+        rows = []
+        for c in changes:
+            row = {
                 "change": kinds.get(c.get("trans_type"), str(c.get("trans_type"))),
                 "transaction_id": c.get("transaction_id"),
                 "user": ((c.get("connection") or {}).get("user") or {}).get("name"),
                 "timestamp": _iso_from_epoch(c.get("timestamp")),
             }
-            for c in changes
-        ]
+            if path is not None:
+                before = _value_at(c.get("old_data"), path)
+                after = _value_at(c.get("new_data"), path)
+                if before == after or (_blank(before) and _blank(after)):
+                    continue
+                row.update({"before": before, "after": after})
+            rows.append(row)
+        found = len(rows)
+        rows = rows[: max(1, min(limit, 200))]
         label = gramps_id or handle
-        return {
+        out = {
             "object_type": object_type,
             "gramps_id": gramps_id,
             "handle": handle,
@@ -5003,10 +5655,120 @@ class GrampsService:
             "total_changes": total,
             "returned": len(rows),
             "changes": rows,
-            "message": f"{total} change(s) to {object_type} {label}"
-            + (", which has since been deleted" if gramps_id is None else "")
-            + ". get_transaction shows what a transaction changed.",
         }
+        message = f"{total} change(s) to {object_type} {label}" + (
+            ", which has since been deleted" if gramps_id is None else ""
+        )
+        if unrecorded := sum(1 for row in rows if row["transaction_id"] is None):
+            message += (
+                f"; {unrecorded} shown with no transaction was a write rolled back at its "
+                "commit, and changed nothing"
+            )
+        if path is not None:
+            out.update({"field": field, "field_changes": found})
+            message += (
+                f"; {found} of them changed {field}, each shown with its value before and after"
+                if found
+                else f"; none changed {field}. A field the record has never had matches "
+                "nothing: get_object shows the record's fields"
+            )
+        out["read_from"] = "record history" if from_log is None else "transaction log"
+        if from_log is not None:
+            out["log_complete"] = from_log["complete"]
+            message += (
+                ". Read from the whole transaction log, newest first"
+                + (
+                    ", back to the record's creation"
+                    if from_log["created"]
+                    else " to its start"
+                    if from_log["complete"]
+                    else f", stopping after {from_log['scanned']} transactions; older "
+                    "changes were not read"
+                )
+                + ": gramps-webapi 3.21 has no per-record history (3.22 has), so this is "
+                "slow on a large log"
+            )
+        out["message"] = message + ". get_transaction shows what a transaction changed."
+        return out
+
+    async def _all_object_changes(self, object_type: str, handle: str) -> list[dict]:
+        """Every change to one record, newest first, with its states before and after."""
+        changes: list[dict] = []
+        page = 1
+        while True:
+            batch, total = await self.client.object_history(
+                object_type, handle, page=page, pagesize=_HISTORY_PAGE, old=True, new=True
+            )
+            changes += batch
+            if not batch or len(changes) >= total:
+                return changes
+            page += 1
+
+    async def _changes_from_log(
+        self, object_type: str, handle: str, *, with_states: bool = False
+    ) -> tuple[list[dict], dict]:
+        """One record's changes found in the whole transaction log, newest first.
+
+        For gramps-webapi 3.21, which has no per-record history. Pages through
+        ``/api/transactions/history/`` with the ``before_id`` cursor, which a
+        write meanwhile cannot shift, keeping each change whose class and
+        ``obj_handle`` are the record's; a reference change (class ``7``)
+        names the record too, and is skipped. Stops at the record's creation
+        -- an add not made by an undo -- or after
+        :data:`_HISTORY_SCAN_LIMIT` transactions.
+
+        Returns
+        -------
+        tuple
+            The changes, shaped as 3.22's per-record history serves them,
+            and how the log was read: ``complete``, ``created``, ``scanned``.
+        """
+        cls = _CLASS_NAMES[object_type]
+        found: list[dict] = []
+        scanned, before_id, created = 0, None, False
+        while True:
+            page = await self.client.transactions(
+                page=1, pagesize=_HISTORY_PAGE, sort="-id", before_id=before_id
+            )
+            for txn in page:
+                hits = [
+                    change
+                    for change in txn.get("changes") or []
+                    if change.get("obj_class") == cls and change.get("obj_handle") == handle
+                ]
+                for change in sorted(hits, key=lambda c: c.get("id") or 0, reverse=True):
+                    found.append(
+                        {
+                            **change,
+                            "transaction_id": txn.get("id"),
+                            "connection": txn.get("connection"),
+                        }
+                    )
+                    undo = str(txn.get("description") or "").lstrip("_").lower()
+                    created = created or (
+                        change.get("trans_type") == 0 and not undo.startswith("undo")
+                    )
+            scanned += len(page)
+            complete = created or len(page) < _HISTORY_PAGE
+            if complete or scanned >= _HISTORY_SCAN_LIMIT:
+                break
+            before_id = page[-1].get("id")
+        if with_states:
+            for change in found:
+                txn = await self.client.transaction(change["transaction_id"], old=True, new=True)
+                full = next(
+                    (
+                        c
+                        for c in txn.get("changes") or []
+                        if c.get("obj_class") == cls
+                        and c.get("obj_handle") == handle
+                        and c.get("id") == change.get("id")
+                    ),
+                    {},
+                )
+                change["old_data"] = full.get("old_data")
+                change["new_data"] = full.get("new_data")
+        return found, {"complete": complete, "created": created, "scanned": scanned}
 
     async def undo_transaction(
         self,
@@ -6936,6 +7698,48 @@ def _object_label(object_type: str, obj: dict) -> str:
     return obj.get("gramps_id") or obj.get("handle", "")
 
 
+_FIELD_STEP = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+
+
+def _field_path(field: str) -> list[str | int] | None:
+    """Split a dotted field path, ``primary_name.surname_list.0.surname``; None if malformed."""
+    steps = str(field).strip().split(".")
+    if not all(_FIELD_STEP.fullmatch(step) for step in steps):
+        return None
+    return [int(step) if step.isdigit() else step for step in steps]
+
+
+def _value_at(data: Any, path: list[str | int]) -> Any:
+    """The value at a field path of a stored record, without ``_class`` keys.
+
+    None when the record is absent (an add has no state before it, a delete
+    none after) or the path leads nowhere.
+    """
+    node = data if isinstance(data, dict) and data else None
+    for step in path:
+        if isinstance(step, int) and isinstance(node, list) and -len(node) <= step < len(node):
+            node = node[step]
+        elif isinstance(step, str) and isinstance(node, dict):
+            node = node.get(step)
+        else:
+            return None
+    return _unclassed(node)
+
+
+def _unclassed(value: Any) -> Any:
+    """A stored value with Gramps' ``_class`` keys removed, at any depth."""
+    if isinstance(value, dict):
+        return {k: _unclassed(v) for k, v in value.items() if k != "_class"}
+    if isinstance(value, list):
+        return [_unclassed(v) for v in value]
+    return value
+
+
+def _blank(value: Any) -> bool:
+    """No value: absent, or an empty string, list or object."""
+    return value is None or value == "" or value == [] or value == {}
+
+
 def _iso_from_epoch(value: Any) -> str | None:
     """Format a Unix timestamp as an ISO-8601 UTC string, or None."""
     if not isinstance(value, int | float):
@@ -7557,6 +8361,33 @@ def _is_unknown_type(value: Any) -> bool:
     if isinstance(value, dict):
         return not value.get("string") and value.get("value") in (None, -1)
     return str(value).strip().lower() == "unknown"
+
+
+class _ConcurrentChange(RuntimeError):
+    """Another session changed what a multi-step write had read."""
+
+
+def _birth_position(crefs: list[dict], births: dict[str, int], child: str) -> int:
+    """Where a child goes among siblings: before the first born after it; last if undated."""
+    mine = births.get(child) or 0
+    if not mine:
+        return len(crefs)
+    for index, cref in enumerate(crefs):
+        theirs = births.get(cref.get("ref")) or 0
+        if theirs > mine:
+            return index
+    return len(crefs)
+
+
+def _with_new_names(result: dict, new_names: list[str]) -> dict:
+    """Say which attribute names a reference write used for the first time."""
+    if new_names:
+        result["new_attribute_names"] = new_names
+        result["message"] += (
+            f" ({', '.join(repr(n) for n in new_names)} used nowhere else on this event or "
+            "in the tree: check the spelling)"
+        )
+    return result
 
 
 def _with_repairs(out: dict, result: dict) -> dict:

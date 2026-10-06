@@ -141,3 +141,57 @@ async def test_from_3_23_a_key_the_class_lacks_is_refused_at_any_depth(service, 
     with pytest.raises(GrampsApiError) as exc:
         await service.client.update_object("place", kept["handle"], served)
     assert exc.value.status == 400
+
+
+async def test_a_handle_the_request_makes_is_kept_and_not_reused(service, fake):
+    """PITFALLS 28: what lets a create answered with a 5xx be looked up."""
+    made = await service.client.create_object(
+        "note", {"_class": "Note", "handle": "made-by-the-client", "text": {"string": "x"}}
+    )
+    assert made["handle"] == "made-by-the-client"
+    assert "made-by-the-client" in fake.store["note"]
+    with pytest.raises(GrampsApiError) as exc:
+        await service.client.create_object(
+            "note", {"_class": "Note", "handle": "made-by-the-client", "text": {"string": "y"}}
+        )
+    assert exc.value.status == 400
+    assert fake.store["note"]["made-by-the-client"]["text"]["string"] == "x"
+
+
+async def test_a_parent_change_the_server_cannot_cascade_is_refused(service, fake):
+    """PITFALLS 15: the old parent must list the family, for list.remove to take it off."""
+    client = service.client
+    mother = await client.create_object("person", {"_class": "Person"})
+    other = await client.create_object("person", {"_class": "Person"})
+    family = await client.create_object(
+        "family", {"_class": "Family", "mother_handle": mother["handle"]}
+    )
+    fake.store["person"][mother["handle"]]["family_list"] = []
+    stored = await client.get_object("family", family["handle"])
+    stored["mother_handle"] = other["handle"]
+    with pytest.raises(GrampsApiError) as exc:
+        await client.update_object("family", family["handle"], stored)
+    assert exc.value.status == 400
+    assert fake.store["family"][family["handle"]]["mother_handle"] == mother["handle"]
+    assert fake.store["person"][other["handle"]].get("family_list") in (None, [])
+
+
+async def test_the_log_pages_by_cursor_and_serves_states_when_asked(service, fake):
+    """3.21's /api/transactions/history/: what get_record_history reads there."""
+    client = service.client
+    made = await client.create_object("person", {"_class": "Person", "gender": 2})
+    person = await client.get_object("person", made["handle"])
+    person["gender"] = 1
+    await client.update_object("person", made["handle"], person)
+    await client.create_object("note", {"_class": "Note", "text": {"string": "x"}})
+    newest = await client.transactions(page=1, pagesize=2, sort="-id")
+    assert [t["id"] for t in newest] == [3, 2]
+    assert [t["description"] for t in newest] == ["New Note", "Edit Person"]
+    assert "old_data" not in newest[1]["changes"][0]
+    older = await client.transactions(page=1, pagesize=2, sort="-id", before_id=2)
+    assert [t["id"] for t in older] == [1]
+    edit = await client.transaction(2, old=True, new=True)
+    (change,) = edit["changes"]
+    assert (change["old_data"]["gender"], change["new_data"]["gender"]) == (2, 1)
+    created = await client.transaction(1, old=True, new=True)
+    assert created["changes"][0]["old_data"] == {}

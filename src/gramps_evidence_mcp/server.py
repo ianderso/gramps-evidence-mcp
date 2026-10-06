@@ -17,7 +17,7 @@ import inspect
 import json
 import logging
 import traceback
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from mcp.server import MCPServer
@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from . import __version__
 from .client import (
     ENDPOINTS,
+    FailedWriteError,
     GrampsApiError,
     GrampsWebClient,
     InvalidIdentifierError,
@@ -35,6 +36,7 @@ from .client import (
 from .config import Config, ConfigError, load_config, transport_settings
 from .gedcom_ref import ReferenceLibrary
 from .models import (
+    ChildLink,
     CitationEdit,
     CitationInput,
     Confidence,
@@ -171,6 +173,9 @@ def _error(exc: Exception) -> dict:
         return {"error": "invalid_carry_to", "message": str(exc)}
     if isinstance(exc, UnsupportedServerError):
         return {"error": "unsupported_server", "message": str(exc)}
+    if isinstance(exc, FailedWriteError):
+        # A 5xx from a write, and what a re-read showed it did (TOOL-REQUESTS #28).
+        return {"error": "api", "status": exc.status, "written": exc.written, "message": exc.detail}
     if isinstance(exc, GrampsApiError):
         hint = ""
         if exc.status in (401, 403):
@@ -300,7 +305,11 @@ async def add_event_to_person(
 async def add_family(
     father: str | None = Field(default=None, description="Father: handle or gramps_id."),
     mother: str | None = Field(default=None, description="Mother: handle or gramps_id."),
-    children: list[str] | None = Field(default=None, description="Child handles or gramps_ids."),
+    children: list[str | ChildLink] | None = Field(
+        default=None,
+        description="Children: handles or gramps_ids, each a birth child of both parents, or "
+        "{person, frel, mrel} for a stepchild, adopted or foster child.",
+    ),
     marriage: VitalEventInput | None = Field(
         default=None,
         description="Optional marriage event; type defaults to 'Marriage'. Cite it.",
@@ -436,6 +445,7 @@ async def add_note(
 
     Use notes for research logs, reasoning about conflicting evidence, or
     transcriptions. Attach to a person/event/source by giving target + target_type.
+    Any length is written in one call; a server error says whether anything was.
     """
     try:
         svc = await state.service_()
@@ -577,18 +587,45 @@ async def add_event_ref(
         description="The person's role in it: 'Primary', 'Witness', 'Informant', "
         "'Godparent', 'Family', 'Clergy', or a custom role the tree already has.",
     ),
+    attributes: dict[str, str] | None = Field(
+        default=None,
+        description="Attributes of this person's reference: what is theirs alone, e.g. "
+        "{'As enumerated': '<their line on the sheet>', 'Age': '34'}. A name is matched "
+        "against standard names, the tree's, and those on the event's other references.",
+    ),
     allow_new_type: bool = _allow_new_type(),
 ) -> dict:
     """Share an existing event with another person, in a role.
 
     For one census entry, residence or burial that several people took part in:
     each references the same event, so its citations and later corrections serve
-    all of them. Refused if the person already has it. A new fact is
-    add_event_to_person.
+    all of them. Refused if the person already has it; update_event_ref edits
+    that reference. A new fact is add_event_to_person.
     """
     try:
         svc = await state.service_()
-        return await svc.add_event_ref(person, event, role, allow_new_type)
+        return await svc.add_event_ref(person, event, role, allow_new_type, attributes)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def update_event_ref(
+    person: str = Field(description="Handle or gramps_id of the person."),
+    event: str = Field(description="Handle or gramps_id of the event they reference."),
+    role: str | None = Field(default=None, description="New role, e.g. 'Witness'. Omit to keep."),
+    attributes: dict[str, str | None] | None = Field(
+        default=None,
+        description="Attribute name to new value; null removes it. The first of a name is "
+        "set in place, keeping its citations; a name the reference lacks is added.",
+    ),
+    allow_new_type: bool = _allow_new_type(),
+) -> dict:
+    """Change a person's reference to a shared event in place: its role, or
+    attributes such as 'As enumerated' or 'Age'."""
+    try:
+        svc = await state.service_()
+        return await svc.update_event_ref(person, event, role, attributes, allow_new_type)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -924,6 +961,52 @@ async def update_child_ref(
         svc = await state.service_()
         return await svc.update_child_ref(
             family, child, frel=frel, mrel=mrel, allow_new_type=allow_new_type
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def set_family_parent(
+    family: str = Field(description="Family handle or gramps_id (e.g. 'F0001')."),
+    role: Literal["father", "mother"] = Field(description="Which parent to set."),
+    person: str | None = Field(
+        default=None, description="The parent's handle or gramps_id. Omit to remove the parent."
+    ),
+    replace: bool = Field(
+        default=False,
+        description="Replace a different parent the role already has; refused otherwise.",
+    ),
+) -> dict:
+    """Set, replace or remove the father or mother of an existing family -- the wife
+    a record names -- keeping both sides of every link, children and all."""
+    try:
+        svc = await state.service_()
+        return await svc.set_family_parent(family, role, person, replace=replace)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def move_child(
+    child: str = Field(description="The child's handle or gramps_id."),
+    from_family: str = Field(description="The family the child is in now."),
+    to_family: str = Field(description="The family to move them to."),
+    frel: str | None = Field(
+        default=None, description="New relationship to the father, e.g. 'Stepchild'. Omit to keep."
+    ),
+    mrel: str | None = Field(
+        default=None, description="New relationship to the mother. Omit to keep."
+    ),
+    allow_new_type: bool = _allow_new_type(),
+) -> dict:
+    """Move a child to another family with the link's citations and notes, placed
+    in birth order. Detaching and re-adding loses both. The new family is written
+    first: a failure leaves the child in both, never in neither."""
+    try:
+        svc = await state.service_()
+        return await svc.move_child(
+            child, from_family, to_family, frel=frel, mrel=mrel, allow_new_type=allow_new_type
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
@@ -2271,15 +2354,21 @@ async def get_record_history(
     ),
     ref: str = Field(description="Handle or gramps_id. A deleted record by its handle."),
     limit: int = Field(default=20, ge=1, le=200, description="Most recent changes to return."),
+    field: str | None = Field(
+        default=None,
+        description="Only the changes to this field of the stored record, each with its "
+        "value before and after: 'parent_family_list', 'primary_name.first_name'.",
+    ),
 ) -> dict:
     """Who added, edited or deleted one record, and when, newest first.
 
     Each change names its transaction: get_transaction shows what it changed.
-    Needs gramps-webapi 3.22 or later.
+    Before gramps-webapi 3.22 the whole transaction log is read instead:
+    slower, and the result says so.
     """
     try:
         svc = await state.service_()
-        return await svc.record_history(object_type, ref, limit)
+        return await svc.record_history(object_type, ref, limit, field)
     except Exception as exc:  # noqa: BLE001 - surfaced as structured error
         return _error(exc)
 

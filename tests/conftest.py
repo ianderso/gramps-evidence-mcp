@@ -338,6 +338,15 @@ class FakeGramps:
         self.delete_error_before_commit: int | None = None
         #: When set, every PUT fails with this status and writes nothing.
         self.put_error: int | None = None
+        #: When set, a PUT writes and then answers this status, as a write
+        #: whose step after the commit fails does (PITFALLS 17).
+        self.put_error_after_commit: int | None = None
+        #: When set, every POST of one object fails with this status and
+        #: writes nothing, as a commit that waited out SQLite's lock does
+        #: (PITFALLS 6).
+        self.post_error: int | None = None
+        #: When set, a POST of one object writes and then answers this status.
+        self.post_error_after_commit: int | None = None
         #: When set, GET /api/metadata/ fails with this status, once.
         self.metadata_error: int | None = None
         self.event_type_map: dict[str, str] = {
@@ -381,8 +390,10 @@ class FakeGramps:
         if request.method in ("POST", "PUT", "DELETE") and "/token/" not in request.url.path:
             before = copy.deepcopy(self.store)
         response = self._dispatch(request)
-        if before is not None and response.status_code < 400:
-            self._record_history(before)
+        # A write that landed is in the log even when a later step failed and
+        # the answer was an error (PITFALLS 17); a refused one changed nothing.
+        if before is not None:
+            self._record_history(before, _txn_description(request))
             self._learn_custom_types()
         return response
 
@@ -400,7 +411,14 @@ class FakeGramps:
                     if isinstance(name, str) and name and name not in standard:
                         self.custom_types[key].add(name)
 
-    def _record_history(self, before: dict) -> None:
+    def _record_history(self, before: dict, description: str = "Edit") -> None:
+        """Log a write as the undo log does: a transaction of per-object changes.
+
+        Each change keeps the object's state before and after it, which the
+        server serves as ``old_data`` and ``new_data`` when asked (``{}`` for
+        no state). The transaction goes into :attr:`transactions`, which
+        ``GET /api/transactions/history/`` pages through as 3.21 does.
+        """
         changes = []
         for typ, objects in self.store.items():
             old = before[typ]
@@ -411,23 +429,46 @@ class FakeGramps:
             return
         self._history_txn += 1
         now = time.time()
-        for typ, handle, kind in changes:
+        connection = {
+            "id": self._history_txn,
+            "timestamp": now,
+            "user": {"name": "mcp", "full_name": ""},
+        }
+        logged = []
+        for number, (typ, handle, kind) in enumerate(changes, 1):
+            states = {
+                "_old": copy.deepcopy(before[typ].get(handle)),
+                "_new": copy.deepcopy(self.store[typ].get(handle)),
+            }
+            change = {
+                "obj_class": _TYPE_TO_CLASS[typ],
+                "trans_type": kind,
+                "obj_handle": handle,
+                "ref_handle": None,
+                "timestamp": now,
+            }
             self.history.append(
                 {
                     "id": len(self.history) + 1,
-                    "obj_class": _TYPE_TO_CLASS[typ],
-                    "trans_type": kind,
-                    "obj_handle": handle,
-                    "ref_handle": None,
-                    "timestamp": now,
-                    "connection": {
-                        "id": self._history_txn,
-                        "timestamp": now,
-                        "user": {"name": "mcp", "full_name": ""},
-                    },
+                    **change,
+                    **states,
+                    "connection": connection,
                     "transaction_id": self._history_txn,
                 }
             )
+            logged.append({"id": number, **change, **states})
+        self.transactions.append(
+            {
+                "id": self._history_txn,
+                "description": description,
+                "timestamp": now,
+                "first": 1,
+                "last": len(logged),
+                "undo": False,
+                "connection": connection,
+                "changes": logged,
+            }
+        )
 
     def _server_at_least(self, major: int, minor: int) -> bool:
         """Whether the gramps-webapi version the fake plays is this one or later."""
@@ -461,6 +502,7 @@ class FakeGramps:
             page = found[start : start + size]
         else:
             page = found
+        page = [_logged_change(c, params) for c in page]
         return httpx.Response(200, json=page, headers={"X-Total-Count": str(len(found))})
 
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
@@ -707,6 +749,8 @@ class FakeGramps:
     def _create(self, typ: str, request: httpx.Request) -> httpx.Response:
         if self.write_forbidden:
             return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
+        if self.post_error:
+            return httpx.Response(self.post_error, text="<h1>Internal Server Error</h1>")
         payload = json.loads(request.content or b"{}")
         admitted = copy.deepcopy(payload)
         refused = self._refusal(_TYPE_TO_CLASS[typ], admitted)
@@ -714,8 +758,14 @@ class FakeGramps:
             refused = _admit(_TYPE_TO_CLASS[typ], admitted)
         if refused is not None:
             return refused
+        # A handle the request carries is kept, and a second object with the
+        # same one refused (add_object(fail_if_exists=True)): PITFALLS 28.
+        if admitted.get("handle") and admitted["handle"] in self.store[typ]:
+            return httpx.Response(
+                400, json={"error": {"code": 400, "message": "Error while adding object"}}
+            )
         obj = _complete(_TYPE_TO_CLASS[typ], admitted)
-        obj["handle"] = self._new_handle()
+        obj["handle"] = admitted.get("handle") or self._new_handle()
         if typ != "tag":  # a tag has a name and a handle, no gramps_id
             obj.setdefault("gramps_id", self._new_gid(typ))
         obj["change"] = int(time.time())
@@ -723,6 +773,10 @@ class FakeGramps:
         self.requests.append(("POST", typ, payload))
         if typ == "family":
             self._family_cascade(None, obj)
+        if self.post_error_after_commit:
+            return httpx.Response(
+                self.post_error_after_commit, text="<h1>Internal Server Error</h1>"
+            )
         return httpx.Response(201, json=self._change_record(typ, obj, "add"))
 
     def _update(self, typ: str, handle: str, request: httpx.Request) -> httpx.Response:
@@ -744,11 +798,41 @@ class FakeGramps:
         obj = _complete(_TYPE_TO_CLASS[typ], sent)
         obj["handle"] = handle
         obj["change"] = int(time.time())
+        if typ == "family" and (refused := self._parent_change_refusal(previous, obj)):
+            return refused
         self.store[typ][handle] = obj
         self.requests.append(("PUT", typ, payload))
         if typ == "family":
             self._family_cascade(previous, obj)
+        if self.put_error_after_commit:
+            return httpx.Response(
+                self.put_error_after_commit, text="<h1>Internal Server Error</h1>"
+            )
         return httpx.Response(200, json=self._change_record(typ, obj, "update"))
+
+    def _parent_change_refusal(self, old: dict, new: dict) -> httpx.Response | None:
+        """Refuse a family write whose father or mother change the server cannot make.
+
+        ``_fix_parent_handles`` (``api/resources/util.py``, 3.21.1 to 3.23.1)
+        takes the family off its old parent with ``family_list.remove``: an old
+        parent who does not list the family raises ValueError, answered 400,
+        and nothing is written. An old parent who does not exist is a
+        HandleError on 3.21, answered 500; 3.22 skips it. PITFALLS 15.
+        """
+        people = self.store["person"]
+        for role in ("father_handle", "mother_handle"):
+            before = old.get(role)
+            if not before or before == new.get(role):
+                continue
+            if before not in people:
+                if self._server_at_least(3, 22):
+                    continue
+                return httpx.Response(500, text="<h1>Internal Server Error</h1>")
+            if new["handle"] not in (people[before].get("family_list") or []):
+                return httpx.Response(
+                    400, json={"error": {"code": 400, "message": "Error while updating object"}}
+                )
+        return None
 
     def _family_cascade(self, old: dict | None, new: dict) -> None:
         """Update family members' lists the way gramps-webapi 3.21.1 does.
@@ -929,14 +1013,35 @@ class FakeGramps:
         self.store["family"].pop(drop)
 
     def _transactions(self, path: str, method: str, request: httpx.Request) -> httpx.Response:
+        params = request.url.params
         if path.rstrip("/") == "/api/transactions/history":
-            return httpx.Response(200, json=self.transactions)
+            # 3.21's paging: sort, before_id/after_id, then page and pagesize
+            # (no page: all of them), each change with its states if asked.
+            found = sorted(
+                self.transactions,
+                key=lambda t: t["id"],
+                reverse=params.get("sort") == "-id",
+            )
+            if params.get("before_id"):
+                found = [t for t in found if t["id"] < int(params["before_id"])]
+            if params.get("after_id"):
+                found = [t for t in found if t["id"] > int(params["after_id"])]
+            total = len(found)
+            if params.get("page"):
+                size = int(params.get("pagesize") or 20)
+                start = (int(params["page"]) - 1) * size
+                found = found[start : start + size]
+            return httpx.Response(
+                200,
+                json=[_logged_transaction(t, params) for t in found],
+                headers={"X-Total-Count": str(total)},
+            )
         m_one = re.match(r"^/api/transactions/history/(\d+)$", path)
         if m_one and method == "GET":
             found = next((t for t in self.transactions if t["id"] == int(m_one.group(1))), None)
             if found is None:
                 return httpx.Response(404, json={"message": "no such transaction"})
-            return httpx.Response(200, json=found)
+            return httpx.Response(200, json=_logged_transaction(found, params))
         m = re.match(r"^/api/transactions/history/(\d+)/undo$", path)
         if not m:
             return httpx.Response(404, json={"message": "not found"})
@@ -1282,6 +1387,31 @@ _ATTRIBUTE_KIND = {
     "source": "source",
     "citation": "source",
 }
+
+
+_TXN_VERBS = {"POST": "New", "PUT": "Edit", "DELETE": "Delete"}
+
+
+def _txn_description(request: httpx.Request) -> str:
+    """What the server calls a write's transaction: "New Person", "Edit Family"."""
+    segment = request.url.path.strip("/").split("/")
+    typ = _SEG_TO_TYPE.get(segment[1] if len(segment) > 1 else "")
+    verb = _TXN_VERBS.get(request.method, "Edit")
+    return f"{verb} {_TYPE_TO_CLASS[typ]}" if typ else verb
+
+
+def _logged_change(change: dict, params: Any) -> dict:
+    """A logged change as served: its states only when ``old``/``new`` ask."""
+    out = {k: v for k, v in change.items() if k not in ("_old", "_new")}
+    for flag, key, state in (("old", "old_data", "_old"), ("new", "new_data", "_new")):
+        if params.get(flag) in ("1", "true", "True"):
+            out[key] = copy.deepcopy(change.get(state)) or {}
+    return out
+
+
+def _logged_transaction(txn: dict, params: Any) -> dict:
+    """A logged transaction as served, its changes by :func:`_logged_change`."""
+    return {**txn, "changes": [_logged_change(c, params) for c in txn.get("changes") or []]}
 
 
 def _type_fields(typ: str, obj: dict) -> Iterator[tuple[str, Any]]:

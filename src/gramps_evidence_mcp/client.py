@@ -21,6 +21,8 @@ import asyncio
 import json
 import logging
 import re
+import secrets
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -129,6 +131,55 @@ class GrampsApiError(RuntimeError):
         self.status = status
         self.detail = detail
         super().__init__(f"{method} {path} -> {status}: {detail}")
+
+
+class FailedWriteError(GrampsApiError):
+    """A write answered 5xx, and what a re-read shows it did.
+
+    A 5xx says nothing about whether a write landed: gramps-webapi answers one
+    for a write it rolled back -- a database that stayed locked past SQLite's
+    five-second wait, ``docs/PITFALLS.md`` section 6 -- and for one it
+    committed before a later step failed (section 17). So the record is read
+    again and the error says which.
+
+    Attributes
+    ----------
+    written : bool or None
+        False when the re-read shows the record exactly as it was; None when
+        it changed, which this write or another session may have done.
+    """
+
+    def __init__(self, cause: GrampsApiError, written: bool | None, what: str):
+        """Wrap the server's error with what the re-read found."""
+        self.written = written
+        if written is False:
+            told = (
+                f"Nothing was written: {what}. Retrying the same call is safe. A 5xx "
+                "that writes nothing is often the tree's SQLite database staying locked "
+                "past its five-second wait while another request reads or writes "
+                "(docs/PITFALLS.md section 6), which a retry a little later gets past; "
+                "it is not the size of what was sent."
+            )
+        else:
+            told = (
+                f"The write may have landed: {what}. Another session may also have "
+                "written it. Re-read it before retrying."
+            )
+        super().__init__(
+            cause.status, f"{told} The server said: {cause.detail}", method="", path=""
+        )
+        self.args = (f"HTTP {cause.status}: {told}",)
+
+
+def new_handle() -> str:
+    """A handle shaped as Gramps makes one (``create_id`` in ``gramps.gen.utils.id``).
+
+    Made here rather than by the server so a create the server answers with a
+    5xx can be looked up by it afterwards. The server keeps a handle the
+    request carries and refuses a second object with the same one
+    (``docs/PITFALLS.md`` section 28).
+    """
+    return f"{int(time.time() * 10000):08x}{secrets.randbits(63):08x}"
 
 
 class GrampsWebClient:
@@ -489,25 +540,65 @@ class GrampsWebClient:
     async def create_object(self, object_type: str, payload: dict) -> dict:
         """Create one object.
 
-        The server assigns the handle and gramps_id, coerces English type
-        strings such as ``"Birth"`` to internal type dicts, and wraps the write
-        in its own transaction.
+        The server assigns the gramps_id, coerces English type strings such as
+        ``"Birth"`` to internal type dicts, and wraps the write in its own
+        transaction. The handle is made here (:func:`new_handle`), so that a
+        create answered with a 5xx can be looked up: found, it landed and is
+        returned as created; not found, nothing was written, and the error
+        says so (``docs/PITFALLS.md`` sections 6 and 28).
 
         Parameters
         ----------
         object_type : str
             Key of :data:`ENDPOINTS`.
         payload : dict
-            The object to create, without handle or gramps_id.
+            The object to create, without gramps_id. A handle it carries is
+            kept.
 
         Returns
         -------
         dict
             ``{"handle", "gramps_id", "new", "_raw"}`` for the created object,
-            extracted from the list of change records the API returns.
+            extracted from the list of change records the API returns. After a
+            5xx for a create that landed, ``late_error`` holds the status.
+
+        Raises
+        ------
+        FailedWriteError
+            On a 5xx, saying whether the object exists.
         """
         expected = _CLASS_NAMES[object_type]
-        resp = await self._request("POST", self._collection(object_type), json=payload)
+        payload = {**payload, "handle": payload.get("handle") or new_handle()}
+        try:
+            resp = await self._request("POST", self._collection(object_type), json=payload)
+        except GrampsApiError as exc:
+            if exc.status < 500:
+                raise
+            try:
+                found = await self.get_object(
+                    object_type, payload["handle"], keys="handle,gramps_id"
+                )
+            except GrampsApiError as again:
+                if again.status != 404:
+                    raise FailedWriteError(
+                        exc, None, f"the new {object_type} could not be looked up afterwards"
+                    ) from exc
+                raise FailedWriteError(
+                    exc, False, f"no {object_type} with the handle the request made exists"
+                ) from exc
+            logger.warning(
+                "%s %s created although the server answered %s",
+                object_type,
+                payload["handle"],
+                exc.status,
+            )
+            return {
+                "handle": found.get("handle") or payload["handle"],
+                "gramps_id": found.get("gramps_id"),
+                "new": {},
+                "_raw": None,
+                "late_error": exc.status,
+            }
         return _normalize_write_response(resp.json(), expected)
 
     async def update_object(self, object_type: str, handle: str, payload: dict) -> dict:
@@ -742,6 +833,7 @@ class GrampsWebClient:
         sort: str = "-id",
         before: float | None = None,
         after: float | None = None,
+        before_id: int | None = None,
         old: bool = False,
         new: bool = False,
     ) -> list[dict]:
@@ -758,6 +850,10 @@ class GrampsWebClient:
             Sort order. Defaults to newest first.
         before, after : float, optional
             Unix timestamp bounds.
+        before_id : int, optional
+            Only transactions with a lower id: a cursor that, unlike a page
+            number, does not shift when another session writes meanwhile.
+            Served since gramps-webapi 3.21.0.
         old, new : bool, optional
             Include the before and after object states.
 
@@ -767,7 +863,13 @@ class GrampsWebClient:
             Change records.
         """
         params: dict[str, Any] = {"sort": sort}
-        for k, v in (("page", page), ("pagesize", pagesize), ("before", before), ("after", after)):
+        for k, v in (
+            ("page", page),
+            ("pagesize", pagesize),
+            ("before", before),
+            ("after", after),
+            ("before_id", before_id),
+        ):
             if v is not None:
                 params[k] = v
         for k, flag in (("old", old), ("new", new)):
@@ -1007,13 +1109,22 @@ class GrampsWebClient:
         return data if isinstance(data, list) else [data]
 
     async def object_history(
-        self, object_type: str, handle: str, *, pagesize: int = 20
+        self,
+        object_type: str,
+        handle: str,
+        *,
+        page: int = 1,
+        pagesize: int = 20,
+        old: bool = False,
+        new: bool = False,
     ) -> tuple[list[dict], int]:
         """One object's changes, newest first: ``(changes, total)``.
 
         ``GET /api/transactions/history/objects/{class}/{handle}``, added in
         gramps-webapi 3.22. A handle the history does not know gives an empty
         list, which is how a deleted object's history is still reachable.
+        ``old`` and ``new`` add the object as it was before and after each
+        change.
 
         Raises
         ------
@@ -1021,10 +1132,12 @@ class GrampsWebClient:
             On a server without the endpoint, naming its version.
         """
         path = f"/api/transactions/history/objects/{_CLASS_NAMES[object_type]}/{_seg(handle)}"
+        params: dict[str, Any] = {"sort": "-id", "page": page, "pagesize": pagesize}
+        for key, flag in (("old", old), ("new", new)):
+            if flag:
+                params[key] = "1"
         try:
-            resp = await self._request(
-                "GET", path, params={"sort": "-id", "page": 1, "pagesize": pagesize}
-            )
+            resp = await self._request("GET", path, params=params)
         except GrampsApiError as exc:
             if exc.status != 404:
                 raise
@@ -1040,9 +1153,14 @@ class GrampsWebClient:
         changes = resp.json()
         return changes, int(resp.headers.get("X-Total-Count") or len(changes))
 
-    async def transaction(self, transaction_id: int) -> dict:
-        """Read one transaction from the change log."""
-        resp = await self._request("GET", f"/api/transactions/history/{transaction_id}")
+    async def transaction(
+        self, transaction_id: int, *, old: bool = False, new: bool = False
+    ) -> dict:
+        """Read one transaction from the change log, with the objects' states if asked."""
+        params = {key: "1" for key, flag in (("old", old), ("new", new)) if flag}
+        resp = await self._request(
+            "GET", f"/api/transactions/history/{transaction_id}", params=params or None
+        )
         return resp.json()
 
     # ----- statistics and researcher -----

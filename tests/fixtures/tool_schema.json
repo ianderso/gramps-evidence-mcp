@@ -35,6 +35,7 @@
   ],
   "add_event_ref": [
     "allow_new_type",
+    "attributes",
     "event",
     "person",
     "role"
@@ -264,6 +265,7 @@
     "place"
   ],
   "get_record_history": [
+    "field",
     "limit",
     "object_type",
     "ref"
@@ -343,6 +345,14 @@
     "keep",
     "object_type"
   ],
+  "move_child": [
+    "allow_new_type",
+    "child",
+    "frel",
+    "from_family",
+    "mrel",
+    "to_family"
+  ],
   "ocr_media": [
     "lang",
     "media"
@@ -386,6 +396,12 @@
     "birth_year_min",
     "include_private",
     "name"
+  ],
+  "set_family_parent": [
+    "family",
+    "person",
+    "replace",
+    "role"
   ],
   "set_private": [
     "object_type",
@@ -449,6 +465,13 @@
     "event",
     "event_type",
     "place"
+  ],
+  "update_event_ref": [
+    "allow_new_type",
+    "attributes",
+    "event",
+    "person",
+    "role"
   ],
   "update_media": [
     "date",

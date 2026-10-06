@@ -169,6 +169,102 @@ async def test_detaching_a_doubly_linked_child_leaves_no_link(live):
     assert family["handle"] not in left
 
 
+async def test_set_family_parent_keeps_both_sides_of_each_link(live):
+    father, child, first, second = await _people(live, "Amos", "Ada", "Ruth", "Hester")
+    family = await live("add_family", father=father["gramps_id"], children=[child["gramps_id"]])
+    out = await live(
+        "set_family_parent", family=family["gramps_id"], role="mother", person=first["gramps_id"]
+    )
+    assert out.get("changed") is True, out
+    assert (await _raw(live, "person", first["gramps_id"]))["family_list"] == [family["handle"]]
+
+    # The old mother lists the family twice and the new one already once: the
+    # server would leave one and add a second (PITFALLS 15).
+    client = live.client
+    for person, links in ((first, [family["handle"]] * 2), (second, [family["handle"]])):
+        stored = await client.get_object("person", person["handle"])
+        stored["family_list"] = links
+        await client.update_object("person", person["handle"], stored)
+    out = await live(
+        "set_family_parent",
+        family=family["gramps_id"],
+        role="mother",
+        person=second["gramps_id"],
+        replace=True,
+    )
+    assert out.get("changed") is True, out
+    assert (await _raw(live, "family", family["gramps_id"]))["mother_handle"] == second["handle"]
+    assert (await _raw(live, "person", first["gramps_id"]))["family_list"] == []
+    assert (await _raw(live, "person", second["gramps_id"]))["family_list"] == [family["handle"]]
+    assert (await live("check_family_links", include_private=True))["problem_count"] == 0
+
+
+async def test_set_family_parent_restores_a_missing_link_the_server_needs(live):
+    first, second = await _people(live, "Ruth", "Hester")
+    family = await live("add_family", mother=first["gramps_id"])
+    client = live.client
+    stored = await client.get_object("person", first["handle"])
+    stored["family_list"] = []
+    await client.update_object("person", first["handle"], stored)
+    out = await live(
+        "set_family_parent",
+        family=family["gramps_id"],
+        role="mother",
+        person=second["gramps_id"],
+        replace=True,
+    )
+    assert out.get("changed") is True, out
+    assert (await _raw(live, "family", family["gramps_id"]))["mother_handle"] == second["handle"]
+    assert (await live("check_family_links", include_private=True))["problem_count"] == 0
+
+
+async def test_move_child_keeps_the_links_evidence_and_the_birth_order(live):
+    father, wife = await _people(live, "Amos", "Ruth")
+    kids = [
+        await live(
+            "add_person",
+            given=name,
+            surname="Wren",
+            birth={"type": "Birth", "date": year},
+            require_citation=False,
+        )
+        for name, year in (("Ada", "1851"), ("Silas", "1854"), ("Tobias", "1860"))
+    ]
+    old = await live("add_family", father=father["gramps_id"], children=[kids[1]["gramps_id"]])
+    new = await live(
+        "add_family",
+        father=father["gramps_id"],
+        mother=wife["gramps_id"],
+        children=[kids[0]["gramps_id"], {"person": kids[2]["gramps_id"], "frel": "stepchild"}],
+    )
+    refs = (await _raw(live, "family", new["gramps_id"]))["child_ref_list"]
+    assert [(_t(r["frel"]), _t(r["mrel"])) for r in refs] == [
+        ("Birth", "Birth"),
+        ("Stepchild", "Birth"),
+    ]
+    cited = await live(
+        "cite_child_link",
+        family=old["gramps_id"],
+        child=kids[1]["gramps_id"],
+        citation={"source_title": "Family register", "page": "p. 7"},
+    )
+    out = await live(
+        "move_child",
+        child=kids[1]["gramps_id"],
+        from_family=old["gramps_id"],
+        to_family=new["gramps_id"],
+    )
+    assert out.get("changed") is True, out
+    assert out["position"] == 2 and out["kept"] == {"citations": 1, "notes": 0}
+    refs = (await _raw(live, "family", new["gramps_id"]))["child_ref_list"]
+    assert [r["ref"] for r in refs] == [k["handle"] for k in kids]
+    assert refs[1]["citation_list"] == [cited["citation_handle"]]
+    assert (await _raw(live, "family", old["gramps_id"]))["child_ref_list"] == []
+    moved = await _raw(live, "person", kids[1]["gramps_id"])
+    assert moved["parent_family_list"] == [new["handle"]]
+    assert (await live("check_family_links", include_private=True))["problem_count"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # Events
 # --------------------------------------------------------------------------- #
@@ -223,6 +319,40 @@ async def test_add_event_ref_shares_an_event_once(live):
     assert backlinks["referenced_by"]["person"]["count"] == 2
     again = await live("add_event_ref", person=witness["gramps_id"], event=handle)
     assert again["error"] == "already_referenced"
+
+
+async def test_an_event_reference_carries_and_changes_its_attributes(live):
+    """TOOL-REQUESTS #7: each participant's own line, on their reference."""
+    head, wife = await _people(live, "Elias", "Mercy")
+    handle = (await _residence(live, head))["event_handle"]
+    out = await live(
+        "add_event_ref",
+        person=wife["gramps_id"],
+        event=handle,
+        attributes={"As enumerated": "Wren, Mercy, W, F, 34", "age": "34"},
+    )
+    assert out.get("changed") is True, out
+    assert out["new_attribute_names"] == ["As enumerated"]
+
+    def attributes(person: dict) -> list[tuple[str, str]]:
+        (ref,) = [r for r in person["event_ref_list"] if r["ref"] == handle]
+        return [(_t(a["type"]), a["value"]) for a in ref["attribute_list"]]
+
+    assert attributes(await _raw(live, "person", wife["gramps_id"])) == [
+        ("As enumerated", "Wren, Mercy, W, F, 34"),
+        ("Age", "34"),
+    ]
+    out = await live(
+        "update_event_ref",
+        person=wife["gramps_id"],
+        event=handle,
+        role="Informant",
+        attributes={"as enumerated": "Wren, Mercy, W, F, 43", "Age": None},
+    )
+    assert out.get("changed") is True, out
+    stored = await _raw(live, "person", wife["gramps_id"])
+    assert attributes(stored) == [("As enumerated", "Wren, Mercy, W, F, 43")]
+    assert _t(stored["event_ref_list"][0]["role"]) == "Informant"
 
 
 # --------------------------------------------------------------------------- #
@@ -487,20 +617,25 @@ async def test_type_names_are_spelt_as_gramps_does_and_unknown_ones_refused(live
 
 
 # --------------------------------------------------------------------------- #
-# A record's history (gramps-webapi 3.22 and later)
+# A record's history: 3.22's endpoint, or 3.21's whole log (TOOL-REQUESTS #29)
 # --------------------------------------------------------------------------- #
-async def test_record_history_or_the_version_it_needs(live):
+async def test_record_history_from_the_endpoint_or_the_log(live):
     person = await live("add_person", given="Elias", surname="Wren")
-    if live_version() < (3, 22):
-        out = await live("get_record_history", object_type="person", ref=person["gramps_id"])
-        assert out["error"] == "unsupported_server", out
-        assert "3.22 or later" in out["message"]
-        return
     await live("update_person", person=person["gramps_id"], gender="male")
-    await live("add_family", father=person["gramps_id"])
+    family = await live("add_family", father=person["gramps_id"])
     out = await live("get_record_history", object_type="person", ref=person["gramps_id"])
     assert [c["change"] for c in out["changes"]] == ["edited", "edited", "added"], out
     assert all(c["user"] == "mcp" for c in out["changes"])
+    from_log = live_version() < (3, 22)
+    assert out["read_from"] == ("transaction log" if from_log else "record history")
+    assert (out.get("log_complete") is True) == from_log
+
+    links = await live(
+        "get_record_history", object_type="person", ref=person["gramps_id"], field="family_list"
+    )
+    (linked,) = links["changes"]
+    assert (linked["before"], linked["after"]) == ([], [family["handle"]])
+    assert links["field_changes"] == 1 and links["total_changes"] == 3, links
 
     await live("delete_object", object_type="person", target=person["gramps_id"])
     gone = await live("get_record_history", object_type="person", ref=person["handle"])

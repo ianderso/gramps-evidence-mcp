@@ -8,6 +8,72 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- `set_family_parent`: set, replace or remove the father or mother of an
+  existing family, so a wife a record names joins the family her husband and
+  children are already in, rather than a second one. Both sides of each
+  person's link are kept: an old parent's missing link is restored first,
+  because without it gramps-webapi refuses the write (400), and both people
+  are written afterwards to hold the family once or not at all. A different
+  parent already in the role is replaced only with `replace=True`.
+  `docs/PITFALLS.md` section 15.
+- `move_child`: move a child to another family with the link's citations,
+  notes and privacy, placed in birth order, optionally with a new `frel` or
+  `mrel`. Detaching and re-adding lost both and put the child last. The new
+  family is written first, so a failure part-way leaves the child in both
+  families, never neither; then every link to the old family goes, a
+  duplicated one too, and the new family takes its place in the child's own
+  list, whose first entry Gramps reads as the main parents.
+- `update_event_ref`: change a person's reference to a shared event in place
+  -- its role, or an attribute set, added or removed by name -- keeping an
+  attribute's citations and notes. Nothing could change one before.
+- `add_event_ref` takes `attributes`, for what is the person's own in a shared
+  event: their line on a census sheet (`As enumerated`), their age. Gramps
+  keeps no list of the attribute names used on event references
+  (`docs/PITFALLS.md` section 29), so a name is matched against the standard
+  ones, the tree's custom ones and those on the event's other references; one
+  matching none is written and reported as new, and one close to a known name
+  is refused as a likely typo unless `allow_new_type`.
+- `add_family`'s `children` takes `{person, frel, mrel}` beside a plain id, so
+  a stepchild needs no second call.
+- `get_record_history` works on gramps-webapi 3.21. It read 3.22's per-record
+  history only, and answered `unsupported_server` on 3.21; there it now reads
+  the whole transaction log, newest first, back to the record's creation, and
+  says so (`read_from`, `log_complete`). That is slow on a large log -- most
+  of a minute for an old record in 54,000 transactions.
+  `docs/PITFALLS.md` section 30.
+- `get_record_history(field=...)`: only the writes that changed one field of
+  the stored record, each with its value before and after --
+  `parent_family_list`, or a nested `primary_name.first_name` -- which is
+  what finding the write behind a defect needs.
+
+### Changed
+
+- A write answered with a 5xx says what it wrote. gramps-webapi answers 500
+  both for a write it rolled back and for one it committed before a later
+  step failed, so the tool looks: a create by its handle, which the client
+  now makes (`docs/PITFALLS.md` section 28), and an edit by reading the
+  record again. The error keeps `"error": "api"` and adds `written`: `false`
+  when nothing was written, so a retry is safe, or `null` when the write may
+  have landed. A create that landed is taken as done. `add_note` whose
+  attachment wrote nothing removes the new note again, so the call writes
+  all or nothing.
+- `detach_object`'s refusal to take only a person's side of a two-sided
+  parent link points at `set_family_parent`.
+
+### Fixed
+
+- `add_note` answered HTTP 500 for a long note, wrote nothing, and said only
+  "HTTP 500" (TOOL-REQUESTS #28). The length was not the cause: there is no
+  limit on a note's text, and minutes later the session that met it wrote a
+  6,000-character note in one call and the full 8,000 by an edit. The three
+  failed requests each reached the database
+  and none was committed, which on a SQLite tree is the commit's five-second
+  wait for a lock running out while another request holds it
+  (`docs/PITFALLS.md` section 6). The error now says that nothing was
+  written and that retrying is safe.
+
 ## [2.0.0] — 2026-10-05
 
 ### Added

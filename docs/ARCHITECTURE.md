@@ -7,7 +7,7 @@ How the server is put together. [PITFALLS.md](PITFALLS.md) covers
 ## Layers
 
 ```
-server.py     93 MCP tool functions, their annotations, and the entry point.
+server.py     96 MCP tool functions, their annotations, and the entry point.
               Parameter validation, no business logic.
 service.py    Genealogy operations. Enforces the evidence model, resolves
               references, shapes results.
@@ -76,6 +76,17 @@ through it would be left attached to nothing. Every delete path checks for
 those first and keeps the object unless `carry_to` moves them. A delete that
 the server answers with a 5xx is looked up again, because it may have landed.
 
+No 5xx is taken at its word, from any write. A create carries a handle the
+client made, so it can be looked up afterwards; an edit is compared with the
+record read again. The error then says whether nothing was written, or the
+write may have landed; a create that landed is taken as done. A tool that
+writes twice -- a note and its attachment -- undoes the first when the second
+wrote nothing. See [PITFALLS.md](PITFALLS.md) sections 6, 17 and 28.
+
+Changes that span several objects are ordered so a failure part-way loses no
+evidence: `move_child` adds the child to the new family, with the link's
+citations and notes, before taking them out of the old one.
+
 ## The reference layer
 
 Legacy GEDCOM exports are parsed from disk and served by `consult_reference` as
@@ -126,7 +137,7 @@ can run alongside this one.
 
 Swept against the full `/api/openapi.json` of gramps-webapi 3.21.1 (137 paths),
 3.22.3 (138: it adds one record's change history, which
-`get_record_history` reads and which answers with a version error on 3.21)
+`get_record_history` reads; on 3.21 it pages the whole transaction log instead)
 and 3.23.1 (143: it adds persistent access tokens and their exchange, the
 server's own metadata, and every place's coordinates, all left out below).
 Everything genealogically useful is covered. What is left out, and why:

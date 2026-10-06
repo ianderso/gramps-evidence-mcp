@@ -275,6 +275,25 @@ async def _editing_and_deleting(step: Recorder) -> None:
     await step(
         "update_child_ref", family=family["gramps_id"], child=one["gramps_id"], frel="stepchild"
     )
+    # Parents and children changed in place (TOOL-REQUESTS #21), and what the
+    # log says about it (#29): 3.21 reads the whole log, 3.22 the record's.
+    wife = await step("add_person", given="Ruth", surname="Ashbee", gender="female")
+    await step(
+        "set_family_parent", family=family["gramps_id"], role="mother", person=wife["gramps_id"]
+    )
+    await step(
+        "move_child",
+        child=one["gramps_id"],
+        from_family=family["gramps_id"],
+        to_family=second["gramps_id"],
+        mrel="stepchild",
+    )
+    await step(
+        "get_record_history",
+        object_type="person",
+        ref=one["gramps_id"],
+        field="parent_family_list",
+    )
 
     added = await step(
         "add_event_to_person",
@@ -291,6 +310,12 @@ async def _editing_and_deleting(step: Recorder) -> None:
     await step("update_event", event=event, date="from 4 May 1864 to 16 Sep 1864")
     await step("update_event", event=event, clear_place=True)
     await step("add_event_ref", person=father["gramps_id"], event=event, role="witness")
+    await step(
+        "update_event_ref",
+        person=father["gramps_id"],
+        event=event,
+        attributes={"As enumerated": "Wren, Elias, 49, head", "age": "49"},
+    )
     citation = (await client.get_object("event", event))["citation_list"][0]
     source = (await client.get_object("citation", citation))["source_handle"]
     await step("uncite", object_type="event", ref=event, citation=citation)

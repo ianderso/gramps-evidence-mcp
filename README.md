@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 **read/write access to a Gramps genealogy tree**, plus a **read-only
 "reference layer"** over legacy GEDCOM exports.
 
-**93 tools, built around evidence discipline.** The premise is that an assistant
+**96 tools, built around evidence discipline.** The premise is that an assistant
 turned loose on a family tree will happily invent a plausible ancestor, so the
 write paths here are shaped to make every claim carry its source: facts are
 created with citations attached, `uncite` deletes what it orphans, parent-child
@@ -289,7 +289,7 @@ server does not authenticate callers itself; see
 ### 5. Add the connector in claude.ai
 
 **Settings → Connectors → Add custom connector →** paste
-`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 93 tools
+`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 96 tools
 appear in chat. (Custom connectors require a paid Claude plan; on
 Team/Enterprise an admin may need to enable them.)
 
@@ -419,7 +419,7 @@ Request URLs are kept out of the log too, because a query filter travels in one.
 
 ## Tool reference
 
-**93 tools.** Every tool that mutates the tree re-fetches the *whole* object
+**96 tools.** Every tool that mutates the tree re-fetches the *whole* object
 before PUTting it back — edits through `service._mutate()` — see
 [the `keys=` trap](docs/PITFALLS.md#1-keys-plus-put-destroys-unfetched-fields).
 
@@ -437,17 +437,17 @@ unfiltered listing of the first 200 objects.
 | Tool | Purpose |
 | --- | --- |
 | `add_person` | Create a person, optionally with cited birth/death events; each event's type may be left out. |
-| `add_family` | Link parents + children with an optional cited marriage. |
+| `add_family` | Link parents + children with an optional cited marriage. A child may be given with its relationship to each parent — a stepchild in the same call. |
 | `add_event_to_person` | Add a cited event (residence, census, occupation…) to a person. |
 | `add_event_to_family` | Add a dated/placed event (marriage, divorce…) to a family. |
 | `add_child_to_family` | Add an existing person as a child of an existing family. |
-| `add_event_ref` | Share an **existing** event with another person, in a role (Witness, Informant, Godparent…): one census entry or burial, one set of citations. |
+| `add_event_ref` | Share an **existing** event with another person, in a role (Witness, Informant, Godparent…): one census entry or burial, one set of citations. What is the person's own — their line on the sheet, their age — goes on the reference as attributes (`As enumerated`, `Age`). |
 | `add_alternate_name` | Add a non-primary name (AKA, married name, nickname) to a person, with the citation for that form of the name. |
 | `add_source` | Create a Source (record set, book, certificate), optionally in a repository. |
 | `add_citation` | Create/reuse a standalone Citation on a Source. |
 | `add_repository` | Create a Repository (archive, library, cemetery, website). |
 | `add_place` | Create a place deliberately, typed and parented, instead of letting one appear as a side effect of naming it in an event. |
-| `add_note` | Create a note, optionally attached to an object. Re-reads the target and returns `verified: false` rather than claiming an attachment it can't demonstrate. |
+| `add_note` | Create a note, optionally attached to an object. Re-reads the target and returns `verified: false` rather than claiming an attachment it can't demonstrate. Any length in one call; a server error says whether anything was written, and an attach that failed takes the new note back. |
 | `add_media` | Upload an image, PDF, audio or video file as a standalone Media object; reuses an identical file by md5. |
 | `attach_media` | Link a file (uploading it) or an existing Media object to an object. |
 | `add_attribute` | Add a typed key/value attribute (`Attribute` on objects, `SrcAttribute` on sources/citations). |
@@ -475,6 +475,9 @@ unfiltered listing of the first 200 objects.
 | `update_person` | Gender, primary name (the old one is kept as an alternate, unless it was a data-entry error — then it is corrected in place and the reason recorded in a note), privacy flag. |
 | `update_alternate_name` | Correct, retype or remove one alternate name in place, keeping its citations. A cited name is not removed. |
 | `update_child_ref` | A child's relationship to the father or mother — Birth, Stepchild, Adopted… — in place, keeping the link's citations and the birth order. |
+| `move_child` | Move a child to another family, keeping the link's citations, notes and privacy, placed in birth order; every link back to the old family goes, a duplicated one too. |
+| `set_family_parent` | Set, replace (when asked) or remove the father or mother of an existing family, keeping both sides of each person's link. |
+| `update_event_ref` | A person's reference to a shared event, in place: the role, or an attribute set, added or removed by name, keeping its citations. |
 | `update_object_fields` | Scalar fields on anything else (places, notes, repositories). Structural lists are refused. |
 | `update_place` | Place type, parent enclosure, name, title, coordinates. The parent must already exist (never minted from a name), cycles are refused, and multi-entry dated enclosures are refused rather than flattened. |
 | `update_url` | Edit or remove ONE existing URL entry on a person/place/repository, matched by substring — must match exactly one. The fix for a link filed under the wrong type. |
@@ -559,7 +562,7 @@ background jobs `list_jobs` reports.
 | `undo_transaction` | Undo a transaction, after a conflict check. Dry-run by default. Returns a `task_id`. |
 | `list_jobs` | Recent background jobs for this tree, newest first. |
 | `get_transaction` | One transaction in full, including the objects it changed. Read before undoing. |
-| `get_record_history` | Who added, edited or deleted one record, and when — each change with its transaction. A deleted record by its handle. Needs gramps-webapi 3.22 or later. |
+| `get_record_history` | Who added, edited or deleted one record, and when — each change with its transaction. A deleted record by its handle. `field` narrows it to the writes that changed one field, with its value before and after. On gramps-webapi 3.21 it reads the whole transaction log instead, which is slower, and says so. |
 | `get_job` | Whether a background job finished, and whether it worked. Undo, verification and reindex all dispatch to a worker. |
 | `reindex_search` | Rebuild the full-text index behind Gramps Web's search box. The server updates it after each write; rebuild after a large import, or when search misses something the tree holds. |
 
@@ -726,7 +729,7 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
 
 ```
 src/gramps_evidence_mcp/    the MCP server
-  server.py                 tool definitions (the 93 tools) and the entry point
+  server.py                 tool definitions (the 96 tools) and the entry point
   service.py                genealogy operations; edits go through _mutate()
   client.py                 gramps-webapi REST client
   mapping.py                Gramps object <-> JSON shapes

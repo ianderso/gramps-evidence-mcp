@@ -4,7 +4,7 @@ Everything this project set out to build is built: cited writes for every kind
 of genealogical claim, the edit and merge tools that keep a tree correctable,
 the audit set that finds where the evidence thins out, server-side queries,
 reports and verification, DNA matches recorded as cited evidence, and the
-read-only reference layer over legacy GEDCOMs. That is 93 tools; the
+read-only reference layer over legacy GEDCOMs. That is 96 tools; the
 [README](../README.md#tool-reference) is the reference for what exists, and the
 [changelog](../CHANGELOG.md) for what changed.
 

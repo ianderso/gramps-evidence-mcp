@@ -9,11 +9,12 @@ unit tests instead.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
 
-from gramps_evidence_mcp.client import GrampsApiError
+from gramps_evidence_mcp.client import GrampsApiError, new_handle
 from gramps_evidence_mcp.mapping import MOD_FROM, MOD_SPAN, parse_date
 
 from .harness import live_version
@@ -451,6 +452,29 @@ async def test_15_a_removed_child_loses_only_the_first_of_two_links(live):
     ]
 
 
+async def test_15_a_parent_change_needs_the_old_parent_to_list_the_family(live):
+    """``family_list.remove`` on the old parent: a ValueError, answered 400."""
+    client = live.client
+    mother = await _person(client)
+    other = await _person(client, given="Ruth")
+    family = await client.create_object(
+        "family", {"_class": "Family", "mother_handle": mother["handle"]}
+    )
+    stored = await client.get_object("person", mother["handle"])
+    assert stored["family_list"] == [family["handle"]], "a new family links its mother"
+    stored["family_list"] = []
+    await client.update_object("person", mother["handle"], stored)
+    fam = await client.get_object("family", family["handle"])
+    fam["mother_handle"] = other["handle"]
+    with pytest.raises(GrampsApiError) as exc:
+        await client.update_object("family", family["handle"], fam)
+    assert exc.value.status == 400
+    assert (await client.get_object("family", family["handle"]))["mother_handle"] == mother[
+        "handle"
+    ]
+    assert (await client.get_object("person", other["handle"]))["family_list"] == []
+
+
 async def test_16_a_delete_removes_references_to_the_object(live):
     client = live.client
     birth = await _event(client)
@@ -798,3 +822,68 @@ async def test_27_the_has_tag_rule_matches_a_tag_by_exact_name(live):
         "source", rules={"rules": [{"name": "HasTag", "values": ["ToDo"]}]}, keys="handle"
     )
     assert [r["handle"] for r in rows] == [tagged["handle"]]
+
+
+# --------------------------------------------------------------------------- #
+# 28: a handle the request makes
+# --------------------------------------------------------------------------- #
+async def test_28_a_create_keeps_a_handle_the_request_makes_and_refuses_it_twice(live):
+    client = live.client
+    handle = new_handle()
+    made = await client.create_object(
+        "note", {"_class": "Note", "handle": handle, "text": {"string": "first"}}
+    )
+    assert made["handle"] == handle
+    with pytest.raises(GrampsApiError) as exc:
+        await client.create_object(
+            "note", {"_class": "Note", "handle": handle, "text": {"string": "second"}}
+        )
+    assert exc.value.status == 400
+    assert (await client.get_object("note", handle))["text"]["string"] == "first"
+
+
+async def test_28_a_long_note_is_one_write(live):
+    """No limit on a note's text: 200,000 characters in one POST (TOOL-REQUESTS #28)."""
+    client = live.client
+    text = "Inventory of the estate, line by line. " * 5200
+    made = await client.create_object("note", {"_class": "Note", "text": {"string": text}})
+    assert (await client.get_object("note", made["handle"]))["text"]["string"] == text
+
+
+# --------------------------------------------------------------------------- #
+# 29: attribute names on an event reference
+# --------------------------------------------------------------------------- #
+async def test_29_an_event_reference_attribute_name_joins_no_vocabulary(live):
+    client = live.client
+    census = await _event(client, "Census", "1880")
+    name = f"Enumerated as {uuid.uuid4().hex[:8]}"
+    ref = {
+        **_ref(census["handle"]),
+        "attribute_list": [{"_class": "Attribute", "type": name, "value": "line 12"}],
+    }
+    person = await _person(client, event_ref_list=[ref])
+    stored = await client.get_object("person", person["handle"])
+    kept = stored["event_ref_list"][0]["attribute_list"][0]["type"]
+    assert (kept if isinstance(kept, str) else kept.get("string")) == name
+    assert name not in json.dumps(await client.types())
+
+
+# --------------------------------------------------------------------------- #
+# 30: a record's history on 3.21 is in the whole log
+# --------------------------------------------------------------------------- #
+async def test_30_the_log_names_each_changes_record_and_pages_by_id(live):
+    client = live.client
+    person = await _person(client)
+    stored = await client.get_object("person", person["handle"])
+    stored["gender"] = 1
+    await client.update_object("person", person["handle"], stored)
+    edit, create = await client.transactions(page=1, pagesize=2, sort="-id")
+    assert (edit["description"], create["description"]) == ("Edit Person", "New Person")
+    assert [(c["obj_class"], c["obj_handle"], c["trans_type"]) for c in edit["changes"]] == [
+        ("Person", person["handle"], 1)
+    ]
+    assert "old_data" not in edit["changes"][0]
+    (older,) = await client.transactions(page=1, pagesize=1, sort="-id", before_id=edit["id"])
+    assert older["id"] == create["id"]
+    (change,) = (await client.transaction(edit["id"], old=True, new=True))["changes"]
+    assert (change["old_data"]["gender"], change["new_data"]["gender"]) == (0, 1)

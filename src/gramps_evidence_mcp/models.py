@@ -255,6 +255,17 @@ class RepositoryLink(_StrictInput):
     )
 
 
+class ChildLink(_StrictInput):
+    """One child of add_family, with its relationship to each parent."""
+
+    person: str = Field(description="The child's handle or gramps_id, e.g. 'I0007'.")
+    frel: str = Field(
+        default="Birth",
+        description="Relationship to the father: 'Birth', 'Adopted', 'Stepchild', 'Foster', ...",
+    )
+    mrel: str = Field(default="Birth", description="Relationship to the mother, the same values.")
+
+
 class WriteResult(BaseModel):
     """Shape returned by a write tool. Tools return plain dicts matching it."""
 

@@ -199,6 +199,32 @@ async def test_no_editing_tool_ever_sends_a_partial_object(tools):
     )
     assert updated["changed"] is True, updated
 
+    # Added after 2.0.0.
+    wife = await tools("add_person", given="Ruth", surname="Ashbee", gender="female")
+    second = await tools("add_family", father=ids["father"])
+    later = [
+        await tools(
+            "add_event_ref",
+            person=wife["gramps_id"],
+            event=death,
+            role="Informant",
+            attributes={"As enumerated": "Ruth Ashbee, widow"},
+        ),
+        await tools(
+            "update_event_ref", person=wife["gramps_id"], event=death, attributes={"Age": "52"}
+        ),
+        await tools(
+            "set_family_parent", family=ids["family"], role="mother", person=wife["gramps_id"]
+        ),
+        await tools(
+            "move_child",
+            child=ids["child"],
+            from_family=ids["family"],
+            to_family=second["gramps_id"],
+        ),
+    ]
+    assert all(e.get("changed") is True for e in later), later
+
     assert fake.partial_writes == [], (
         f"a tool sent a partial object; every write must go through _mutate: {fake.partial_writes}"
     )

@@ -13,12 +13,13 @@ are covered by the unit tests.
 Not checked, because a healthy throwaway server cannot show them: the HTTP 500
 answered to a delete that has landed (section 17), which needs a failing
 search index; that the server never removes a media file (section 16), which
-needs an upload; the 500s on every write under prolonged concurrent writing
-(section 6); how a server on Gramps older than 5.2 stores "from X"
-(section 20), since no supported server runs one; and what 3.23 does with a
-stray key or a `year` an older server stored (sections 18 and 24), which needs
-a tree written by one version and served by another. Each says where it came
-from.
+needs an upload; the 500s on every write under prolonged concurrent writing,
+and the 500 a commit answers when SQLite's lock wait runs out (section 6),
+which need a second client holding the database; how a server on Gramps
+older than 5.2 stores "from X" (section 20), since no supported server runs
+one; and what 3.23 does with a stray key or a `year` an older server stored
+(sections 18 and 24), which needs a tree written by one version and served by
+another. Each says where it came from.
 
 The sections were first found on gramps-webapi 3.20.1 and 3.21.1, in research
 sessions against a live tree, and explained from the gramps-webapi and Gramps
@@ -87,6 +88,42 @@ back -- and that is the most a client can do.
 Prolonged concurrent writing has also produced HTTP 500 on every write while
 reads stayed healthy. `list_transactions` shows recent write activity -- check
 it before starting a write session.
+
+**A write whose commit cannot get the database answers 500 and writes
+nothing.** Gramps opens a tree's SQLite file with Python's default five-second
+wait for a lock (`sqlite3.connect(path)` in `gramps/plugins/db/dbapi/sqlite.py`,
+6.0.8), and neither Gramps nor gramps-webapi sets a longer wait or WAL mode;
+the undo log is a second SQLite file, opened the same way through SQLAlchemy.
+A request that holds the database for longer -- a GrampsQL query or an
+unpaginated list, which keeps its read cursor open while it walks the whole
+collection (`_iter_raw_data`), or another write -- makes the commit fail with
+"database is locked". The transaction is rolled back and the answer is HTTP
+500.
+
+Seen on 2026-10-06 against 3.21.1 (TOOL-REQUESTS #28). `add_note` answered 500
+three times in under a minute and wrote nothing, and the session concluded
+that a long note was refused. The log says otherwise:
+
+- Each failed request opened an undo-log connection, as every write request
+  does with its first change, and recorded no transaction: connections 54196
+  to 54198, between transactions 53638 and 53639. The only such gap in the 400
+  transactions before them. So each request had inserted the note inside its
+  database transaction and failed at or just before the commit -- past the
+  point where a request refused for its size or content is turned away.
+- Minutes later the same session created notes of 5,994 and 4,463 characters
+  in one call each, and set the 8,054-character text by an edit, which sends
+  the whole note.
+- Nothing on the path limits a note's length: Gramps' schema puts no
+  `maxLength` on a note's text, gramps-webapi sets no `MAX_CONTENT_LENGTH`,
+  and a body refused for its size would be a 413 or 400 before the database
+  is touched. The live suite writes a 200,000-character note in one call.
+
+The server's own log would name the exception; it was not available. Either
+way a 5xx from a write is no evidence of what was written, in either
+direction (section 17), so the tools look: a create by the handle it was
+given (section 28), an edit by reading the record again, and the error says
+`written: false` -- nothing was written, retrying is safe -- or that the write
+may have landed.
 
 ## 7. GrampsQL syntax
 
@@ -293,6 +330,22 @@ So every person write through `_mutate()` drops a repeated family from either
 list, `detach_object(child_kind="child")` removes every remaining link from the
 child, and `check_family_links` reports duplicates and one-sided links in both
 directions. A person write does not cascade into families.
+
+A third detail makes a **parent change need the old parent's link**. The family
+is taken off its old father or mother with `family_list.remove`
+(`_fix_parent_handles`), which raises ValueError when they do not list it: the
+write is refused with 400, "Error while updating object", and nothing is
+written. On 3.21 an old parent who no longer exists is a HandleError and a
+500; 3.22 skips them. Read from the 3.21.1, 3.22.3 and 3.23.1 source on
+2026-10-06; the live suite checks the 400.
+
+So `set_family_parent` restores an old parent's missing link before writing
+the family, for the server to remove, and writes both people afterwards so
+each holds the family once or not at all. `move_child` writes the new family
+before the old, so a failure part-way leaves the child in both rather than
+neither, then removes every remaining link to the old family and puts the new
+one where it stood in the child's `parent_family_list`, whose first entry
+Gramps reads as the main parents (`get_main_parents_family_handle`).
 
 ## 16. A delete removes references -- and a source takes its citations
 
@@ -557,3 +610,53 @@ the first attribute of a name in place and removes any further one; and
 frontend source (`GrampsjsViewNewTask.js`, `GrampsjsViewTasks.js`,
 `GrampsjsTask.js`, 26.10.0) on 2026-10-05; the `HasTag` query and the kept
 handle are checked against the server by the live suite.
+
+## 28. A create keeps a handle the request makes
+
+A `POST` that carries a `handle` stores the object under it; a second object
+with the same handle is refused with 400, "Error while adding object"
+(`add_object(fail_if_exists=True)` in `api/resources/util.py`, 3.21.1 to
+3.23.1). `POST /api/objects/` keeps one too (section 27).
+
+So the client makes every handle (`new_handle()`, shaped as Gramps'
+`create_id`), and a create answered with a 5xx is looked up by it: absent,
+nothing was written; present, the create landed before a later step failed,
+and is taken as done. A retry of a create that did land is refused rather
+than duplicated. The live suite checks the kept handle and the refusal.
+
+## 29. Attribute names on an event reference are in no vocabulary
+
+Gramps adds a custom attribute name to the tree's vocabulary when it stores a
+person, family, event or media object carrying it, and a media reference's
+too -- but not an event reference's (`commit_person` in
+`gramps/gen/db/generic.py`, 6.0.8). A name used only there, such as
+`As enumerated`, is in no list `GET /api/types/` serves, however many
+references carry it: on a live tree whose census references use it widely, it
+was in none on 2026-10-06.
+
+So `add_event_ref` and `update_event_ref` match an attribute name against the
+standard names, the custom ones of the four object kinds, and the names on
+the event's other references; a name none of them has is written and
+reported as new, rather than refused as section 26 would, and one close to a
+known name is refused as a likely typo unless `allow_new_type`. Nothing is
+added to any vocabulary either way. The live suite checks that the name stays
+out of `/api/types/`.
+
+## 30. A record's history before 3.22 is in the whole log
+
+3.22 serves one record's changes
+(`/api/transactions/history/objects/{class}/{handle}`); 3.21 does not. Its
+transaction log does name the record each change touched -- `obj_class` and
+`obj_handle` on every change, a reference change with class `7` -- and pages
+by `before_id`, a cursor another session's write cannot shift, as page
+numbers can. `old=1&new=1` on one transaction adds each object's stored state
+before and after, raw: types as stored dicts, `_class` keys at every level.
+
+On 3.21 `get_record_history` therefore reads the log newest first, 2,000
+transactions a request, until the record's creation (an add not made by an
+undo, which can restore a deleted record), or 100,000 transactions, and says
+so. On a tree of 54,000 transactions on 2026-10-06 a page took 1.7 s and 1 MB:
+a record created long ago costs most of a minute. With `field`, each change
+found is read again with its states. 3.22's endpoint also returns a change no
+transaction recorded -- a write that failed at its commit, section 6 -- with
+no transaction id; the log does not.
