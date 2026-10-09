@@ -8,6 +8,16 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- The repository was recreated on 2026-10-09 with its history rewritten, so
+  every commit from 1.0.1 on has a new hash, and links to an old commit no
+  longer resolve. GitHub keeps the tag names v1.0.0 to v2.2.0 reserved for
+  the original immutable releases, so those versions are tagged
+  `release-1.0.0` to `release-2.2.0` here, with no GitHub release pages; the
+  links below compare those tags. Versions 1.0.0 to 2.2.0 are unchanged on
+  PyPI, and releases from here on are tagged `v*` as before.
+
 ## [2.2.0] — 2026-10-06
 
 ### Added
@@ -486,11 +496,11 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.0...HEAD
-[2.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.1.0...v2.2.0
-[2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.0.0...v2.1.0
-[2.0.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.2.0...v2.0.0
-[1.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.1...v1.1.0
-[1.0.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/ianderso/gramps-evidence-mcp/releases/tag/v1.0.0
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.2.0...HEAD
+[2.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.1.0...release-2.2.0
+[2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.0.0...release-2.1.0
+[2.0.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-1.2.0...release-2.0.0
+[1.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-1.1.0...release-1.2.0
+[1.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-1.0.1...release-1.1.0
+[1.0.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-1.0.0...release-1.0.1
+[1.0.0]: https://github.com/ianderso/gramps-evidence-mcp/tree/release-1.0.0
