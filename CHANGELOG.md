@@ -8,15 +8,20 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [2.2.1] — 2026-10-09
+
+The package is the same as 2.2.0; this is the first release from the
+recreated repository.
+
 ### Changed
 
 - The repository was recreated on 2026-10-09 with its history rewritten, so
   every commit from 1.0.1 on has a new hash, and links to an old commit no
   longer resolve. GitHub keeps the tag names v1.0.0 to v2.2.0 reserved for
   the original immutable releases, so those versions are tagged
-  `release-1.0.0` to `release-2.2.0` here, with no GitHub release pages; the
-  links below compare those tags. Versions 1.0.0 to 2.2.0 are unchanged on
-  PyPI, and releases from here on are tagged `v*` as before.
+  `release-1.0.0` to `release-2.2.0` here, each with its release page
+  recreated; the links below compare those tags. Versions 1.0.0 to 2.2.0 are
+  unchanged on PyPI, and releases from 2.2.1 on are tagged `v*` as before.
 
 ## [2.2.0] — 2026-10-06
 
@@ -496,7 +501,8 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.2.0...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.2.0...v2.2.1
 [2.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.1.0...release-2.2.0
 [2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.0.0...release-2.1.0
 [2.0.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-1.2.0...release-2.0.0
