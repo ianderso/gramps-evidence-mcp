@@ -8,6 +8,30 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `get_timeline` reported every event uncited, with `citations: 0` and
+  `confidence: null` (TOOL-REQUESTS #30). gramps-webapi counts an event's
+  citations only when asked for `ratings`, and only `consolidated_timeline`
+  asked; now both do. Three more faults in the same output:
+  - `person` held the event type ("Birth"), from the server's `label`. It now
+    says whose event it is: `{gramps_id, name, relationship, role}`, with
+    `relationship` `self` for the person's own events and their families'.
+  - The server folds in a generation of relatives each way whether asked or
+    not -- its `ancestors` and `offspring` start at 1 -- so siblings' births
+    and children's marriages came back on a plain call. Without `ancestors`
+    or `offspring`, only the person's own events are kept now, before
+    `limit` is applied. `consolidated_timeline` keeps to the people named,
+    and its `anchor`, where an anchor had brought its relatives in too.
+  - `place` was the server's whole place profile, with every alternate name
+    of the place and of each place enclosing it: thirty events came to
+    163,649 characters. It is now the place's title and id; `get_place` has
+    the rest.
+
+  A family's timeline with `ancestors` or `offspring` failed with the
+  server's 422, since its endpoint takes neither; it is now refused with a
+  message saying to pass a member as a person.
+
 ## [2.2.1] — 2026-10-09
 
 The package is the same as 2.2.0; this is the first release from the

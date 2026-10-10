@@ -2886,11 +2886,13 @@ async def get_timeline(
     object_type: str = Field(default="person", description="Either 'person' or 'family'."),
     ancestors: int | None = Field(
         default=None,
-        description="Generations of ancestors whose events to fold in.",
+        description="Generations (1-5) of ancestors whose events to fold in. Omit this and "
+        "offspring for the person's own events only. Given either, the server adds at "
+        "least one generation each way; each event's person.relationship says whose it is.",
     ),
     offspring: int | None = Field(
         default=None,
-        description="Generations of descendants whose events to fold in.",
+        description="Generations (1-5) of descendants whose events to fold in.",
     ),
     limit: int = Field(default=200, description="Maximum events to return."),
     include_private: bool = _include_private(),

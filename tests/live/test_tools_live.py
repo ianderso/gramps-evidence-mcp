@@ -724,6 +724,59 @@ async def test_a_private_tasks_note_is_private_and_stays_so(live):
     assert (await _raw(live, "note", stored["note_list"][0]))["private"] is True
 
 
+# --------------------------------------------------------------------------- #
+# Timelines
+# --------------------------------------------------------------------------- #
+async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
+    """TOOL-REQUESTS #30: ratings asked for, relatives only on request, places short."""
+    county = await live("add_place", name="Brannock", place_type="County")
+    town = await live("add_place", name="Cedar Flat", place_type="City", parent=county["gramps_id"])
+    cited = {"source_title": "Register", "page": "p. 1"}
+    father = await live(
+        "add_person",
+        given="Elias",
+        surname="Wren",
+        birth={"date": "1740", "place": town["gramps_id"], "citation": cited},
+    )
+    son = await live(
+        "add_person",
+        given="Josiah",
+        surname="Wren",
+        birth={"date": "1770", "place": town["gramps_id"], "citation": cited},
+        death={"date": "1830", "citation": cited},
+    )
+    family = await live("add_family", father=father["gramps_id"], children=[son["gramps_id"]])
+
+    own = await live("get_timeline", target=son["gramps_id"])
+    assert "error" not in own, own
+    assert [e["type"] for e in own["events"]] == ["Birth", "Death"], own
+    birth = own["events"][0]
+    assert birth["citations"] == 1 and own["uncited_count"] == 0, own
+    assert birth["person"]["gramps_id"] == son["gramps_id"]
+    assert birth["person"]["name"] == "Josiah Wren"
+    assert birth["person"]["relationship"] == "self"
+    assert birth["place"]["gramps_id"] == town["gramps_id"]
+    assert set(birth["place"]) == {"title", "gramps_id"}
+
+    wider = await live("get_timeline", target=son["gramps_id"], ancestors=1)
+    fathers = [e for e in wider["events"] if e["person"]["gramps_id"] == father["gramps_id"]]
+    assert fathers, wider
+    assert fathers[0]["person"]["relationship"] != "self"
+
+    of_family = await live("get_timeline", target=family["gramps_id"], object_type="family")
+    assert "error" not in of_family, of_family
+    together = await live(
+        "consolidated_timeline",
+        targets=[father["gramps_id"], son["gramps_id"]],
+        anchor=son["gramps_id"],
+    )
+    assert "error" not in together, together
+    assert {e["person"]["gramps_id"] for e in together["events"]} == {
+        father["gramps_id"],
+        son["gramps_id"],
+    }
+
+
 async def test_ocr_media_routes_print_handwriting_and_a_scanned_pdf(live, tmp_path):
     import io
 

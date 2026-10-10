@@ -1177,7 +1177,8 @@ class GrampsWebClient:
             Which consolidated endpoint to read.
         **params
             ``handles``, ``anchor``, ``events``, ``event_classes``, ``dates``,
-            ``ratings``, ``discard_empty``, ``page``, ``pagesize``.
+            ``ratings``, ``omit_anchor`` (people only), ``discard_empty``,
+            ``page``, ``pagesize``.
 
         Returns
         -------
@@ -1511,14 +1512,18 @@ class GrampsWebClient:
             The anchor object's handle.
         **options
             ``ancestors``, ``offspring``, ``events``, ``event_classes``,
-            ``discard_empty``, ``first``, ``last``, ``page``, ``pagesize``,
-            ``locale``. None values are dropped.
+            ``ratings``, ``omit_anchor``, ``discard_empty``, ``first``,
+            ``last``, ``page``, ``pagesize``, ``locale``. None values are
+            dropped. The server refuses an argument the endpoint does not
+            take with 422: a family's timeline takes no ``ancestors``,
+            ``offspring`` or ``omit_anchor``.
 
         Returns
         -------
         list of dict
             Timeline event profiles, each carrying the anchor person's age,
-            the citation count and the highest confidence among them.
+            and, with ``ratings``, the citation count and the highest
+            confidence among them.
         """
         seg = ENDPOINTS[object_type]
         params = {k: v for k, v in options.items() if v is not None}

@@ -6870,16 +6870,23 @@ class GrampsService:
         handles = [await self._resolve_handle(object_type, r) for r in refs]
         anchor_handle = await self._resolve_handle(object_type, anchor) if anchor else None
         kind = "people" if object_type == "person" else "families"
+        named = set(handles) | {anchor_handle} if object_type == "person" else set()
+        # An anchor brings a generation of its relatives with it, as in
+        # get_timeline; only the people named are kept, so paging waits.
+        relatives = object_type == "person" and anchor_handle is not None
+        options: dict[str, Any] = {"pagesize": limit, "page": 1} if not relatives else {}
+        if object_type == "person":
+            options["omit_anchor"] = 0
         raw = await self.client.consolidated_timeline(
             kind,
             handles=",".join(handles),
             anchor=anchor_handle,
             events=event_types,
             ratings="1",
-            pagesize=limit,
-            page=1,
+            **options,
         )
-        named = set(handles) if object_type == "person" else set()
+        if relatives:
+            raw = [e for e in raw if _timeline_person(e) in named][:limit]
         events, withheld = await self._timeline_events(raw, named)
         return {
             "object_type": object_type,
@@ -7483,6 +7490,14 @@ class GrampsService:
         citations support it and the strongest confidence among them -- which
         makes a timeline a readable audit of where the evidence thins out.
 
+        gramps-webapi counts citations only when asked for ``ratings``, and
+        folds in a generation of relatives each way whether asked or not: its
+        ``ancestors`` and ``offspring`` start at 1 (TOOL-REQUESTS #30). So
+        ``ratings`` is always asked for, and without ``ancestors`` or
+        ``offspring`` only the person's own events are kept -- theirs, and
+        their families'. A family's timeline is its members' events; the
+        server takes no ``ancestors`` or ``offspring`` for one.
+
         Parameters
         ----------
         object_type : {"person", "family"}
@@ -7506,15 +7521,25 @@ class GrampsService:
                 "error": "unsupported_type",
                 "message": "Timelines exist for person and family only.",
             }
+        relatives = bool(ancestors or offspring)
+        if object_type == "family" and relatives:
+            return {
+                "error": "unsupported_option",
+                "message": "ancestors and offspring apply to a person's timeline. A "
+                "family's timeline is its members' events; pass a member as a person "
+                "to fold in their relatives.",
+            }
         handle = await self._resolve_handle(object_type, ref)
-        raw = await self.client.timeline(
-            object_type,
-            handle,
-            ancestors=ancestors,
-            offspring=offspring,
-            pagesize=limit,
-            page=1,
-        )
+        options: dict[str, Any] = {"ratings": 1}
+        if object_type == "person":
+            # The anchor's own entries carry their name and id only with this.
+            options.update(ancestors=ancestors or None, offspring=offspring or None, omit_anchor=0)
+        own_only = object_type == "person" and not relatives
+        if not own_only:
+            options.update(pagesize=limit, page=1)
+        raw = await self.client.timeline(object_type, handle, **options)
+        if own_only:
+            raw = [e for e in raw if _timeline_person(e) == handle][:limit]
         named = {handle} if object_type == "person" else set()
         events, withheld = await self._timeline_events(raw, named)
         return {
@@ -8391,15 +8416,34 @@ def _timeline_person(raw: dict) -> str | None:
 
 
 def _timeline_entry(raw: dict) -> dict:
-    """Shape one timeline event, keeping the evidence columns."""
+    """Shape one timeline event, keeping the evidence columns.
+
+    ``person`` says whose event it is: their id and name, how they are
+    related to the anchor (``self`` for the anchor's own events and their
+    families'), and their role in it. The server's ``label`` is the event
+    type, never a name. ``place`` is the place's title and id only: the
+    server's place profile carries every alternate name of the place and of
+    each place enclosing it, which made thirty events 163,649 characters
+    (TOOL-REQUESTS #30); get_place has the rest.
+    """
+    person = raw.get("person") or {}
+    place = raw.get("place") or {}
+    parts = (person.get(k) for k in ("name_given", "name_surname", "name_suffix"))
+    name = " ".join(part for part in parts if part)
+    title = place.get("display_name") or place.get("name")
     return {
         "gramps_id": raw.get("gramps_id"),
         "type": _type_string(raw.get("type")),
         "date": raw.get("date") or None,
-        "place": raw.get("place") or None,
+        "place": {"title": title, "gramps_id": place.get("gramps_id")} if place else None,
         "description": raw.get("description") or None,
         "age": raw.get("age") or None,
-        "person": raw.get("label") or raw.get("person") or None,
+        "person": {
+            "gramps_id": person.get("gramps_id"),
+            "name": name or None,
+            "relationship": person.get("relationship") or None,
+            "role": raw.get("role") or None,
+        },
         "citations": raw.get("citations") or 0,
         "confidence": raw.get("confidence"),
     }

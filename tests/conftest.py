@@ -246,8 +246,10 @@ class FakeGramps:
         #: handle -> {"living": bool} and the estimated-dates document.
         self.living: dict[str, bool] = {}
         self.living_dates: dict[str, dict] = {}
-        #: handle -> timeline event profiles.
+        #: handle -> timeline event profiles, as the server makes them with
+        #: ratings on and the anchor not omitted (see :func:`timeline_row`).
         self.timelines: dict[str, list[dict]] = {}
+        self.timeline_params: dict[str, str] = {}
         #: (handle1, handle2) -> span wording.
         self.spans: dict[tuple[str, str], str] = {}
         self.reindex_calls: list[dict[str, str]] = []
@@ -526,6 +528,44 @@ class FakeGramps:
         page = [_logged_change(c, params) for c in page]
         return httpx.Response(200, json=page, headers={"X-Total-Count": str(len(found))})
 
+    def _timeline(
+        self, endpoint: str, request: httpx.Request, rows: list[dict], anchor: str | None
+    ) -> httpx.Response:
+        """A timeline endpoint, as 3.21.1 to 3.23.1 answer (``api/resources/timeline.py``).
+
+        An unknown query argument is refused with 422, as every gramps-webapi
+        argument schema refuses one. ``citations`` and ``confidence`` come
+        only with ``ratings``, and the anchor's own rows carry no person
+        profile unless ``omit_anchor`` is off -- the two defaults that made
+        get_timeline report every event uncited (TOOL-REQUESTS #30).
+        """
+        params = request.url.params
+        unknown = sorted(set(params) - _TIMELINE_ARGS[endpoint])
+        if unknown:
+            return httpx.Response(
+                422, json={"error": {"code": 422, "message": f"{unknown}: Unknown field."}}
+            )
+        for depth in ("ancestors", "offspring"):
+            if depth in params and not 1 <= int(params[depth]) <= 5:
+                return httpx.Response(422, json={"error": {"code": 422, "message": depth}})
+        ratings = _query_bool(params.get("ratings"), default=False)
+        omit_anchor = _query_bool(params.get("omit_anchor"), default=True)
+        shaped = []
+        for row in rows:
+            row = copy.deepcopy(row)
+            if not ratings:
+                row.pop("citations", None)
+                row.pop("confidence", None)
+            person = row.get("person") or {}
+            if anchor and omit_anchor and person.get("handle") == anchor:
+                row["person"] = {"relationship": person.get("relationship", "self")}
+            shaped.append(row)
+        if params.get("page"):
+            size = int(params.get("pagesize") or 20)
+            start = (int(params["page"]) - 1) * size
+            shaped = shaped[start : start + size]
+        return httpx.Response(200, json=shaped)
+
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         method = request.method
@@ -569,7 +609,12 @@ class FakeGramps:
             return httpx.Response(200, json={"living": self.living.get(handle, False)})
         m_tl = re.match(r"^/api/(people|families)/([^/]+)/timeline$", path)
         if m_tl and method == "GET":
-            return httpx.Response(200, json=self.timelines.get(m_tl.group(2), []))
+            kind, handle = m_tl.group(1), m_tl.group(2)
+            self.timeline_params = dict(request.url.params)
+            anchor = handle if kind == "people" else None
+            return self._timeline(
+                f"{kind}/timeline", request, self.timelines.get(handle, []), anchor
+            )
         m_span = re.match(r"^/api/events/([^/]+)/span/([^/]+)$", path)
         if m_span and method == "GET":
             key = (m_span.group(1), m_span.group(2))
@@ -648,7 +693,12 @@ class FakeGramps:
         m_ctl = re.match(r"^/api/timelines/(people|families)/$", path)
         if m_ctl and method == "GET":
             self.consolidated_params = dict(request.url.params)
-            return httpx.Response(200, json=self.consolidated)
+            return self._timeline(
+                f"timelines/{m_ctl.group(1)}",
+                request,
+                self.consolidated,
+                request.url.params.get("anchor"),
+            )
         if path == "/api/tasks/" and method == "GET":
             return httpx.Response(200, json=self.task_list)
         m_dna = re.match(r"^/api/people/([^/]+)/dna/matches$", path)
@@ -1901,6 +1951,101 @@ def _display_name(person: dict) -> str:
     sl = name.get("surname_list", [])
     surname = sl[0].get("surname", "") if sl else ""
     return " ".join(p for p in (given, surname) if p)
+
+
+_TIMELINE_COMMON = {
+    "dates",
+    "discard_empty",
+    "event_classes",
+    "events",
+    "keys",
+    "locale",
+    "page",
+    "pagesize",
+    "ratings",
+    "skipkeys",
+    "strip",
+}
+#: The query arguments each timeline endpoint accepts, 3.21.1 to 3.23.1.
+_TIMELINE_ARGS = {
+    "people/timeline": _TIMELINE_COMMON
+    | {
+        "ancestors",
+        "first",
+        "last",
+        "name_format",
+        "offspring",
+        "omit_anchor",
+        "precision",
+        "relative_event_classes",
+        "relative_events",
+        "relatives",
+    },
+    "families/timeline": _TIMELINE_COMMON | {"name_format"},
+    "timelines/people": _TIMELINE_COMMON
+    | {"anchor", "filter", "first", "handles", "last", "omit_anchor", "precision", "rules"},
+    "timelines/families": _TIMELINE_COMMON | {"filter", "handles", "rules"},
+}
+
+
+def _query_bool(value: str | None, *, default: bool) -> bool:
+    """A query-string boolean as marshmallow reads one."""
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def timeline_row(
+    event: str,
+    event_type: str,
+    date: str,
+    person: dict | None = None,
+    *,
+    relationship: str = "self",
+    role: str = "Primary",
+    place: dict | None = None,
+    citations: int = 0,
+    confidence: int | None = None,
+) -> dict:
+    """One timeline event profile, shaped as gramps-webapi's ``Timeline.profile``.
+
+    ``label`` is the event type, with the relationship for a relative's
+    event; ``person`` is the person's profile, ``place`` the place's, with
+    its alternate names and enclosing places. ``citations`` and
+    ``confidence`` are what ``ratings`` adds; the fake drops them without it.
+    """
+    profile = {}
+    if person is not None:
+        name = person.get("primary_name") or {}
+        surnames = name.get("surname_list") or [{}]
+        profile = {
+            "handle": person["handle"],
+            "gramps_id": person.get("gramps_id"),
+            "name_given": name.get("first_name", ""),
+            "name_surname": surnames[0].get("surname", ""),
+            "name_suffix": "",
+            "sex": "U",
+            "birth": {},
+            "death": {},
+            "age": "",
+        }
+    profile["relationship"] = relationship
+    label = event_type if relationship == "self" else f"{event_type} ({relationship.title()})"
+    return {
+        "date": date,
+        "description": "",
+        "gramps_id": event,
+        "handle": f"h{event}",
+        "label": label,
+        "media": [],
+        "person": profile,
+        "place": place or {},
+        "age": "",
+        "type": event_type,
+        "role": role,
+        "citations": citations,
+        "confidence": confidence,
+    }
 
 
 @pytest.fixture(autouse=True)

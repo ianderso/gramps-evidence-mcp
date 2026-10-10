@@ -12,6 +12,8 @@ import json
 
 import pytest
 
+from .conftest import timeline_row
+
 
 # --------------------------------------------------------------------------- #
 # Reports
@@ -156,13 +158,24 @@ async def test_deleting_a_filter_touches_only_the_definition(tools):
 # --------------------------------------------------------------------------- #
 # Consolidated timeline
 # --------------------------------------------------------------------------- #
+async def _dead(tools, given: str, surname: str) -> dict:
+    """Someone born long ago, so privacy does not withhold their events."""
+    return await tools(
+        "add_person",
+        given=given,
+        surname=surname,
+        birth={"type": "Birth", "date": "1770", "citation": {"source_title": "S", "page": "p"}},
+    )
+
+
 async def test_consolidated_timeline_merges_several_people(tools):
     """Seeing a household move through censuses together is the point."""
-    a = await tools("add_person", given="Josiah", surname="Pembrook")
-    b = await tools("add_person", given="Mercy", surname="Ashbee")
+    a = await _dead(tools, "Josiah", "Pembrook")
+    b = await _dead(tools, "Mercy", "Ashbee")
+    people = tools.fake.store["person"]
     tools.fake.consolidated = [
-        {"gramps_id": "E0001", "type": "Census", "date": "1800", "citations": 1},
-        {"gramps_id": "E0002", "type": "Census", "date": "1810", "citations": 0},
+        timeline_row("E0001", "Census", "1800", people[a["handle"]], citations=1),
+        timeline_row("E0002", "Census", "1810", people[b["handle"]], relationship="wife"),
     ]
     out = await tools(
         "consolidated_timeline",
@@ -172,6 +185,41 @@ async def test_consolidated_timeline_merges_several_people(tools):
     assert out["included"] == 2
     assert out["event_count"] == 2
     assert out["uncited_count"] == 1
+    assert out["events"][1]["person"]["gramps_id"] == b["gramps_id"]
+
+
+async def test_consolidated_timeline_keeps_to_the_people_named(tools):
+    """An anchor brings its relatives with it; only the people named stay.
+
+    The same unasked generation each way as get_timeline (TOOL-REQUESTS #30).
+    """
+    a = await _dead(tools, "Josiah", "Pembrook")
+    b = await _dead(tools, "Mercy", "Ashbee")
+    sister = await _dead(tools, "Ruth", "Pembrook")
+    people = tools.fake.store["person"]
+    tools.fake.consolidated = [
+        timeline_row("E0001", "Birth", "1770", people[a["handle"]]),
+        timeline_row("E0002", "Birth", "1772", people[sister["handle"]], relationship="sister"),
+        timeline_row("E0003", "Birth", "1774", people[b["handle"]], relationship="wife"),
+    ]
+    out = await tools(
+        "consolidated_timeline", targets=[b["gramps_id"]], anchor=a["gramps_id"], limit=5
+    )
+    assert [e["gramps_id"] for e in out["events"]] == ["E0001", "E0003"]
+    assert tools.fake.consolidated_params["omit_anchor"] == "0"
+    assert "page" not in tools.fake.consolidated_params
+
+    out = await tools("consolidated_timeline", targets=[a["gramps_id"]], limit=5)
+    assert tools.fake.consolidated_params["page"] == "1"
+
+
+async def test_consolidated_family_timeline_sends_only_what_it_takes(tools):
+    """The families endpoint takes no omit_anchor; sent, the server answers 422."""
+    a = await tools("add_person", given="Josiah", surname="Pembrook")
+    fam = await tools("add_family", father=a["gramps_id"])
+    out = await tools("consolidated_timeline", targets=[fam["gramps_id"]], object_type="family")
+    assert "error" not in out
+    assert "omit_anchor" not in tools.fake.consolidated_params
 
 
 async def test_consolidated_timeline_asks_for_evidence_ratings(tools):

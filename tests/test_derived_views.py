@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from .conftest import timeline_row
+
 
 async def _two_people(tools) -> tuple[str, str, str, str]:
     """Create two people and return their gramps_ids and handles."""
@@ -123,24 +125,152 @@ async def test_living_assessment_does_not_change_bulk_redaction(tools):
 # --------------------------------------------------------------------------- #
 # get_timeline
 # --------------------------------------------------------------------------- #
+async def _born(tools, given: str, year: int) -> dict:
+    """A Pembrook born long ago, so privacy does not withhold their events."""
+    return await tools(
+        "add_person",
+        given=given,
+        surname="Pembrook",
+        birth={"type": "Birth", "date": str(year), "citation": {"source_title": "S", "page": "p"}},
+    )
+
+
 async def test_timeline_counts_uncited_events(tools):
-    """The count is the audit: how much of this life rests on nothing."""
-    a, _, ha, _ = await _two_people(tools)
-    tools.fake.timelines[ha] = [
-        {
-            "gramps_id": "E0001",
-            "type": "Birth",
-            "date": "1762",
-            "age": "0",
-            "citations": 2,
-            "confidence": 4,
-        },
-        {"gramps_id": "E0002", "type": "Residence", "date": "1801", "age": "39", "citations": 0},
+    """The count is the audit: how much of this life rests on nothing.
+
+    The server counts citations only when asked for ratings; unasked, every
+    event read as uncited (TOOL-REQUESTS #30).
+    """
+    anchor = await tools("add_person", given="Josiah", surname="Pembrook")
+    person = tools.fake.store["person"][anchor["handle"]]
+    tools.fake.timelines[anchor["handle"]] = [
+        timeline_row("E0001", "Birth", "1762", person, citations=2, confidence=4),
+        timeline_row("E0002", "Residence", "1801", person),
     ]
-    out = await tools("get_timeline", target=a)
+    out = await tools("get_timeline", target=anchor["gramps_id"])
+    assert tools.fake.timeline_params["ratings"] == "1"
     assert out["event_count"] == 2
     assert out["uncited_count"] == 1
+    assert out["events"][0]["citations"] == 2
     assert out["events"][0]["confidence"] == 4
+
+
+async def test_timeline_says_whose_event_each_is(tools):
+    """``person`` names the person and their role, never the event type.
+
+    It once held the server's label, "Birth", and nothing marked which
+    events were the anchor's own (TOOL-REQUESTS #30).
+    """
+    anchor = await tools("add_person", given="Josiah", surname="Pembrook")
+    father = await _born(tools, "Elias", 1735)
+    me = tools.fake.store["person"][anchor["handle"]]
+    dad = tools.fake.store["person"][father["handle"]]
+    tools.fake.timelines[anchor["handle"]] = [
+        timeline_row("E0001", "Birth", "1762", me),
+        timeline_row("E0002", "Death", "1790", dad, relationship="father"),
+        timeline_row("E0003", "Marriage", "1785", me, role="Family"),
+    ]
+    out = await tools("get_timeline", target=anchor["gramps_id"], ancestors=1)
+    people = {e["gramps_id"]: e["person"] for e in out["events"]}
+    assert people["E0001"] == {
+        "gramps_id": anchor["gramps_id"],
+        "name": "Josiah Pembrook",
+        "relationship": "self",
+        "role": "Primary",
+    }
+    assert people["E0002"]["gramps_id"] == father["gramps_id"]
+    assert people["E0002"]["relationship"] == "father"
+    assert people["E0003"]["role"] == "Family"
+
+
+async def test_timeline_leaves_relatives_out_unless_asked(tools):
+    """The server folds in a generation each way unasked; the tool does not.
+
+    Its ``ancestors`` and ``offspring`` start at 1, so siblings' births and
+    children's marriages came back on a plain call (TOOL-REQUESTS #30).
+    """
+    anchor = await tools("add_person", given="Josiah", surname="Pembrook")
+    sister = await _born(tools, "Mercy", 1764)
+    me = tools.fake.store["person"][anchor["handle"]]
+    sis = tools.fake.store["person"][sister["handle"]]
+    tools.fake.timelines[anchor["handle"]] = [
+        timeline_row("E0001", "Birth", "1762", me),
+        timeline_row("E0002", "Birth", "1764", sis, relationship="sister"),
+        timeline_row("E0003", "Marriage", "1785", me, role="Family"),
+    ]
+    out = await tools("get_timeline", target=anchor["gramps_id"])
+    assert [e["gramps_id"] for e in out["events"]] == ["E0001", "E0003"]
+    assert "ancestors" not in tools.fake.timeline_params
+    assert "page" not in tools.fake.timeline_params
+
+    out = await tools("get_timeline", target=anchor["gramps_id"], ancestors=1)
+    assert [e["gramps_id"] for e in out["events"]] == ["E0001", "E0002", "E0003"]
+
+
+async def test_timeline_limit_counts_the_persons_own_events(tools):
+    """Relatives are left out before the limit, so they do not use it up."""
+    anchor = await tools("add_person", given="Josiah", surname="Pembrook")
+    sister = await tools("add_person", given="Mercy", surname="Pembrook")
+    me = tools.fake.store["person"][anchor["handle"]]
+    sis = tools.fake.store["person"][sister["handle"]]
+    tools.fake.timelines[anchor["handle"]] = [
+        timeline_row("E0001", "Birth", "1764", sis, relationship="sister"),
+        timeline_row("E0002", "Birth", "1765", sis, relationship="sister"),
+        timeline_row("E0003", "Residence", "1780", me),
+        timeline_row("E0004", "Residence", "1790", me),
+        timeline_row("E0005", "Residence", "1800", me),
+    ]
+    out = await tools("get_timeline", target=anchor["gramps_id"], limit=2)
+    assert [e["gramps_id"] for e in out["events"]] == ["E0003", "E0004"]
+
+
+async def test_timeline_gives_a_place_as_title_and_id(tools):
+    """The server's place profile carries every alternate name, nested.
+
+    Thirty events came to 163,649 characters (TOOL-REQUESTS #30).
+    """
+    anchor = await tools("add_person", given="Josiah", surname="Pembrook")
+    me = tools.fake.store["person"][anchor["handle"]]
+    county = {
+        "gramps_id": "P0002",
+        "name": "Polk",
+        "type": "County",
+        "alternate_names": ["Polk Co."] * 50,
+        "alternate_place_names": [{"value": "Polk Co.", "date_str": ""}] * 50,
+    }
+    place = {
+        "gramps_id": "P0001",
+        "name": "Des Moines",
+        "type": "City",
+        "display_name": "Des Moines, Polk, Iowa, USA",
+        "handle": "hP0001",
+        "alternate_names": ["Fort Des Moines"] * 50,
+        "alternate_place_names": [{"value": "Fort Des Moines", "date_str": ""}] * 50,
+        "parent_places": [county],
+        "lat": None,
+        "long": None,
+    }
+    tools.fake.timelines[anchor["handle"]] = [
+        timeline_row("E0001", "Birth", "1762", me, place=place),
+    ]
+    out = await tools("get_timeline", target=anchor["gramps_id"])
+    assert out["events"][0]["place"] == {
+        "title": "Des Moines, Polk, Iowa, USA",
+        "gramps_id": "P0001",
+    }
+
+
+async def test_family_timeline_refuses_ancestors_and_offspring(tools):
+    """The family endpoint takes neither; sent, the server answers 422."""
+    a = await tools("add_person", given="Josiah", surname="Pembrook")
+    fam = await tools("add_family", father=a["gramps_id"])
+    out = await tools("get_timeline", target=fam["gramps_id"], object_type="family", ancestors=2)
+    assert out["error"] == "unsupported_option"
+
+    out = await tools("get_timeline", target=fam["gramps_id"], object_type="family")
+    assert out["event_count"] == 0
+    assert "omit_anchor" not in tools.fake.timeline_params
+    assert tools.fake.timeline_params["ratings"] == "1"
 
 
 async def test_timeline_withholds_a_living_relatives_events(tools):
@@ -162,30 +292,15 @@ async def test_timeline_withholds_a_living_relatives_events(tools):
         surname="Ashbee",
         birth={"type": "Birth", "date": "1850", "citation": {"source_title": "S", "page": "p"}},
     )
+    people = tools.fake.store["person"]
     tools.fake.timelines[anchor["handle"]] = [
-        {
-            "gramps_id": "E0101",
-            "type": "Residence",
-            "date": "1900",
-            "person": {"handle": anchor["handle"]},
-            "citations": 1,
-        },
-        {
-            "gramps_id": "E0102",
-            "type": "Birth",
-            "date": "1990",
-            "label": "Birth of Daughter",
-            "person": {"handle": child["handle"]},
-            "citations": 1,
-        },
-        {
-            "gramps_id": "E0103",
-            "type": "Birth",
-            "date": "1850",
-            "label": "Birth of Father",
-            "person": {"handle": elder["handle"]},
-            "citations": 1,
-        },
+        timeline_row("E0101", "Residence", "1900", people[anchor["handle"]], citations=1),
+        timeline_row(
+            "E0102", "Birth", "1990", people[child["handle"]], relationship="daughter", citations=1
+        ),
+        timeline_row(
+            "E0103", "Birth", "1850", people[elder["handle"]], relationship="father", citations=1
+        ),
     ]
     out = await tools("get_timeline", target=anchor["gramps_id"], offspring=1)
     assert [e["gramps_id"] for e in out["events"]] == ["E0101", "E0103"]
