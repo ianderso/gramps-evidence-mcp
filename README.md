@@ -504,7 +504,7 @@ unfiltered listing of the first 200 objects.
 
 | Tool | Purpose |
 | --- | --- |
-| `get_person` | Full detail: name, every alternate name (+ citation counts), gender, events, families, media. |
+| `get_person` | Full detail: name, every alternate name (+ citation counts), gender, events, attributes (+ citation counts), families, media. |
 | `get_family` | Relationship, parents, children, event count. |
 | `get_event` | Type, date (with its modifier: "between 1882 and 1883", never "1882"), place, description, citation count. |
 | `get_source` | Title, author, pubinfo, abbrev — and its real citation count. |

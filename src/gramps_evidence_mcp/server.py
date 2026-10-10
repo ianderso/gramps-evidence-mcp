@@ -1130,7 +1130,7 @@ async def get_person(
     person: str = Field(description="Person handle or gramps_id, e.g. 'I0001'."),
 ) -> dict:
     """Get full detail for one person: name, gender, events (with citation counts),
-    family links, and media count.
+    attributes, family links, and media count.
 
     Direct lookup is allowed even for living/private individuals (this is your own
     local tool); only bulk/list tools filter them. Use this to inspect someone
@@ -2391,8 +2391,9 @@ async def consolidated_timeline(
     object_type: str = Field(default="person", description="Either 'person' or 'family'."),
     anchor: str = Field(
         default="",
-        description="Handle or gramps_id of the central person, so ages are "
-        "reported relative to them.",
+        description="Handle or gramps_id of a central person. They are included, and each "
+        "event gets anchor_age, their age at it; age is always the age of the person "
+        "whose event it is.",
     ),
     event_types: str = Field(
         default="",

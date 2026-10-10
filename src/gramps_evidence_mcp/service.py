@@ -7085,8 +7085,8 @@ class GrampsService:
         refs : list of str
             Handles or gramps_ids to include.
         anchor : str, optional
-            Handle or gramps_id of the central person, so ages are reported
-            relative to them.
+            Handle or gramps_id of a central person: included, and each event
+            gets ``anchor_age``, their age at it.
         event_types : str, optional
             Comma-delimited event type names to include.
         limit : int, optional
@@ -7103,26 +7103,29 @@ class GrampsService:
                 "message": "Consolidated timelines exist for person and family.",
             }
         handles = [await self._resolve_handle(object_type, r) for r in refs]
-        anchor_handle = await self._resolve_handle(object_type, anchor) if anchor else None
+        anchor_handle = await self._resolve_handle("person", anchor) if anchor else None
+        if object_type == "person" and anchor_handle and anchor_handle not in handles:
+            handles.insert(0, anchor_handle)
         kind = "people" if object_type == "person" else "families"
-        named = set(handles) | {anchor_handle} if object_type == "person" else set()
-        # An anchor brings a generation of its relatives with it, as in
-        # get_timeline; only the people named are kept, so paging waits.
-        relatives = object_type == "person" and anchor_handle is not None
-        options: dict[str, Any] = {"pagesize": limit, "page": 1} if not relatives else {}
-        if object_type == "person":
-            options["omit_anchor"] = 0
+        # The anchor is never sent: given one, the server adds the others as
+        # its relatives, with their births, deaths and marriages only, and a
+        # generation of the anchor's own relatives besides (TOOL-REQUESTS #34).
         raw = await self.client.consolidated_timeline(
             kind,
             handles=",".join(handles),
-            anchor=anchor_handle,
             events=event_types,
             ratings="1",
-            **options,
+            pagesize=limit,
+            page=1,
         )
-        if relatives:
-            raw = [e for e in raw if _timeline_person(e) in named][:limit]
+        named = set(handles) if object_type == "person" else set()
+        if anchor_handle:
+            named.add(anchor_handle)
         events, withheld = await self._timeline_events(raw, named)
+        if anchor_handle:
+            ages = await self._ages_of(anchor_handle, raw)
+            for event in events:
+                event["anchor_age"] = ages.get(event["gramps_id"])
         return {
             "object_type": object_type,
             "included": len(handles),
@@ -7130,6 +7133,47 @@ class GrampsService:
             "uncited_count": sum(1 for e in events if not e["citations"]),
             "withheld_count": withheld,
             "events": events,
+        }
+
+    async def _ages_of(self, person: str, rows: list[dict]) -> dict[str, str | None]:
+        """A person's age at each timeline event, by the event's gramps_id.
+
+        Reckoned from the stored dates (:func:`mapping.age_between`) and the
+        person's birth, or their baptism or christening without one, as the
+        server reckons a timeline's ages.
+        """
+        held = await self.client.get_object(
+            "person", person, keys="handle,birth_ref_index,event_ref_list"
+        )
+        refs = held.get("event_ref_list") or []
+        found = [*(r.get("handle") for r in rows), *(r.get("ref") for r in refs)]
+        wanted = [h for h in dict.fromkeys(found) if h]
+        events: dict[str, dict] = {}
+        for start in range(0, len(wanted), 100):  # handles go in the URL
+            for event in await self.client.list_objects(
+                "event", handles=wanted[start : start + 100], keys="handle,type,date"
+            ):
+                events[event["handle"]] = event
+        index = held.get("birth_ref_index", -1)
+        birth = events.get(refs[index].get("ref")) if 0 <= index < len(refs) else None
+        if birth is None:
+            birth = next(
+                (
+                    events[r["ref"]]
+                    for r in refs
+                    if r.get("ref") in events
+                    and _type_string(events[r["ref"]].get("type")) in ("Baptism", "Christening")
+                    and _type_string(r.get("role")) in ("", "Primary")
+                ),
+                None,
+            )
+        if birth is None:
+            return {}
+        return {
+            row.get("gramps_id"): mapping.age_between(
+                birth.get("date"), (events.get(row.get("handle")) or {}).get("date")
+            )
+            for row in rows
         }
 
     async def list_jobs(self, limit: int = 25) -> dict:
@@ -9776,7 +9820,8 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
     Returns
     -------
     dict
-        Name, gender, events with citation counts, families and media.
+        Name, gender, events with citation counts, attributes, families and
+        media.
     """
     extended = obj.get("extended", {}) or {}
     profile = obj.get("profile", {}) or {}
@@ -9804,6 +9849,16 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
         "gender": mapping.gender_label(obj.get("gender")),
         "private": obj.get("private", False),
         "events": events,
+        # Seen only through get_object before (TOOL-REQUESTS #35).
+        "attributes": [
+            {
+                "type": _type_string(a.get("type")),
+                "value": a.get("value"),
+                "citation_count": len(a.get("citation_list") or []),
+                "private": bool(a.get("private")),
+            }
+            for a in obj.get("attribute_list") or []
+        ],
         "citation_count": len(obj.get("citation_list") or []),
         "family_handles": obj.get("family_list", []),
         "parent_family_handles": obj.get("parent_family_list", []),

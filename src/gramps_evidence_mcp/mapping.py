@@ -368,6 +368,48 @@ def year_from_date_dict(date: dict | None) -> int | None:
     return None
 
 
+def age_between(birth: dict | None, at: dict | None) -> str | None:
+    """Whole years from a birth date to another date, as an age: ``"34 years"``.
+
+    ``"about 34 years"`` when either date is less than a known day -- a year or
+    month alone, a modifier such as "before", an estimated or calculated date,
+    a range or span (its start is used). A rough answer, made in Python from
+    the stored dates where the server's own would need a request per event.
+
+    Parameters
+    ----------
+    birth, at : dict or None
+        Gramps ``Date`` dicts.
+
+    Returns
+    -------
+    str or None
+        The age; None for a text-only date, one with no year, or a date
+        before the birth.
+    """
+
+    def parts(date: dict | None) -> tuple[int, int, int, bool] | None:
+        if not date or date.get("modifier") == MOD_TEXTONLY:
+            return None
+        dateval = date.get("dateval") or []
+        if len(dateval) < 3 or not dateval[2]:
+            return None
+        day, month, year = (int(v or 0) for v in dateval[:3])
+        exact = bool(day and month) and not date.get("modifier") and not date.get("quality")
+        return year, month, day, exact
+
+    born, then = parts(birth), parts(at)
+    if not born or not then:
+        return None
+    years = then[0] - born[0]
+    if born[1] and then[1] and (then[1], then[2]) < (born[1], born[2]):
+        years -= 1
+    if years < 0:
+        return None
+    age = f"{years} year{'' if years == 1 else 's'}"
+    return age if born[3] and then[3] else f"about {age}"
+
+
 # ---- payload builders -------------------------------------------------------
 def name_payload(name: NameParts) -> dict:
     """Build a Gramps ``Name`` dict for use as a person's primary name.

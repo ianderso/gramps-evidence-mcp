@@ -180,3 +180,14 @@ async def test_value_or_remove_and_an_object_that_has_attributes(tools):
         "update_attribute", object_type="place", target=place["gramps_id"], name="X", value="Y"
     )
     assert out["error"] == "unsupported"
+
+
+async def test_get_person_shows_the_attributes(tools):
+    """TOOL-REQUESTS #35: a person's attributes were seen only through get_object."""
+    person = await _person_with(tools, ("Occupation", OCCUPATION), ("Nickname", "Hettie"))
+    await _cite_first_attribute(tools, person)
+    out = await tools("get_person", person=person["gramps_id"])
+    assert out["attributes"] == [
+        {"type": "Occupation", "value": OCCUPATION, "citation_count": 1, "private": False},
+        {"type": "Nickname", "value": "Hettie", "citation_count": 0, "private": False},
+    ]

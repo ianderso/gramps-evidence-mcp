@@ -2103,6 +2103,7 @@ def timeline_row(
     place: dict | None = None,
     citations: int = 0,
     confidence: int | None = None,
+    handle: str | None = None,
 ) -> dict:
     """One timeline event profile, shaped as gramps-webapi's ``Timeline.profile``.
 
@@ -2132,7 +2133,7 @@ def timeline_row(
         "date": date,
         "description": "",
         "gramps_id": event,
-        "handle": f"h{event}",
+        "handle": handle or f"h{event}",
         "label": label,
         "media": [],
         "person": profile,

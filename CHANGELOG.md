@@ -23,6 +23,9 @@ adding one is a minor release.
   citations, notes and privacy; a removed attribute's citations stay in the
   tree and are named in the result. `add_attribute`'s description points at
   it.
+- `get_person` shows the person's attributes -- type, value, citation count,
+  privacy -- as `get_event` and `get_source` show theirs (TOOL-REQUESTS #35).
+  They were seen only through `get_object`.
 
 - `get_timeline` reported every event uncited, with `citations: 0` and
   `confidence: null` (TOOL-REQUESTS #30). gramps-webapi counts an event's
@@ -76,6 +79,17 @@ adding one is a minor release.
   every person's event references with one GrampsQL query, spelt as found
   there, and remembered for the life of the process; a name found nowhere is
   still reported, as on no event reference in the tree.
+- `consolidated_timeline` with an `anchor` gave the other people named only
+  their births, deaths and marriages (TOOL-REQUESTS #34). Given an anchor,
+  gramps-webapi adds the others as the anchor's relatives, which bring only
+  those, adds a generation of the anchor's own relatives, and keeps to the
+  anchor's lifespan -- so a household's censuses appeared for the anchor
+  alone. The anchor is no longer sent: it is included among the people, so
+  every one's own events come back, and each event carries `anchor_age`, the
+  anchor's age at it, reckoned from the stored dates ("about" when either is
+  less than a known day). `age` is always the age of the person whose event
+  it is. A family timeline with an `anchor`, which the families endpoint
+  refused with 422, works.
 
 ## [2.2.1] — 2026-10-09
 

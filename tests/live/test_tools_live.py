@@ -740,6 +740,11 @@ async def test_update_attribute_sets_and_removes_one_in_place(live):
 
     out = await live("update_attribute", name="Occupation", value="Custodian, 1963", **target)
     assert "error" not in out, out
+    shown = await live("get_person", person=person["gramps_id"])
+    assert [(a["type"], a["value"], a["citation_count"]) for a in shown["attributes"]] == [
+        ("Occupation", "Custodian, 1963", 1),
+        ("Nickname", "Addie", 0),
+    ]
     stored = await live.client.get_object("person", person["handle"])
     assert [a["value"] for a in stored["attribute_list"]] == ["Custodian, 1963", "Addie"]
     assert stored["attribute_list"][0]["citation_list"] == [citation["handle"]]
@@ -800,16 +805,30 @@ async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
 
     of_family = await live("get_timeline", target=family["gramps_id"], object_type="family")
     assert "error" not in of_family, of_family
+    # TOOL-REQUESTS #34: with an anchor, a named person's events beyond birth,
+    # death and marriage come back too, each with the anchor's age at it.
+    await live(
+        "add_event_to_person",
+        person=father["gramps_id"],
+        event={"type": "Residence", "date": "1785", "citation": cited},
+    )
     together = await live(
-        "consolidated_timeline",
-        targets=[father["gramps_id"], son["gramps_id"]],
-        anchor=son["gramps_id"],
+        "consolidated_timeline", targets=[father["gramps_id"]], anchor=son["gramps_id"]
     )
     assert "error" not in together, together
     assert {e["person"]["gramps_id"] for e in together["events"]} == {
         father["gramps_id"],
         son["gramps_id"],
     }
+    [residence] = [e for e in together["events"] if e["type"] == "Residence"]
+    assert residence["anchor_age"] == "about 15 years", together
+    families = await live(
+        "consolidated_timeline",
+        targets=[family["gramps_id"]],
+        object_type="family",
+        anchor=son["gramps_id"],
+    )
+    assert "error" not in families, families
 
 
 # --------------------------------------------------------------------------- #
