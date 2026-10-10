@@ -67,6 +67,15 @@ adding one is a minor release.
     and gives it the description if it has none.
   - The target is looked up before the upload, so a mistyped one leaves no
     media object behind.
+- `add_event_ref` and `update_event_ref` said an attribute name was "used
+  nowhere else on this event or in the tree" when it was used on references
+  to other events: each household event's first `As enumerated` was flagged,
+  on a tree that uses it widely (TOOL-REQUESTS #33). Gramps keeps no list of
+  those names (`docs/PITFALLS.md` section 29), and only the event's own
+  references were looked at. A name the lists lack is now looked for on
+  every person's event references with one GrampsQL query, spelt as found
+  there, and remembered for the life of the process; a name found nowhere is
+  still reported, as on no event reference in the tree.
 
 ## [2.2.1] — 2026-10-09
 

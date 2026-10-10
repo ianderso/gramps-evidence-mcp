@@ -646,6 +646,18 @@ known name is refused as a likely typo unless `allow_new_type`. Nothing is
 added to any vocabulary either way. The live suite checks that the name stays
 out of `/api/types/`.
 
+Those lists missed a name used on references to *other* events: each household
+event's first `As enumerated` was reported as "used nowhere in the tree" on a
+tree that used it widely (TOOL-REQUESTS #33, 2026-10-09). GrampsQL can look:
+it sees a type as an object, a custom name in its `string` and a standard one
+with `string` empty and only its `value` set, and its `=` ignores case. So
+`event_ref_list.any.attribute_list.any.type.string = "As enumerated"` finds
+the people whose references carry it, though `...type = "As enumerated"`, the
+form the served JSON suggests, finds nobody. The tools ask that of a name the
+lists lack, which reads every person on the server, and remember a name found
+for the life of the process. Seen on a throwaway 3.21.1 on 2026-10-09; the
+live suite checks each of those answers.
+
 ## 30. A record's history before 3.22 is in the whole log
 
 3.22 serves one record's changes

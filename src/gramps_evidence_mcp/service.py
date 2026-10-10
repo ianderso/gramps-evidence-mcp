@@ -200,6 +200,8 @@ class GrampsService:
         self._open_spans: bool | None = None  # server stores "from X" / "to X"
         self._transkribus_api: ocr.TranskribusClient | None = None  # made on first use
         self._ledger_lock = asyncio.Lock()  # one Transkribus ledger change at a time
+        #: type key -> a spelling some event reference in the tree carries.
+        self._ref_names_in_tree: dict[str, str] = {}
 
     @property
     def exposing_private(self) -> bool:
@@ -1184,8 +1186,12 @@ class GrampsService:
         Matched like any type name (``docs/PITFALLS.md`` section 26): Gramps'
         standard attribute names, the tree's custom ones, and -- since Gramps
         keeps no list of the names used on event references (section 29) --
-        the names on every other reference to the same event. A name matching
-        none of them is accepted as new and reported; one close to a known
+        the names on every other reference to the same event. A name none of
+        those has is looked for on every person's event references
+        (:meth:`_ref_name_in_tree`), and spelt as found there: a household
+        event's first reference was told that ``As enumerated`` was used
+        nowhere in the tree, which used it widely (TOOL-REQUESTS #33). A name
+        found nowhere is accepted as new and reported; one close to a known
         name is refused as a likely typo unless ``allow_new_type``.
 
         Returns
@@ -1230,6 +1236,8 @@ class GrampsService:
             spelt = await self._canonical_type(
                 "attribute_types", name, True, types=types, custom_keys=lists
             )
+            if _type_key(spelt) not in known and (found := await self._ref_name_in_tree(spelt)):
+                known[_type_key(found)] = spelt = found
             if _type_key(spelt) not in known:
                 close = difflib.get_close_matches(_type_key(spelt), list(known), n=2, cutoff=0.8)
                 if close and not allow_new_type:
@@ -1241,6 +1249,42 @@ class GrampsService:
                 new.append(spelt)
             names[name] = spelt
         return names, new
+
+    async def _ref_name_in_tree(self, name: str) -> str | None:
+        """The spelling of an attribute name some person's event reference carries.
+
+        GrampsQL sees a type as an object: a custom name in its ``string``, a
+        standard one with ``string`` empty, and ``=`` ignores case
+        (``docs/PITFALLS.md`` section 29). So one query, which reads every
+        person on the server, says whether any reference carries the name. A
+        name found is remembered for the life of the process; one not found
+        is asked about again, since the write that follows may add it.
+
+        Returns
+        -------
+        str or None
+            The name as the tree spells it, or None when no reference has it.
+        """
+        key = _type_key(name)
+        if key in self._ref_names_in_tree:
+            return self._ref_names_in_tree[key]
+        if '"' in name or "\\" in name:
+            return None  # no way to quote it in GrampsQL
+        rows = await self.client.list_objects(
+            "person",
+            gql=f'event_ref_list.any.attribute_list.any.type.string = "{name}"',
+            keys="handle,event_ref_list",
+            pagesize=1,
+            page=1,
+        )
+        for row in rows:
+            for ref in row.get("event_ref_list") or []:
+                for attribute in ref.get("attribute_list") or []:
+                    spelt = _type_string(attribute.get("type"))
+                    if _type_key(spelt) == key:
+                        self._ref_names_in_tree[key] = spelt
+                        return spelt
+        return None
 
     async def delete_object(self, object_type: str, ref: str, carry_to: str | None = None) -> dict:
         """Delete an object by handle-or-gramps_id, without stranding evidence.
@@ -9608,8 +9652,8 @@ def _with_new_names(result: dict, new_names: list[str]) -> dict:
     if new_names:
         result["new_attribute_names"] = new_names
         result["message"] += (
-            f" ({', '.join(repr(n) for n in new_names)} used nowhere else on this event or "
-            "in the tree: check the spelling)"
+            f" ({', '.join(repr(n) for n in new_names)} on no event reference in the tree "
+            "and in no attribute list: check the spelling)"
         )
     return result
 

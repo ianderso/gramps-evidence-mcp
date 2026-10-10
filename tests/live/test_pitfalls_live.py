@@ -868,6 +868,32 @@ async def test_29_an_event_reference_attribute_name_joins_no_vocabulary(live):
     assert name not in json.dumps(await client.types())
 
 
+async def test_29_grampsql_finds_a_custom_name_on_any_event_reference(live):
+    """A type is an object to GrampsQL: a custom name in ``string``, a standard
+    one with ``string`` empty; ``=`` ignores case."""
+    client = live.client
+    census = await _event(client, "Census", "1880")
+    name = f"Enumerated as {uuid.uuid4().hex[:8]}"
+    ref = {
+        **_ref(census["handle"]),
+        "attribute_list": [
+            {"_class": "Attribute", "type": name, "value": "line 12"},
+            {"_class": "Attribute", "type": "Age", "value": "34"},
+        ],
+    }
+    person = await _person(client, event_ref_list=[ref])
+
+    async def found(query: str) -> list[str]:
+        rows = await client.list_objects("person", gql=query, keys="handle")
+        return [r["handle"] for r in rows]
+
+    path = "event_ref_list.any.attribute_list.any.type"
+    assert await found(f'{path}.string = "{name}"') == [person["handle"]]
+    assert await found(f'{path}.string = "{name.upper()}"') == [person["handle"]]
+    assert await found(f'{path} = "{name}"') == []
+    assert await found(f'{path}.string = "Age"') == []
+
+
 # --------------------------------------------------------------------------- #
 # 30: a record's history on 3.21 is in the whole log
 # --------------------------------------------------------------------------- #

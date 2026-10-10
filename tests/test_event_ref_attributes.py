@@ -62,6 +62,42 @@ async def test_a_name_no_list_knows_is_used_and_flagged(tools):
     assert "As enumerated" not in str(types["custom"])
 
 
+async def test_a_name_on_any_event_reference_in_the_tree_is_not_new(tools):
+    """TOOL-REQUESTS #33: "used nowhere in the tree" was said of a name on many.
+
+    The other references to the same event were the only ones looked at, so
+    each household event's first reference was warned about a name the tree
+    uses widely. A name no list knows is now looked for on every person's
+    event references, and spelt as found there.
+    """
+    _, wife, census = await _household(tools)
+    await tools(
+        "add_event_ref", person=wife["gramps_id"], event=census, attributes={"As enumerated": "x"}
+    )
+    other = await tools("add_person", given="Dora", surname="Pell")
+    added = await tools("add_event_to_person", person=other["gramps_id"], event=CENSUS)
+    out = await tools(
+        "update_event_ref",
+        person=other["gramps_id"],
+        event=added["event_handle"],
+        attributes={"as enumerated": "Pell, Dora, W, F, 51"},
+    )
+    assert "new_attribute_names" not in out, out
+    assert "nowhere" not in out["message"]
+    assert _attributes(_refs(tools, other, added["event_handle"])[0]) == [
+        ("As enumerated", "Pell, Dora, W, F, 51")
+    ]
+
+    out = await tools(
+        "update_event_ref",
+        person=other["gramps_id"],
+        event=added["event_handle"],
+        attributes={"Enumerator's note": "illegible"},
+    )
+    assert out["new_attribute_names"] == ["Enumerator's note"], out
+    assert "no event reference in the tree" in out["message"]
+
+
 async def test_a_name_on_another_reference_to_the_event_is_spelt_as_there(tools):
     head, wife, census = await _household(tools)
     son = await tools("add_person", given="Cyrus", surname="Turnbull")

@@ -1970,11 +1970,21 @@ def _gql_path(obj: Any, path: list[str], op: str, rhs: str, resolve) -> bool:
                 return False
         elif isinstance(result, dict):
             result = result.get(part)
+        elif part == "string" and isinstance(result, str):
+            # A type, served as its name, is an object to GrampsQL: a custom
+            # name is its ``string``; a standard one has it empty and is
+            # known by ``value`` only (PITFALLS 29, seen on 3.21.1).
+            result = "" if result in _STANDARD_TYPE_NAMES else result
         else:
             return False
         if result is None:
             return False
     return _gql_values(result, op, rhs)
+
+
+_STANDARD_TYPE_NAMES = {
+    name for names in _SERVER_SHAPES["types"].values() for name in names if isinstance(name, str)
+}
 
 
 def _gql_values(result: Any, op: str, rhs: str) -> bool:
