@@ -724,6 +724,140 @@ async def test_a_private_tasks_note_is_private_and_stays_so(live):
     assert (await _raw(live, "note", stored["note_list"][0]))["private"] is True
 
 
+# --------------------------------------------------------------------------- #
+# Attributes
+# --------------------------------------------------------------------------- #
+async def test_update_attribute_sets_and_removes_one_in_place(live):
+    """TOOL-REQUESTS #32: a value trimmed keeps its citation; a removal names it."""
+    [person] = await _people(live, "Ada")
+    target = {"object_type": "person", "target": person["gramps_id"]}
+    await live("add_attribute", name="Occupation", value="Custodian, 1963; no. 000", **target)
+    await live("add_attribute", name="Nickname", value="Addie", **target)
+    citation = await live("add_citation", citation={"source_title": "Index", "page": "entry 1"})
+    raw = await live.client.get_object("person", person["handle"])
+    raw["attribute_list"][0]["citation_list"] = [citation["handle"]]
+    await live.client.update_object("person", person["handle"], raw)
+
+    out = await live("update_attribute", name="Occupation", value="Custodian, 1963", **target)
+    assert "error" not in out, out
+    shown = await live("get_person", person=person["gramps_id"])
+    assert [(a["type"], a["value"], a["citation_count"]) for a in shown["attributes"]] == [
+        ("Occupation", "Custodian, 1963", 1),
+        ("Nickname", "Addie", 0),
+    ]
+    stored = await live.client.get_object("person", person["handle"])
+    assert [a["value"] for a in stored["attribute_list"]] == ["Custodian, 1963", "Addie"]
+    assert stored["attribute_list"][0]["citation_list"] == [citation["handle"]]
+
+    out = await live("update_attribute", name="Occupation", remove=True, **target)
+    assert out["citations_left"] == [citation["gramps_id"]], out
+    stored = await live.client.get_object("person", person["handle"])
+    assert [_t(a["type"]) for a in stored["attribute_list"]] == ["Nickname"]
+
+    source = await live("add_source", title="Pension File W.1")
+    on_source = {"object_type": "source", "target": source["gramps_id"]}
+    await live("add_attribute", name="Bears-On", value="I0001", allow_new_type=True, **on_source)
+    out = await live("update_attribute", name="Bears-On", value="I0001, I0002", **on_source)
+    assert "error" not in out, out
+
+
+# --------------------------------------------------------------------------- #
+# Timelines
+# --------------------------------------------------------------------------- #
+async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
+    """TOOL-REQUESTS #30: ratings asked for, relatives only on request, places short."""
+    county = await live("add_place", name="Brannock", place_type="County")
+    town = await live("add_place", name="Cedar Flat", place_type="City", parent=county["gramps_id"])
+    cited = {"source_title": "Register", "page": "p. 1"}
+    # The server drops what falls before the anchor's first event (its
+    # `first`), so the father's birth never shows on the son's timeline.
+    father = await live(
+        "add_person",
+        given="Elias",
+        surname="Wren",
+        birth={"date": "1740", "place": town["gramps_id"], "citation": cited},
+        death={"date": "1800", "citation": cited},
+    )
+    son = await live(
+        "add_person",
+        given="Josiah",
+        surname="Wren",
+        birth={"date": "1770", "place": town["gramps_id"], "citation": cited},
+        death={"date": "1830", "citation": cited},
+    )
+    family = await live("add_family", father=father["gramps_id"], children=[son["gramps_id"]])
+
+    own = await live("get_timeline", target=son["gramps_id"])
+    assert "error" not in own, own
+    assert [e["type"] for e in own["events"]] == ["Birth", "Death"], own
+    birth = own["events"][0]
+    assert birth["citations"] == 1 and own["uncited_count"] == 0, own
+    assert birth["person"]["gramps_id"] == son["gramps_id"]
+    assert birth["person"]["name"] == "Josiah Wren"
+    assert birth["person"]["relationship"] == "self"
+    assert birth["place"]["gramps_id"] == town["gramps_id"]
+    assert set(birth["place"]) == {"title", "gramps_id"}
+
+    wider = await live("get_timeline", target=son["gramps_id"], ancestors=1)
+    fathers = [e for e in wider["events"] if e["person"]["gramps_id"] == father["gramps_id"]]
+    assert [e["type"] for e in fathers] == ["Death"], wider
+    assert fathers[0]["person"]["relationship"] not in (None, "self")
+
+    of_family = await live("get_timeline", target=family["gramps_id"], object_type="family")
+    assert "error" not in of_family, of_family
+    # TOOL-REQUESTS #34: with an anchor, a named person's events beyond birth,
+    # death and marriage come back too, each with the anchor's age at it.
+    await live(
+        "add_event_to_person",
+        person=father["gramps_id"],
+        event={"type": "Residence", "date": "1785", "citation": cited},
+    )
+    together = await live(
+        "consolidated_timeline", targets=[father["gramps_id"]], anchor=son["gramps_id"]
+    )
+    assert "error" not in together, together
+    assert {e["person"]["gramps_id"] for e in together["events"]} == {
+        father["gramps_id"],
+        son["gramps_id"],
+    }
+    [residence] = [e for e in together["events"] if e["type"] == "Residence"]
+    assert residence["anchor_age"] == "about 15 years", together
+    families = await live(
+        "consolidated_timeline",
+        targets=[family["gramps_id"]],
+        object_type="family",
+        anchor=son["gramps_id"],
+    )
+    assert "error" not in families, families
+
+
+# --------------------------------------------------------------------------- #
+# Media
+# --------------------------------------------------------------------------- #
+async def test_attach_media_stores_the_file_in_the_object_it_creates(live, tmp_path):
+    """TOOL-REQUESTS #31: one request makes the object, holding the file."""
+    import hashlib
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (60, 80), "white").save(buf, format="PNG")
+    (tmp_path / "page.png").write_bytes(buf.getvalue())
+    source = await live("add_source", title="High School Yearbook, 1931")
+    args = {"target": source["gramps_id"], "target_type": "source"}
+    out = await live(
+        "attach_media", file_path=str(tmp_path / "page.png"), description="Page 12", **args
+    )
+    assert out["verified"] is True, out
+    stored = await _raw(live, "media", out["gramps_id"])
+    assert stored["checksum"] == hashlib.md5(buf.getvalue()).hexdigest()  # noqa: S324
+    assert (stored["mime"], stored["desc"]) == ("image/png", "Page 12")
+
+    again = await live("attach_media", file_path=str(tmp_path / "page.png"), **args)
+    assert again["media_created"] is False and again["handle"] == out["handle"], again
+
+
 async def test_ocr_media_routes_print_handwriting_and_a_scanned_pdf(live, tmp_path):
     import io
 

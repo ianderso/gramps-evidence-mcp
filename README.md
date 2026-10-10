@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 **read/write access to a Gramps genealogy tree**, plus a **read-only
 "reference layer"** over legacy GEDCOM exports.
 
-**96 tools, built around evidence discipline.** The premise is that an assistant
+**97 tools, built around evidence discipline.** The premise is that an assistant
 turned loose on a family tree will happily invent a plausible ancestor, so the
 write paths here are shaped to make every claim carry its source: facts are
 created with citations attached, `uncite` deletes what it orphans, parent-child
@@ -293,7 +293,7 @@ server does not authenticate callers itself; see
 ### 5. Add the connector in claude.ai
 
 **Settings → Connectors → Add custom connector →** paste
-`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 96 tools
+`https://gramps-mcp.example.org/mcp`, complete the auth prompt, and the 97 tools
 appear in chat. (Custom connectors require a paid Claude plan; on
 Team/Enterprise an admin may need to enable them.)
 
@@ -427,7 +427,7 @@ Request URLs are kept out of the log too, because a query filter travels in one.
 
 ## Tool reference
 
-**96 tools.** Every tool that mutates the tree re-fetches the *whole* object
+**97 tools.** Every tool that mutates the tree re-fetches the *whole* object
 before PUTting it back — edits through `service._mutate()` — see
 [the `keys=` trap](docs/PITFALLS.md#1-keys-plus-put-destroys-unfetched-fields).
 
@@ -488,6 +488,7 @@ unfiltered listing of the first 200 objects.
 | `move_child` | Move a child to another family, keeping the link's citations, notes and privacy, placed in birth order; every link back to the old family goes, a duplicated one too. |
 | `set_family_parent` | Set, replace (when asked) or remove the father or mother of an existing family, keeping both sides of each person's link. |
 | `update_event_ref` | A person's reference to a shared event, in place: the role, or an attribute set, added or removed by name, keeping its citations. |
+| `update_attribute` | Set or remove ONE attribute on a person, family, event, media object, source or citation, in place, keeping its citations; picked by name, and by part of its value where the name repeats. A removed attribute's citations are named. |
 | `update_object_fields` | Scalar fields on anything else (places, notes, repositories). Structural lists are refused. |
 | `update_place` | Place type, parent enclosure, name, title, coordinates. The parent must already exist (never minted from a name), cycles are refused, and multi-entry dated enclosures are refused rather than flattened. |
 | `update_url` | Edit or remove ONE existing URL entry on a person/place/repository, matched by substring — must match exactly one. The fix for a link filed under the wrong type. |
@@ -503,7 +504,7 @@ unfiltered listing of the first 200 objects.
 
 | Tool | Purpose |
 | --- | --- |
-| `get_person` | Full detail: name, every alternate name (+ citation counts), gender, events, families, media. |
+| `get_person` | Full detail: name, every alternate name (+ citation counts), gender, events, attributes (+ citation counts), families, media. |
 | `get_family` | Relationship, parents, children, event count. |
 | `get_event` | Type, date (with its modifier: "between 1882 and 1883", never "1882"), place, description, citation count. |
 | `get_source` | Title, author, pubinfo, abbrev — and its real citation count. |
@@ -798,7 +799,7 @@ stands in for. [CONTRIBUTING.md](CONTRIBUTING.md) says how to run it.
 
 ```
 src/gramps_evidence_mcp/    the MCP server
-  server.py                 tool definitions (the 96 tools) and the entry point
+  server.py                 tool definitions (the 97 tools) and the entry point
   service.py                genealogy operations; edits go through _mutate()
   client.py                 gramps-webapi REST client
   mapping.py                Gramps object <-> JSON shapes

@@ -441,9 +441,7 @@ async def test_add_media_reuses_an_identical_file(service, fake, tmp_path):
 
     first = await service.add_media(str(path), "Headstone of Ann Pembrook")
     assert first["created"] is True
-    # The fake echoes back what was stored; give it the checksum the real server
-    # would have computed on upload.
-    fake.store["media"][first["handle"]]["checksum"] = first["checksum"]
+    assert fake.store["media"][first["handle"]]["checksum"] == first["checksum"]
 
     second = await service.add_media(str(path), "Headstone (again)")
     assert second["created"] is False

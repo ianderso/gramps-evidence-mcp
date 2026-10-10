@@ -10,10 +10,12 @@ GrampsWebClient + GrampsService orchestration end-to-end.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import ipaddress
 import itertools
 import json
+import mimetypes
 import operator
 import os
 import re
@@ -246,8 +248,10 @@ class FakeGramps:
         #: handle -> {"living": bool} and the estimated-dates document.
         self.living: dict[str, bool] = {}
         self.living_dates: dict[str, dict] = {}
-        #: handle -> timeline event profiles.
+        #: handle -> timeline event profiles, as the server makes them with
+        #: ratings on and the anchor not omitted (see :func:`timeline_row`).
         self.timelines: dict[str, list[dict]] = {}
+        self.timeline_params: dict[str, str] = {}
         #: (handle1, handle2) -> span wording.
         self.spans: dict[tuple[str, str], str] = {}
         self.reindex_calls: list[dict[str, str]] = []
@@ -368,6 +372,15 @@ class FakeGramps:
         self.post_error: int | None = None
         #: When set, a POST of one object writes and then answers this status.
         self.post_error_after_commit: int | None = None
+        #: When set, the request carrying a file's bytes loses its connection,
+        #: "before" the server stores anything or "after" it has committed, or
+        #: is "refused" a connection at all (TOOL-REQUESTS #31).
+        self.upload_drop: str | None = None
+        #: Content-Type of every POST /api/media/, newest last.
+        self.media_posts: list[str] = []
+        #: When set, a new media object is stored with this mime type, whatever
+        #: was sent: a server that stored something other than the file.
+        self.media_mime_stored: str | None = None
         #: When set, GET /api/metadata/ fails with this status, once.
         self.metadata_error: int | None = None
         self.event_type_map: dict[str, str] = {
@@ -410,13 +423,15 @@ class FakeGramps:
         before = None
         if request.method in ("POST", "PUT", "DELETE") and "/token/" not in request.url.path:
             before = copy.deepcopy(self.store)
-        response = self._dispatch(request)
-        # A write that landed is in the log even when a later step failed and
-        # the answer was an error (PITFALLS 17); a refused one changed nothing.
-        if before is not None:
-            self._record_history(before, _txn_description(request))
-            self._learn_custom_types()
-        return response
+        try:
+            return self._dispatch(request)
+        finally:
+            # A write that landed is in the log even when a later step failed,
+            # or the connection did, before the answer (PITFALLS 17); a
+            # refused one changed nothing.
+            if before is not None:
+                self._record_history(before, _txn_description(request))
+                self._learn_custom_types()
 
     def _learn_custom_types(self) -> None:
         """Add each type name a stored object carries that is not a standard one.
@@ -526,6 +541,44 @@ class FakeGramps:
         page = [_logged_change(c, params) for c in page]
         return httpx.Response(200, json=page, headers={"X-Total-Count": str(len(found))})
 
+    def _timeline(
+        self, endpoint: str, request: httpx.Request, rows: list[dict], anchor: str | None
+    ) -> httpx.Response:
+        """A timeline endpoint, as 3.21.1 to 3.23.1 answer (``api/resources/timeline.py``).
+
+        An unknown query argument is refused with 422, as every gramps-webapi
+        argument schema refuses one. ``citations`` and ``confidence`` come
+        only with ``ratings``, and the anchor's own rows carry no person
+        profile unless ``omit_anchor`` is off -- the two defaults that made
+        get_timeline report every event uncited (TOOL-REQUESTS #30).
+        """
+        params = request.url.params
+        unknown = sorted(set(params) - _TIMELINE_ARGS[endpoint])
+        if unknown:
+            return httpx.Response(
+                422, json={"error": {"code": 422, "message": f"{unknown}: Unknown field."}}
+            )
+        for depth in ("ancestors", "offspring"):
+            if depth in params and not 1 <= int(params[depth]) <= 5:
+                return httpx.Response(422, json={"error": {"code": 422, "message": depth}})
+        ratings = _query_bool(params.get("ratings"), default=False)
+        omit_anchor = _query_bool(params.get("omit_anchor"), default=True)
+        shaped = []
+        for row in rows:
+            row = copy.deepcopy(row)
+            if not ratings:
+                row.pop("citations", None)
+                row.pop("confidence", None)
+            person = row.get("person") or {}
+            if anchor and omit_anchor and person.get("handle") == anchor:
+                row["person"] = {"relationship": person.get("relationship", "self")}
+            shaped.append(row)
+        if params.get("page"):
+            size = int(params.get("pagesize") or 20)
+            start = (int(params["page"]) - 1) * size
+            shaped = shaped[start : start + size]
+        return httpx.Response(200, json=shaped)
+
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         method = request.method
@@ -569,7 +622,12 @@ class FakeGramps:
             return httpx.Response(200, json={"living": self.living.get(handle, False)})
         m_tl = re.match(r"^/api/(people|families)/([^/]+)/timeline$", path)
         if m_tl and method == "GET":
-            return httpx.Response(200, json=self.timelines.get(m_tl.group(2), []))
+            kind, handle = m_tl.group(1), m_tl.group(2)
+            self.timeline_params = dict(request.url.params)
+            anchor = handle if kind == "people" else None
+            return self._timeline(
+                f"{kind}/timeline", request, self.timelines.get(handle, []), anchor
+            )
         m_span = re.match(r"^/api/events/([^/]+)/span/([^/]+)$", path)
         if m_span and method == "GET":
             key = (m_span.group(1), m_span.group(2))
@@ -648,7 +706,12 @@ class FakeGramps:
         m_ctl = re.match(r"^/api/timelines/(people|families)/$", path)
         if m_ctl and method == "GET":
             self.consolidated_params = dict(request.url.params)
-            return httpx.Response(200, json=self.consolidated)
+            return self._timeline(
+                f"timelines/{m_ctl.group(1)}",
+                request,
+                self.consolidated,
+                request.url.params.get("anchor"),
+            )
         if path == "/api/tasks/" and method == "GET":
             return httpx.Response(200, json=self.task_list)
         m_dna = re.match(r"^/api/people/([^/]+)/dna/matches$", path)
@@ -734,6 +797,8 @@ class FakeGramps:
             return httpx.Response(404, json={"message": f"unknown collection {seg}"})
 
         if rest == "":  # collection
+            if method == "POST" and typ == "media":
+                return self._create_media(request)
             if method == "POST":
                 return self._create(typ, request)
             if method == "GET":
@@ -746,11 +811,7 @@ class FakeGramps:
             if rest.endswith("/ocr") and method == "POST":
                 return self._ocr(handle, request)
             if rest.endswith("/file") and method == "PUT":
-                self.files[handle] = (
-                    request.content,
-                    request.headers.get("content-type", "application/octet-stream"),
-                )
-                return httpx.Response(200, json=[])
+                return self._replace_file(handle, request)
             if rest.endswith("/file") and method == "GET":
                 if handle not in self.store["media"] or handle not in self.files:
                     return httpx.Response(404, json={"message": "not found"})
@@ -874,6 +935,82 @@ class FakeGramps:
                 self.post_error_after_commit, text="<h1>Internal Server Error</h1>"
             )
         return httpx.Response(201, json=self._change_record(typ, obj, "add"))
+
+    def _create_media(self, request: httpx.Request) -> httpx.Response:
+        """POST /api/media/, as 3.21.1 to 3.23.1 answer it (``MediaObjectsResource.post``).
+
+        The body is the file, not a Media object: whatever is sent is stored
+        as the file under its md5, its Content-Type becomes the mime type, and
+        the server makes the handle. A Media object sent as JSON is stored as
+        a ``.json`` file (docs/PITFALLS.md section 32).
+        """
+        if self.write_forbidden:
+            return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
+        if self.post_error:
+            return httpx.Response(self.post_error, text="<h1>Internal Server Error</h1>")
+        mime = request.headers.get("content-type")
+        if not mime:
+            return httpx.Response(406, json={"message": "Media type not recognized"})
+        if self.upload_drop == "refused":
+            raise httpx.ConnectError("connection refused", request=request)
+        self.media_posts.append(mime)
+        if self.upload_drop == "before":
+            raise httpx.ReadError("connection lost", request=request)
+        content = request.content
+        checksum = hashlib.md5(content).hexdigest()  # noqa: S324 - the server's own
+        stored = self.media_mime_stored or mime
+        obj = _complete(
+            "Media",
+            {
+                "_class": "Media",
+                "checksum": checksum,
+                "path": f"{checksum}{mimetypes.guess_extension(stored) or ''}",
+                "mime": stored,
+            },
+        )
+        obj["handle"] = self._new_handle()
+        obj["gramps_id"] = self._new_gid("media")
+        obj["change"] = int(time.time())
+        self.store["media"][obj["handle"]] = obj
+        self.files[obj["handle"]] = (content, mime)
+        self.requests.append(("POST", "media", {"mime": mime, "bytes": len(content)}))
+        if self.upload_drop == "after":
+            raise httpx.ReadError("connection lost", request=request)
+        if self.post_error_after_commit:
+            return httpx.Response(
+                self.post_error_after_commit, text="<h1>Internal Server Error</h1>"
+            )
+        return httpx.Response(201, json=self._change_record("media", obj, "add"))
+
+    def _replace_file(self, handle: str, request: httpx.Request) -> httpx.Response:
+        """PUT /api/media/{handle}/file: the file replaced, and the object's
+        checksum, path and mime type with it (``MediaFileResource.put``)."""
+        media = self.store["media"].get(handle)
+        if media is None:
+            return httpx.Response(404, json={"message": "not found"})
+        mime = request.headers.get("content-type")
+        if not mime:
+            return httpx.Response(406, json={"message": "Media type not recognized"})
+        if self.upload_drop == "before":
+            raise httpx.ReadError("connection lost", request=request)
+        checksum = hashlib.md5(request.content).hexdigest()  # noqa: S324
+        if checksum == media.get("checksum"):
+            return httpx.Response(
+                409,
+                json={
+                    "message": "Uploaded file has the same checksum as the existing media object"
+                },
+            )
+        self.files[handle] = (request.content, mime)
+        media.update(
+            checksum=checksum,
+            path=f"{checksum}{mimetypes.guess_extension(mime) or ''}",
+            mime=mime,
+            change=int(time.time()),
+        )
+        if self.upload_drop == "after":
+            raise httpx.ReadError("connection lost", request=request)
+        return httpx.Response(200, json=self._change_record("media", media, "update"))
 
     def _update(self, typ: str, handle: str, request: httpx.Request) -> httpx.Response:
         if self.write_forbidden:
@@ -1833,11 +1970,21 @@ def _gql_path(obj: Any, path: list[str], op: str, rhs: str, resolve) -> bool:
                 return False
         elif isinstance(result, dict):
             result = result.get(part)
+        elif part == "string" and isinstance(result, str):
+            # A type, served as its name, is an object to GrampsQL: a custom
+            # name is its ``string``; a standard one has it empty and is
+            # known by ``value`` only (PITFALLS 29, seen on 3.21.1).
+            result = "" if result in _STANDARD_TYPE_NAMES else result
         else:
             return False
         if result is None:
             return False
     return _gql_values(result, op, rhs)
+
+
+_STANDARD_TYPE_NAMES = {
+    name for names in _SERVER_SHAPES["types"].values() for name in names if isinstance(name, str)
+}
 
 
 def _gql_values(result: Any, op: str, rhs: str) -> bool:
@@ -1901,6 +2048,102 @@ def _display_name(person: dict) -> str:
     sl = name.get("surname_list", [])
     surname = sl[0].get("surname", "") if sl else ""
     return " ".join(p for p in (given, surname) if p)
+
+
+_TIMELINE_COMMON = {
+    "dates",
+    "discard_empty",
+    "event_classes",
+    "events",
+    "keys",
+    "locale",
+    "page",
+    "pagesize",
+    "ratings",
+    "skipkeys",
+    "strip",
+}
+#: The query arguments each timeline endpoint accepts, 3.21.1 to 3.23.1.
+_TIMELINE_ARGS = {
+    "people/timeline": _TIMELINE_COMMON
+    | {
+        "ancestors",
+        "first",
+        "last",
+        "name_format",
+        "offspring",
+        "omit_anchor",
+        "precision",
+        "relative_event_classes",
+        "relative_events",
+        "relatives",
+    },
+    "families/timeline": _TIMELINE_COMMON | {"name_format"},
+    "timelines/people": _TIMELINE_COMMON
+    | {"anchor", "filter", "first", "handles", "last", "omit_anchor", "precision", "rules"},
+    "timelines/families": _TIMELINE_COMMON | {"filter", "handles", "rules"},
+}
+
+
+def _query_bool(value: str | None, *, default: bool) -> bool:
+    """A query-string boolean as marshmallow reads one."""
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def timeline_row(
+    event: str,
+    event_type: str,
+    date: str,
+    person: dict | None = None,
+    *,
+    relationship: str = "self",
+    role: str = "Primary",
+    place: dict | None = None,
+    citations: int = 0,
+    confidence: int | None = None,
+    handle: str | None = None,
+) -> dict:
+    """One timeline event profile, shaped as gramps-webapi's ``Timeline.profile``.
+
+    ``label`` is the event type, with the relationship for a relative's
+    event; ``person`` is the person's profile, ``place`` the place's, with
+    its alternate names and enclosing places. ``citations`` and
+    ``confidence`` are what ``ratings`` adds; the fake drops them without it.
+    """
+    profile = {}
+    if person is not None:
+        name = person.get("primary_name") or {}
+        surnames = name.get("surname_list") or [{}]
+        profile = {
+            "handle": person["handle"],
+            "gramps_id": person.get("gramps_id"),
+            "name_given": name.get("first_name", ""),
+            "name_surname": surnames[0].get("surname", ""),
+            "name_suffix": "",
+            "sex": "U",
+            "birth": {},
+            "death": {},
+            "age": "",
+        }
+    profile["relationship"] = relationship
+    label = event_type if relationship == "self" else f"{event_type} ({relationship.title()})"
+    return {
+        "date": date,
+        "description": "",
+        "gramps_id": event,
+        "handle": handle or f"h{event}",
+        "label": label,
+        "media": [],
+        "person": profile,
+        "place": place or {},
+        "age": "",
+        "type": event_type,
+        "role": role,
+        "citations": citations,
+        "confidence": confidence,
+    }
 
 
 @pytest.fixture(autouse=True)

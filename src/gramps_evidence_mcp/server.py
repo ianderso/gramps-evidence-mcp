@@ -191,8 +191,14 @@ def _error(exc: Exception) -> dict:
     if isinstance(exc, TranskribusError):
         return {"error": "transkribus", "status": exc.status, "message": exc.message}
     if isinstance(exc, FailedWriteError):
-        # A 5xx from a write, and what a re-read showed it did (TOOL-REQUESTS #28).
-        return {"error": "api", "status": exc.status, "written": exc.written, "message": exc.detail}
+        # A 5xx from a write, or a connection lost before its answer, and what
+        # a re-read showed it did (TOOL-REQUESTS #28, #31).
+        return {
+            "error": "api" if exc.status else "connection",
+            "status": exc.status,
+            "written": exc.written,
+            "message": exc.detail,
+        }
     if isinstance(exc, GrampsApiError):
         hint = ""
         if exc.status in (401, 403):
@@ -723,14 +729,42 @@ async def add_attribute(
     value: str = Field(description="Attribute value, e.g. 'Blacksmith'."),
     allow_new_type: bool = _allow_new_type(),
 ) -> dict:
-    """Add a typed key/value attribute to an object.
-
-    Sources and citations use a SrcAttribute; everything else uses an Attribute.
-    The right class is chosen automatically from object_type.
-    """
+    """Add a typed key/value attribute to an object. update_attribute changes
+    or removes one already there."""
     try:
         svc = await state.service_()
         return await svc.add_attribute(object_type, target, name, value, allow_new_type)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def update_attribute(
+    object_type: str = Field(
+        description="Type of the object: 'person', 'event', 'family', 'media', "
+        "'source', 'citation'."
+    ),
+    target: str = Field(description="Handle or gramps_id of the object."),
+    name: str = Field(description="Name (type) of the attribute to change, e.g. 'Occupation'."),
+    value: str | None = Field(default=None, description="Its new value. Omit when removing it."),
+    match: str | None = Field(
+        default=None,
+        description="Case-insensitive part of the current value, to pick one of several "
+        "attributes of this name. Matching none, or several that differ, changes nothing "
+        "and lists them.",
+    ),
+    remove: bool = Field(
+        default=False,
+        description="Remove the attribute. Its citations stay in the tree and are named.",
+    ),
+) -> dict:
+    """Set or remove ONE attribute on an object in place, keeping its
+    citations, notes and privacy."""
+    try:
+        svc = await state.service_()
+        return await svc.update_attribute(
+            object_type, target, name, value=value, match=match, remove=remove
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -1096,7 +1130,7 @@ async def get_person(
     person: str = Field(description="Person handle or gramps_id, e.g. 'I0001'."),
 ) -> dict:
     """Get full detail for one person: name, gender, events (with citation counts),
-    family links, and media count.
+    attributes, family links, and media count.
 
     Direct lookup is allowed even for living/private individuals (this is your own
     local tool); only bulk/list tools filter them. Use this to inspect someone
@@ -2357,8 +2391,9 @@ async def consolidated_timeline(
     object_type: str = Field(default="person", description="Either 'person' or 'family'."),
     anchor: str = Field(
         default="",
-        description="Handle or gramps_id of the central person, so ages are "
-        "reported relative to them.",
+        description="Handle or gramps_id of a central person. They are included, and each "
+        "event gets anchor_age, their age at it; age is always the age of the person "
+        "whose event it is.",
     ),
     event_types: str = Field(
         default="",
@@ -2886,11 +2921,13 @@ async def get_timeline(
     object_type: str = Field(default="person", description="Either 'person' or 'family'."),
     ancestors: int | None = Field(
         default=None,
-        description="Generations of ancestors whose events to fold in.",
+        description="Generations (1-5) of ancestors whose events to fold in. Omit this and "
+        "offspring for the person's own events only. Given either, the server adds at "
+        "least one generation each way; each event's person.relationship says whose it is.",
     ),
     offspring: int | None = Field(
         default=None,
-        description="Generations of descendants whose events to fold in.",
+        description="Generations (1-5) of descendants whose events to fold in.",
     ),
     limit: int = Field(default=200, description="Maximum events to return."),
     include_private: bool = _include_private(),

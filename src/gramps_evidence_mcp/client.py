@@ -18,6 +18,7 @@ contents.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -145,7 +146,8 @@ class FailedWriteError(GrampsApiError):
     for a write it rolled back -- a database that stayed locked past SQLite's
     five-second wait, ``docs/PITFALLS.md`` section 6 -- and for one it
     committed before a later step failed (section 17). So the record is read
-    again and the error says which.
+    again and the error says which. A connection lost before the answer says
+    as little, and is read again the same way; ``status`` is then None.
 
     Attributes
     ----------
@@ -154,26 +156,31 @@ class FailedWriteError(GrampsApiError):
         it changed, which this write or another session may have done.
     """
 
-    def __init__(self, cause: GrampsApiError, written: bool | None, what: str):
+    def __init__(
+        self, cause: GrampsApiError | httpx.TransportError, written: bool | None, what: str
+    ):
         """Wrap the server's error with what the re-read found."""
         self.written = written
-        if written is False:
-            told = (
-                f"Nothing was written: {what}. Retrying the same call is safe. A 5xx "
-                "that writes nothing is often the tree's SQLite database staying locked "
-                "past its five-second wait while another request reads or writes "
+        if isinstance(cause, GrampsApiError):
+            status, said = cause.status, f"The server said: {cause.detail}"
+            why = (
+                " A 5xx that writes nothing is often the tree's SQLite database staying "
+                "locked past its five-second wait while another request reads or writes "
                 "(docs/PITFALLS.md section 6), which a retry a little later gets past; "
                 "it is not the size of what was sent."
             )
+        else:
+            status, why = None, ""
+            said = f"The connection failed before the answer ({type(cause).__name__})."
+        if written is False:
+            told = f"Nothing was written: {what}. Retrying the same call is safe.{why}"
         else:
             told = (
                 f"The write may have landed: {what}. Another session may also have "
                 "written it. Re-read it before retrying."
             )
-        super().__init__(
-            cause.status, f"{told} The server said: {cause.detail}", method="", path=""
-        )
-        self.args = (f"HTTP {cause.status}: {told}",)
+        super().__init__(status, f"{told} {said}", method="", path="")  # type: ignore[arg-type]
+        self.args = (f"HTTP {status}: {told}" if status else f"Connection lost: {told}",)
 
 
 def new_handle() -> str:
@@ -313,6 +320,8 @@ class GrampsWebClient:
         *,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        content: bytes | None = None,
+        content_type: str | None = None,
         timeout: float | None = None,
     ) -> httpx.Response:
         """Send an authenticated request, refreshing once on 401.
@@ -327,6 +336,9 @@ class GrampsWebClient:
             Query parameters.
         json : Any, optional
             JSON request body.
+        content, content_type : bytes and str, optional
+            A raw request body -- a file's bytes -- and its Content-Type,
+            instead of ``json``.
         timeout : float, optional
             Seconds for this request only. Omitted, the client default applies.
 
@@ -343,15 +355,23 @@ class GrampsWebClient:
         if self._access is None:
             await self._renew(None)
         extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        if content is not None:
+            extra["content"] = content
+        typed = {"Content-Type": content_type} if content_type else {}
         sent = self._access
         resp = await self._http.request(
-            method, path, params=params, json=json, headers=self._auth_headers(), **extra
+            method, path, params=params, json=json, headers=self._auth_headers() | typed, **extra
         )
         if resp.status_code == 401:
             # Token probably expired; refresh or re-login, then retry once.
             await self._renew(sent)
             resp = await self._http.request(
-                method, path, params=params, json=json, headers=self._auth_headers(), **extra
+                method,
+                path,
+                params=params,
+                json=json,
+                headers=self._auth_headers() | typed,
+                **extra,
             )
         if resp.status_code >= 400:
             raise GrampsApiError(resp.status_code, _detail(resp), method=method, path=path)
@@ -744,18 +764,75 @@ class GrampsWebClient:
         GrampsApiError
             On any status of 400 or above, after one retry on 401.
         """
-        if self._access is None:
-            await self.login()
-        path = f"/api/media/{_seg(handle)}/file"
-        headers = {**self._auth_headers(), "Content-Type": mime}
-        resp = await self._http.put(path, content=content, headers=headers)
-        if resp.status_code == 401:
-            if not await self._refresh_token():
-                await self.login()
-            headers = {**self._auth_headers(), "Content-Type": mime}
-            resp = await self._http.put(path, content=content, headers=headers)
-        if resp.status_code >= 400:
-            raise GrampsApiError(resp.status_code, _detail(resp), method="PUT", path=path)
+        await self._request(
+            "PUT", f"/api/media/{_seg(handle)}/file", content=content, content_type=mime
+        )
+
+    async def create_media(self, content: bytes, mime: str) -> dict:
+        """Create a media object from a file, in one request.
+
+        ``POST /api/media/`` takes the file itself as its body, not a Media
+        object: the server stores the bytes under their md5, takes the
+        Content-Type as the mime type, and makes the handle. A JSON body is
+        stored as a ``.json`` file (``docs/PITFALLS.md`` section 32). So the
+        object either holds the whole file or does not exist.
+
+        The handle being the server's, a request that fails without a clear
+        refusal -- a 5xx, or a connection lost before the answer
+        (TOOL-REQUESTS #31) -- is looked up by checksum: found, the object
+        is returned as created; not found, nothing was written.
+
+        Parameters
+        ----------
+        content : bytes
+            The file's bytes.
+        mime : str
+            The file's Content-Type.
+
+        Returns
+        -------
+        dict
+            ``{"handle", "gramps_id", "new", "_raw"}``, as :meth:`create_object`
+            returns. After a failed request whose object landed,
+            ``late_error`` says what failed.
+
+        Raises
+        ------
+        FailedWriteError
+            When the request failed, saying whether the object exists.
+        """
+        try:
+            resp = await self._request(
+                "POST", self._collection("media"), content=content, content_type=mime
+            )
+        except (GrampsApiError, httpx.TransportError) as exc:
+            if isinstance(exc, GrampsApiError) and exc.status < 500:
+                raise
+            if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                raise  # never connected, so nothing was sent
+            checksum = hashlib.md5(content).hexdigest()  # noqa: S324 - the server's own
+            try:
+                found = await self.list_objects(
+                    "media", gql=f'checksum = "{checksum}"', keys="handle,gramps_id"
+                )
+            except (GrampsApiError, httpx.TransportError):
+                raise FailedWriteError(
+                    exc, None, "the new media object could not be looked up afterwards"
+                ) from exc
+            if not found:
+                raise FailedWriteError(
+                    exc, False, "no media object holds a file with this checksum"
+                ) from exc
+            late = exc.status if isinstance(exc, GrampsApiError) else type(exc).__name__
+            logger.warning("media %s created although the request failed (%s)", found[0], late)
+            return {
+                "handle": found[0]["handle"],
+                "gramps_id": found[0].get("gramps_id"),
+                "new": {},
+                "_raw": None,
+                "late_error": late,
+            }
+        return _normalize_write_response(resp.json(), "Media")
 
     # ----- merge -----
     async def merge(self, object_type: str, keep_handle: str, drop_handle: str) -> dict:
@@ -1177,7 +1254,8 @@ class GrampsWebClient:
             Which consolidated endpoint to read.
         **params
             ``handles``, ``anchor``, ``events``, ``event_classes``, ``dates``,
-            ``ratings``, ``discard_empty``, ``page``, ``pagesize``.
+            ``ratings``, ``omit_anchor`` (people only), ``discard_empty``,
+            ``page``, ``pagesize``.
 
         Returns
         -------
@@ -1511,14 +1589,18 @@ class GrampsWebClient:
             The anchor object's handle.
         **options
             ``ancestors``, ``offspring``, ``events``, ``event_classes``,
-            ``discard_empty``, ``first``, ``last``, ``page``, ``pagesize``,
-            ``locale``. None values are dropped.
+            ``ratings``, ``omit_anchor``, ``discard_empty``, ``first``,
+            ``last``, ``page``, ``pagesize``, ``locale``. None values are
+            dropped. The server refuses an argument the endpoint does not
+            take with 422: a family's timeline takes no ``ancestors``,
+            ``offspring`` or ``omit_anchor``.
 
         Returns
         -------
         list of dict
             Timeline event profiles, each carrying the anchor person's age,
-            the citation count and the highest confidence among them.
+            and, with ``ratings``, the citation count and the highest
+            confidence among them.
         """
         seg = ENDPOINTS[object_type]
         params = {k: v for k, v in options.items() if v is not None}

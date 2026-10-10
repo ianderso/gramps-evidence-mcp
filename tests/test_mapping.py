@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from gramps_evidence_mcp import mapping
 from gramps_evidence_mcp.mapping import (
     MOD_ABOUT,
     MOD_AFTER,
@@ -189,3 +190,17 @@ def test_date_display_shows_calculated_quality_and_calendar():
 def test_date_display_of_an_empty_date_is_none():
     assert date_display(parse_date(None)) is None
     assert date_display(None) is None
+
+
+def test_age_between_counts_whole_years_and_says_when_rough():
+    """The anchor's age on consolidated_timeline (TOOL-REQUESTS #34)."""
+    born = mapping.parse_date("10 Mar 1850")
+    assert mapping.age_between(born, mapping.parse_date("9 Mar 1880")) == "29 years"
+    assert mapping.age_between(born, mapping.parse_date("10 Mar 1880")) == "30 years"
+    assert mapping.age_between(born, mapping.parse_date("10 Mar 1851")) == "1 year"
+    assert mapping.age_between(born, mapping.parse_date("1880")) == "about 30 years"
+    assert mapping.age_between(born, mapping.parse_date("about 1 Jun 1880")) == "about 30 years"
+    assert mapping.age_between(mapping.parse_date("1850"), born) == "about 0 years"
+    assert mapping.age_between(born, mapping.parse_date("1849")) is None
+    assert mapping.age_between(born, mapping.parse_date("in the spring")) is None
+    assert mapping.age_between(None, born) is None

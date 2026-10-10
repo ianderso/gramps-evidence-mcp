@@ -200,6 +200,8 @@ class GrampsService:
         self._open_spans: bool | None = None  # server stores "from X" / "to X"
         self._transkribus_api: ocr.TranskribusClient | None = None  # made on first use
         self._ledger_lock = asyncio.Lock()  # one Transkribus ledger change at a time
+        #: type key -> a spelling some event reference in the tree carries.
+        self._ref_names_in_tree: dict[str, str] = {}
 
     @property
     def exposing_private(self) -> bool:
@@ -1184,8 +1186,12 @@ class GrampsService:
         Matched like any type name (``docs/PITFALLS.md`` section 26): Gramps'
         standard attribute names, the tree's custom ones, and -- since Gramps
         keeps no list of the names used on event references (section 29) --
-        the names on every other reference to the same event. A name matching
-        none of them is accepted as new and reported; one close to a known
+        the names on every other reference to the same event. A name none of
+        those has is looked for on every person's event references
+        (:meth:`_ref_name_in_tree`), and spelt as found there: a household
+        event's first reference was told that ``As enumerated`` was used
+        nowhere in the tree, which used it widely (TOOL-REQUESTS #33). A name
+        found nowhere is accepted as new and reported; one close to a known
         name is refused as a likely typo unless ``allow_new_type``.
 
         Returns
@@ -1230,6 +1236,8 @@ class GrampsService:
             spelt = await self._canonical_type(
                 "attribute_types", name, True, types=types, custom_keys=lists
             )
+            if _type_key(spelt) not in known and (found := await self._ref_name_in_tree(spelt)):
+                known[_type_key(found)] = spelt = found
             if _type_key(spelt) not in known:
                 close = difflib.get_close_matches(_type_key(spelt), list(known), n=2, cutoff=0.8)
                 if close and not allow_new_type:
@@ -1241,6 +1249,42 @@ class GrampsService:
                 new.append(spelt)
             names[name] = spelt
         return names, new
+
+    async def _ref_name_in_tree(self, name: str) -> str | None:
+        """The spelling of an attribute name some person's event reference carries.
+
+        GrampsQL sees a type as an object: a custom name in its ``string``, a
+        standard one with ``string`` empty, and ``=`` ignores case
+        (``docs/PITFALLS.md`` section 29). So one query, which reads every
+        person on the server, says whether any reference carries the name. A
+        name found is remembered for the life of the process; one not found
+        is asked about again, since the write that follows may add it.
+
+        Returns
+        -------
+        str or None
+            The name as the tree spells it, or None when no reference has it.
+        """
+        key = _type_key(name)
+        if key in self._ref_names_in_tree:
+            return self._ref_names_in_tree[key]
+        if '"' in name or "\\" in name:
+            return None  # no way to quote it in GrampsQL
+        rows = await self.client.list_objects(
+            "person",
+            gql=f'event_ref_list.any.attribute_list.any.type.string = "{name}"',
+            keys="handle,event_ref_list",
+            pagesize=1,
+            page=1,
+        )
+        for row in rows:
+            for ref in row.get("event_ref_list") or []:
+                for attribute in ref.get("attribute_list") or []:
+                    spelt = _type_string(attribute.get("type"))
+                    if _type_key(spelt) == key:
+                        self._ref_names_in_tree[key] = spelt
+                        return spelt
+        return None
 
     async def delete_object(self, object_type: str, ref: str, carry_to: str | None = None) -> dict:
         """Delete an object by handle-or-gramps_id, without stranding evidence.
@@ -1787,6 +1831,9 @@ class GrampsService:
                 "attach a Media object already in the tree.",
             }
 
+        # Resolved first, so a bad target fails before an orphan upload exists.
+        target_handle = await self._resolve_handle(target_type, target_ref)
+        notes: list[str] = []
         if media_ref:
             media = await self._resolve("media", media_ref, keys="handle,gramps_id,desc")
             media_handle = media["handle"]
@@ -1798,6 +1845,7 @@ class GrampsService:
             media_handle = uploaded["handle"]
             media = {"handle": media_handle, "gramps_id": uploaded.get("gramps_id")}
             created = uploaded.get("created", True)
+            notes = uploaded.get("notes", [])
 
         def edit(obj: dict) -> str | bool:
             media_list = obj.setdefault("media_list", [])
@@ -1814,7 +1862,12 @@ class GrampsService:
             )
             return "media attached"
 
-        result = await self._mutate(target_type, target_ref, edit, label="attached to")
+        try:
+            result = await self._mutate(target_type, target_handle, edit, label="attached to")
+        except (GrampsApiError, httpx.TransportError) as exc:
+            if not created:
+                raise
+            return _unattached_upload(media, target_type, target_ref, exc)
         attached = result.get("gramps_id")
         verified = await self._verify_in_list(
             target_type, result["handle"], "media_list", media_handle
@@ -1831,7 +1884,8 @@ class GrampsService:
                 if verified
                 else f"WARNING: media {media.get('gramps_id')} does NOT appear on "
                 f"{target_type} {attached} after the write. Nothing was attached."
-            ),
+            )
+            + "".join(f"; {n}" for n in notes),
         }
 
     # ------------------------------------------------------------------ #
@@ -2265,6 +2319,135 @@ class GrampsService:
             },
             result,
         )
+
+    async def update_attribute(
+        self,
+        object_type: str,
+        ref: str,
+        name: str,
+        value: str | None = None,
+        match: str | None = None,
+        remove: bool = False,
+    ) -> dict:
+        """Set or remove one attribute of an object in place (TOOL-REQUESTS #32).
+
+        ``add_attribute`` only appends, and ``update_object_fields`` refuses
+        ``attribute_list``, a structural list, so a value could be neither
+        corrected nor taken out. The attribute is chosen by its name, and,
+        where the name repeats, by ``match`` against its value. Several left
+        are refused with the candidates, unless they are identical in every
+        field, when any one is the same as another and the last is taken. A
+        value set keeps the attribute's citations, notes and privacy; an
+        attribute removed has its citations named, since nothing else may
+        reference them.
+
+        Parameters
+        ----------
+        object_type : {"person", "family", "event", "media", "source", "citation"}
+            Type of the object carrying the attribute.
+        ref : str
+            Handle or gramps_id.
+        name : str
+            The attribute's name (type), matched ignoring case and punctuation.
+        value : str, optional
+            The new value. Not with ``remove``.
+        match : str, optional
+            Case-insensitive substring of the current value.
+        remove : bool, optional
+            Remove the attribute instead of setting its value.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id, the attribute as it now is (or was, removed),
+            and a message; or an ``error`` key naming the candidates.
+        """
+        if object_type not in _ATTRIBUTE_HOLDERS:
+            return {
+                "error": "unsupported",
+                "message": f"Attributes are carried by {', '.join(sorted(_ATTRIBUTE_HOLDERS))}, "
+                f"not {object_type}. An event reference's are update_event_ref's.",
+            }
+        if remove == (value is not None):
+            return {
+                "error": "nothing_to_do",
+                "message": "Pass value to set the attribute's value, or remove=True to "
+                "remove it; not both.",
+            }
+        needle = (match or "").strip().lower()
+        found: dict[str, Any] = {}
+
+        def edit(obj: dict) -> str | bool:
+            attrs = obj.get("attribute_list") or []
+            named = [a for a in attrs if _type_key(_type_string(a.get("type"))) == _type_key(name)]
+            hits = [a for a in named if needle in str(a.get("value") or "").lower()]
+            found["listing"] = (
+                "; ".join(
+                    f"{_type_string(a.get('type'))}: {str(a.get('value') or '')[:60]}"
+                    for a in (named or attrs)
+                )
+                or f"(no attributes on this {object_type})"
+            )
+            if not hits:
+                found["error"] = "not_found"
+                return False
+            if any(a != hits[0] for a in hits[1:]):
+                found["error"] = "ambiguous"
+                found["count"] = len(hits)
+                return False
+            attr = hits[-1]
+            found["before"] = copy.deepcopy(attr)
+            label = _type_string(attr.get("type"))
+            if remove:
+                obj["attribute_list"] = [a for a in attrs if a is not attr]
+                return f"attribute '{label}' removed"
+            if attr.get("value") == value:
+                return False
+            attr["value"] = value
+            return f"attribute '{label}' set"
+
+        result = await self._mutate(object_type, ref, edit, label="updated")
+        who = f"{object_type} {result.get('gramps_id') or result['handle']}"
+        if "error" in found:
+            wanted = f"'{name}'" + (f" with '{match}' in its value" if match else "")
+            return _with_repairs(
+                {
+                    "error": found["error"],
+                    "message": (
+                        f"No attribute {wanted} on {who}."
+                        if found["error"] == "not_found"
+                        else f"{found['count']} attributes {wanted} on {who}: pass match, a "
+                        "part of the value that only the one you mean has."
+                    )
+                    + f" Attributes: {found['listing']}. Nothing was changed.",
+                },
+                result,
+            )
+        before = found["before"]
+        out = {
+            "object_type": object_type,
+            "handle": result["handle"],
+            "gramps_id": result.get("gramps_id"),
+            "changed": result.get("changed", True),
+            "attribute": {
+                "type": _type_string(before.get("type")),
+                "value": before.get("value") if remove else value,
+                "citation_count": len(before.get("citation_list") or []),
+            },
+            "message": result["message"],
+            **({"repaired": result["repaired"]} if result.get("repaired") else {}),
+        }
+        if remove and before.get("citation_list"):
+            rows = await self.client.list_objects(
+                "citation", handles=before["citation_list"], keys="handle,gramps_id"
+            )
+            left = [r.get("gramps_id") or r["handle"] for r in rows]
+            out["citations_left"] = left
+            out["message"] += (
+                f". Its citations stay in the tree: {', '.join(left)}; delete any that "
+                "now supports nothing"
+            )
+        return out
 
     async def add_url(
         self,
@@ -5409,7 +5592,14 @@ class GrampsService:
 
         One image, one Media object. The same photograph uploaded once per
         person it depicts produces duplicates that are tedious to unpick later,
-        so the default checks the md5 first.
+        so the default checks the md5 first; a reused object without a
+        description is given this one.
+
+        The file goes in the request that creates the object
+        (:meth:`GrampsWebClient.create_media`), so the object holds the whole
+        file or does not exist; one the server stored with another checksum
+        or mime type is removed again (TOOL-REQUESTS #31). The description
+        takes a second write, the create's body being the file.
         """
         path = Path(file_path).expanduser()
         if not path.exists():
@@ -5431,6 +5621,10 @@ class GrampsService:
             )
             if existing:
                 hit = existing[0]
+                # A retry after an upload whose description never landed.
+                if description and not hit.get("desc"):
+                    await self.update_media(hit["handle"], description=description)
+                    hit["desc"] = description
                 return {
                     "handle": hit["handle"],
                     "gramps_id": hit.get("gramps_id"),
@@ -5442,21 +5636,62 @@ class GrampsService:
                     f"Reusing it instead of uploading a duplicate.",
                 }
 
-        media = await self.client.create_object(
-            "media", {"_class": "Media", "path": path.name, "mime": mime, "desc": description}
+        media = await self.client.create_media(content, mime)
+        label = media.get("gramps_id") or media["handle"]
+        stored = await self.client.get_object(
+            "media", media["handle"], keys="handle,gramps_id,checksum,mime"
         )
-        await self.client.upload_media_bytes(media["handle"], content, mime)
-        # The create can land with an empty desc; set it explicitly afterwards.
+        if (stored.get("checksum"), stored.get("mime")) != (checksum, mime):
+            return await self._unwanted_media(label, media["handle"], path.name, stored)
+        notes = []
+        if media.get("late_error"):
+            notes.append(
+                f"the upload's request failed ({media['late_error']}) after the server had "
+                "stored it; a look-up by checksum found it"
+            )
         if description:
-            await self.update_media(media["handle"], description=description)
+            try:
+                await self.update_media(media["handle"], description=description)
+            except (GrampsApiError, httpx.TransportError) as exc:
+                logger.warning("media %s: description not set (%s)", label, type(exc).__name__)
+                notes.append(
+                    f"its description could not be set ({type(exc).__name__}): "
+                    f"update_media(ref='{label}', description=...)"
+                )
         return {
             "handle": media["handle"],
             "gramps_id": media.get("gramps_id"),
             "object_type": "media",
             "created": True,
             "checksum": checksum,
-            "message": f"Uploaded {path.name} as media {media.get('gramps_id')}. "
-            f"Attach it with attach_media(media_ref=...).",
+            **({"notes": notes} if notes else {}),
+            "message": f"Uploaded {path.name} as media {label}"
+            + "".join(f"; {n}" for n in notes)
+            + ". Attach it with attach_media(media_ref=...).",
+        }
+
+    async def _unwanted_media(self, label: str, handle: str, name: str, stored: dict) -> dict:
+        """Remove a new media object that does not hold the file sent.
+
+        It is junk -- a request body, say, where the image should be -- that
+        nothing references yet (TOOL-REQUESTS #31).
+        """
+        held = f"checksum {stored.get('checksum')}, mime {stored.get('mime')}"
+        try:
+            await self.client.delete_object("media", handle)
+        except (GrampsApiError, httpx.TransportError):
+            return {
+                "error": "upload_mismatch",
+                "written": True,
+                "message": f"The server stored media {label}, which does not hold {name} "
+                f"({held}), and it could not be removed again: delete it with "
+                f"delete_object('media', '{label}'). Nothing was attached.",
+            }
+        return {
+            "error": "upload_mismatch",
+            "written": False,
+            "message": f"The server stored a media object that does not hold {name} "
+            f"({held}), so it was removed again. Nothing was attached; retrying is safe.",
         }
 
     # ------------------------------------------------------------------ #
@@ -6850,8 +7085,8 @@ class GrampsService:
         refs : list of str
             Handles or gramps_ids to include.
         anchor : str, optional
-            Handle or gramps_id of the central person, so ages are reported
-            relative to them.
+            Handle or gramps_id of a central person: included, and each event
+            gets ``anchor_age``, their age at it.
         event_types : str, optional
             Comma-delimited event type names to include.
         limit : int, optional
@@ -6868,19 +7103,29 @@ class GrampsService:
                 "message": "Consolidated timelines exist for person and family.",
             }
         handles = [await self._resolve_handle(object_type, r) for r in refs]
-        anchor_handle = await self._resolve_handle(object_type, anchor) if anchor else None
+        anchor_handle = await self._resolve_handle("person", anchor) if anchor else None
+        if object_type == "person" and anchor_handle and anchor_handle not in handles:
+            handles.insert(0, anchor_handle)
         kind = "people" if object_type == "person" else "families"
+        # The anchor is never sent: given one, the server adds the others as
+        # its relatives, with their births, deaths and marriages only, and a
+        # generation of the anchor's own relatives besides (TOOL-REQUESTS #34).
         raw = await self.client.consolidated_timeline(
             kind,
             handles=",".join(handles),
-            anchor=anchor_handle,
             events=event_types,
             ratings="1",
             pagesize=limit,
             page=1,
         )
         named = set(handles) if object_type == "person" else set()
+        if anchor_handle:
+            named.add(anchor_handle)
         events, withheld = await self._timeline_events(raw, named)
+        if anchor_handle:
+            ages = await self._ages_of(anchor_handle, raw)
+            for event in events:
+                event["anchor_age"] = ages.get(event["gramps_id"])
         return {
             "object_type": object_type,
             "included": len(handles),
@@ -6888,6 +7133,47 @@ class GrampsService:
             "uncited_count": sum(1 for e in events if not e["citations"]),
             "withheld_count": withheld,
             "events": events,
+        }
+
+    async def _ages_of(self, person: str, rows: list[dict]) -> dict[str, str | None]:
+        """A person's age at each timeline event, by the event's gramps_id.
+
+        Reckoned from the stored dates (:func:`mapping.age_between`) and the
+        person's birth, or their baptism or christening without one, as the
+        server reckons a timeline's ages.
+        """
+        held = await self.client.get_object(
+            "person", person, keys="handle,birth_ref_index,event_ref_list"
+        )
+        refs = held.get("event_ref_list") or []
+        found = [*(r.get("handle") for r in rows), *(r.get("ref") for r in refs)]
+        wanted = [h for h in dict.fromkeys(found) if h]
+        events: dict[str, dict] = {}
+        for start in range(0, len(wanted), 100):  # handles go in the URL
+            for event in await self.client.list_objects(
+                "event", handles=wanted[start : start + 100], keys="handle,type,date"
+            ):
+                events[event["handle"]] = event
+        index = held.get("birth_ref_index", -1)
+        birth = events.get(refs[index].get("ref")) if 0 <= index < len(refs) else None
+        if birth is None:
+            birth = next(
+                (
+                    events[r["ref"]]
+                    for r in refs
+                    if r.get("ref") in events
+                    and _type_string(events[r["ref"]].get("type")) in ("Baptism", "Christening")
+                    and _type_string(r.get("role")) in ("", "Primary")
+                ),
+                None,
+            )
+        if birth is None:
+            return {}
+        return {
+            row.get("gramps_id"): mapping.age_between(
+                birth.get("date"), (events.get(row.get("handle")) or {}).get("date")
+            )
+            for row in rows
         }
 
     async def list_jobs(self, limit: int = 25) -> dict:
@@ -7483,6 +7769,14 @@ class GrampsService:
         citations support it and the strongest confidence among them -- which
         makes a timeline a readable audit of where the evidence thins out.
 
+        gramps-webapi counts citations only when asked for ``ratings``, and
+        folds in a generation of relatives each way whether asked or not: its
+        ``ancestors`` and ``offspring`` start at 1 (TOOL-REQUESTS #30). So
+        ``ratings`` is always asked for, and without ``ancestors`` or
+        ``offspring`` only the person's own events are kept -- theirs, and
+        their families'. A family's timeline is its members' events; the
+        server takes no ``ancestors`` or ``offspring`` for one.
+
         Parameters
         ----------
         object_type : {"person", "family"}
@@ -7506,15 +7800,25 @@ class GrampsService:
                 "error": "unsupported_type",
                 "message": "Timelines exist for person and family only.",
             }
+        relatives = bool(ancestors or offspring)
+        if object_type == "family" and relatives:
+            return {
+                "error": "unsupported_option",
+                "message": "ancestors and offspring apply to a person's timeline. A "
+                "family's timeline is its members' events; pass a member as a person "
+                "to fold in their relatives.",
+            }
         handle = await self._resolve_handle(object_type, ref)
-        raw = await self.client.timeline(
-            object_type,
-            handle,
-            ancestors=ancestors,
-            offspring=offspring,
-            pagesize=limit,
-            page=1,
-        )
+        options: dict[str, Any] = {"ratings": 1}
+        if object_type == "person":
+            # The anchor's own entries carry their name and id only with this.
+            options.update(ancestors=ancestors or None, offspring=offspring or None, omit_anchor=0)
+        own_only = object_type == "person" and not relatives
+        if not own_only:
+            options.update(pagesize=limit, page=1)
+        raw = await self.client.timeline(object_type, handle, **options)
+        if own_only:
+            raw = [e for e in raw if _timeline_person(e) == handle][:limit]
         named = {handle} if object_type == "person" else set()
         events, withheld = await self._timeline_events(raw, named)
         return {
@@ -8384,6 +8688,35 @@ def _reused_citation_refused(tool: str) -> dict:
     }
 
 
+def _unattached_upload(media: dict, target_type: str, target: str, exc: Exception) -> dict:
+    """Say that a file was uploaded and its attach failed, naming the object.
+
+    The upload is kept: the file is on the server whatever happens, since the
+    server never removes one (``docs/PITFALLS.md`` section 16), and a retry
+    with the same file finds the object by checksum.
+    """
+    label = media.get("gramps_id") or media["handle"]
+    if isinstance(exc, FailedWriteError):
+        written = exc.written
+    else:  # a refusal (4xx) wrote nothing; a lost connection may have
+        written = False if isinstance(exc, GrampsApiError) and exc.status < 500 else None
+    attach = (
+        "it was not attached"
+        if written is False
+        else f"whether it was attached is unknown: read {target_type} {target} before retrying"
+    )
+    return {
+        "error": "not_attached",
+        "handle": media["handle"],
+        "gramps_id": media.get("gramps_id"),
+        "media_created": True,
+        "written": written,
+        "message": f"The file was uploaded as media {label}, but attaching it to "
+        f"{target_type} {target} failed ({exc.args[0] if exc.args else type(exc).__name__}); "
+        f"{attach}. Retry with media_ref='{label}', or with the same file, which finds it.",
+    }
+
+
 def _timeline_person(raw: dict) -> str | None:
     """Handle of the person a timeline entry is about, if it names one."""
     person = raw.get("person")
@@ -8391,15 +8724,34 @@ def _timeline_person(raw: dict) -> str | None:
 
 
 def _timeline_entry(raw: dict) -> dict:
-    """Shape one timeline event, keeping the evidence columns."""
+    """Shape one timeline event, keeping the evidence columns.
+
+    ``person`` says whose event it is: their id and name, how they are
+    related to the anchor (``self`` for the anchor's own events and their
+    families'), and their role in it. The server's ``label`` is the event
+    type, never a name. ``place`` is the place's title and id only: the
+    server's place profile carries every alternate name of the place and of
+    each place enclosing it, which made thirty events 163,649 characters
+    (TOOL-REQUESTS #30); get_place has the rest.
+    """
+    person = raw.get("person") or {}
+    place = raw.get("place") or {}
+    parts = (person.get(k) for k in ("name_given", "name_surname", "name_suffix"))
+    name = " ".join(part for part in parts if part)
+    title = place.get("display_name") or place.get("name")
     return {
         "gramps_id": raw.get("gramps_id"),
         "type": _type_string(raw.get("type")),
         "date": raw.get("date") or None,
-        "place": raw.get("place") or None,
+        "place": {"title": title, "gramps_id": place.get("gramps_id")} if place else None,
         "description": raw.get("description") or None,
         "age": raw.get("age") or None,
-        "person": raw.get("label") or raw.get("person") or None,
+        "person": {
+            "gramps_id": person.get("gramps_id"),
+            "name": name or None,
+            "relationship": person.get("relationship") or None,
+            "role": raw.get("role") or None,
+        },
         "citations": raw.get("citations") or 0,
         "confidence": raw.get("confidence"),
     }
@@ -9233,6 +9585,9 @@ def _placeref_key(ref: dict) -> tuple:
 
 #: Object types with a media_list, and with a note_list.
 _MEDIA_HOLDERS = {"person", "family", "event", "place", "source", "citation"}
+#: Objects with an ``attribute_list``: a SrcAttribute on a source or citation,
+#: an Attribute on the rest.
+_ATTRIBUTE_HOLDERS = {"person", "family", "event", "media", "source", "citation"}
 _NOTE_HOLDERS = _MEDIA_HOLDERS | {"media", "repository"}
 
 
@@ -9341,8 +9696,8 @@ def _with_new_names(result: dict, new_names: list[str]) -> dict:
     if new_names:
         result["new_attribute_names"] = new_names
         result["message"] += (
-            f" ({', '.join(repr(n) for n in new_names)} used nowhere else on this event or "
-            "in the tree: check the spelling)"
+            f" ({', '.join(repr(n) for n in new_names)} on no event reference in the tree "
+            "and in no attribute list: check the spelling)"
         )
     return result
 
@@ -9465,7 +9820,8 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
     Returns
     -------
     dict
-        Name, gender, events with citation counts, families and media.
+        Name, gender, events with citation counts, attributes, families and
+        media.
     """
     extended = obj.get("extended", {}) or {}
     profile = obj.get("profile", {}) or {}
@@ -9493,6 +9849,16 @@ def _format_person(obj: dict, expose_private: bool) -> dict:
         "gender": mapping.gender_label(obj.get("gender")),
         "private": obj.get("private", False),
         "events": events,
+        # Seen only through get_object before (TOOL-REQUESTS #35).
+        "attributes": [
+            {
+                "type": _type_string(a.get("type")),
+                "value": a.get("value"),
+                "citation_count": len(a.get("citation_list") or []),
+                "private": bool(a.get("private")),
+            }
+            for a in obj.get("attribute_list") or []
+        ],
         "citation_count": len(obj.get("citation_list") or []),
         "family_handles": obj.get("family_list", []),
         "parent_family_handles": obj.get("parent_family_list", []),

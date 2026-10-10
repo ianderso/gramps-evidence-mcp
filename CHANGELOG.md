@@ -8,6 +8,90 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-10-09
+
+### Added
+
+- `update_attribute`: set or remove one attribute on a person, family,
+  event, media object, source or citation, in place (TOOL-REQUESTS #32).
+  `add_attribute` only appends and `update_object_fields` refuses
+  `attribute_list`, so a value could not be corrected or taken out: a
+  number moved into its own attribute stayed in the old one too. The
+  attribute is picked by name, ignoring case, and by `match`, part of its
+  value, where the name repeats; matching none, or several that differ,
+  changes nothing and lists them. A value set keeps the attribute's
+  citations, notes and privacy; a removed attribute's citations stay in the
+  tree and are named in the result. `add_attribute`'s description points at
+  it.
+- `get_person` shows the person's attributes -- type, value, citation count,
+  privacy -- as `get_event` and `get_source` show theirs (TOOL-REQUESTS #35).
+  They were seen only through `get_object`.
+
+### Fixed
+
+- `get_timeline` reported every event uncited, with `citations: 0` and
+  `confidence: null` (TOOL-REQUESTS #30). gramps-webapi counts an event's
+  citations only when asked for `ratings`, and only `consolidated_timeline`
+  asked; now both do. Three more faults in the same output:
+  - `person` held the event type ("Birth"), from the server's `label`. It now
+    says whose event it is: `{gramps_id, name, relationship, role}`, with
+    `relationship` `self` for the person's own events and their families'.
+  - The server folds in a generation of relatives each way whether asked or
+    not -- its `ancestors` and `offspring` start at 1 -- so siblings' births
+    and children's marriages came back on a plain call. Without `ancestors`
+    or `offspring`, only the person's own events are kept now, before
+    `limit` is applied.
+  - `place` was the server's whole place profile, with every alternate name
+    of the place and of each place enclosing it: thirty events came to
+    163,649 characters. It is now the place's title and id; `get_place` has
+    the rest.
+
+  A family's timeline with `ancestors` or `offspring` failed with the
+  server's 422, since its endpoint takes neither; it is now refused with a
+  message saying to pass a member as a person.
+- `attach_media` and `add_media` could leave a media object holding the
+  request body instead of the file (TOOL-REQUESTS #31). `POST /api/media/`
+  stores its body as the file (`docs/PITFALLS.md` section 32), and the tools
+  sent a JSON Media object there and the file afterwards, in a second
+  request; when that one's connection dropped, the object kept path
+  `<md5>.json` and mime `application/json`, with no description. Every
+  upload also left a `<md5>.json` file of a few hundred bytes in the media
+  directory, since the server never removes a file. Now the file goes in
+  the request that creates the object, so the object holds the whole file
+  or does not exist:
+  - A request that fails -- a 5xx, a connection lost before the answer -- is
+    looked up by the file's checksum, the handle being the server's: found,
+    the upload goes on and the result says what failed; not found, the error
+    says nothing was written (`"error": "connection"`, `written: false` for
+    a lost connection).
+  - An object the server stored with another checksum or mime type than the
+    file's is deleted before the error is returned.
+  - When the attach fails after the upload, the error (`not_attached`) names
+    the media object, which is kept; a retry with the same file finds it,
+    and gives it the description if it has none.
+  - The target is looked up before the upload, so a mistyped one leaves no
+    media object behind.
+- `add_event_ref` and `update_event_ref` said an attribute name was "used
+  nowhere else on this event or in the tree" when it was used on references
+  to other events: each household event's first `As enumerated` was flagged,
+  on a tree that uses it widely (TOOL-REQUESTS #33). Gramps keeps no list of
+  those names (`docs/PITFALLS.md` section 29), and only the event's own
+  references were looked at. A name the lists lack is now looked for on
+  every person's event references with one GrampsQL query, spelt as found
+  there, and remembered for the life of the process; a name found nowhere is
+  still reported, as on no event reference in the tree.
+- `consolidated_timeline` with an `anchor` gave the other people named only
+  their births, deaths and marriages (TOOL-REQUESTS #34). Given an anchor,
+  gramps-webapi adds the others as the anchor's relatives, which bring only
+  those, adds a generation of the anchor's own relatives, and keeps to the
+  anchor's lifespan -- so a household's censuses appeared for the anchor
+  alone. The anchor is no longer sent: it is included among the people, so
+  every one's own events come back, and each event carries `anchor_age`, the
+  anchor's age at it, reckoned from the stored dates ("about" when either is
+  less than a known day). `age` is always the age of the person whose event
+  it is. A family timeline with an `anchor`, which the families endpoint
+  refused with 422, works.
+
 ## [2.2.1] — 2026-10-09
 
 The package is the same as 2.2.0; this is the first release from the
@@ -501,7 +585,8 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.2.0...v2.2.1
 [2.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.1.0...release-2.2.0
 [2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.0.0...release-2.1.0

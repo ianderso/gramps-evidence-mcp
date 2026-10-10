@@ -97,6 +97,13 @@ async def test_no_editing_tool_ever_sends_a_partial_object(tools, tmp_path):
         value="Farmer",
     )
     await tools(
+        "update_attribute",
+        object_type="person",
+        target=ids["child"],
+        name="Occupation",
+        value="Farmer's widow",
+    )
+    await tools(
         "add_url",
         object_type="person",
         target=ids["child"],
