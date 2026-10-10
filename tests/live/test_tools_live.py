@@ -777,6 +777,33 @@ async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Media
+# --------------------------------------------------------------------------- #
+async def test_attach_media_stores_the_file_in_the_object_it_creates(live, tmp_path):
+    """TOOL-REQUESTS #31: one request makes the object, holding the file."""
+    import hashlib
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (60, 80), "white").save(buf, format="PNG")
+    (tmp_path / "page.png").write_bytes(buf.getvalue())
+    source = await live("add_source", title="High School Yearbook, 1931")
+    args = {"target": source["gramps_id"], "target_type": "source"}
+    out = await live(
+        "attach_media", file_path=str(tmp_path / "page.png"), description="Page 12", **args
+    )
+    assert out["verified"] is True, out
+    stored = await _raw(live, "media", out["gramps_id"])
+    assert stored["checksum"] == hashlib.md5(buf.getvalue()).hexdigest()  # noqa: S324
+    assert (stored["mime"], stored["desc"]) == ("image/png", "Page 12")
+
+    again = await live("attach_media", file_path=str(tmp_path / "page.png"), **args)
+    assert again["media_created"] is False and again["handle"] == out["handle"], again
+
+
 async def test_ocr_media_routes_print_handwriting_and_a_scanned_pdf(live, tmp_path):
     import io
 

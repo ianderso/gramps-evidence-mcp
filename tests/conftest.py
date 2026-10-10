@@ -10,10 +10,12 @@ GrampsWebClient + GrampsService orchestration end-to-end.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import ipaddress
 import itertools
 import json
+import mimetypes
 import operator
 import os
 import re
@@ -370,6 +372,15 @@ class FakeGramps:
         self.post_error: int | None = None
         #: When set, a POST of one object writes and then answers this status.
         self.post_error_after_commit: int | None = None
+        #: When set, the request carrying a file's bytes loses its connection,
+        #: "before" the server stores anything or "after" it has committed
+        #: (TOOL-REQUESTS #31).
+        self.upload_drop: str | None = None
+        #: Content-Type of every POST /api/media/, newest last.
+        self.media_posts: list[str] = []
+        #: When set, a new media object is stored with this mime type, whatever
+        #: was sent: a server that stored something other than the file.
+        self.media_mime_stored: str | None = None
         #: When set, GET /api/metadata/ fails with this status, once.
         self.metadata_error: int | None = None
         self.event_type_map: dict[str, str] = {
@@ -412,13 +423,15 @@ class FakeGramps:
         before = None
         if request.method in ("POST", "PUT", "DELETE") and "/token/" not in request.url.path:
             before = copy.deepcopy(self.store)
-        response = self._dispatch(request)
-        # A write that landed is in the log even when a later step failed and
-        # the answer was an error (PITFALLS 17); a refused one changed nothing.
-        if before is not None:
-            self._record_history(before, _txn_description(request))
-            self._learn_custom_types()
-        return response
+        try:
+            return self._dispatch(request)
+        finally:
+            # A write that landed is in the log even when a later step failed,
+            # or the connection did, before the answer (PITFALLS 17); a
+            # refused one changed nothing.
+            if before is not None:
+                self._record_history(before, _txn_description(request))
+                self._learn_custom_types()
 
     def _learn_custom_types(self) -> None:
         """Add each type name a stored object carries that is not a standard one.
@@ -784,6 +797,8 @@ class FakeGramps:
             return httpx.Response(404, json={"message": f"unknown collection {seg}"})
 
         if rest == "":  # collection
+            if method == "POST" and typ == "media":
+                return self._create_media(request)
             if method == "POST":
                 return self._create(typ, request)
             if method == "GET":
@@ -796,11 +811,7 @@ class FakeGramps:
             if rest.endswith("/ocr") and method == "POST":
                 return self._ocr(handle, request)
             if rest.endswith("/file") and method == "PUT":
-                self.files[handle] = (
-                    request.content,
-                    request.headers.get("content-type", "application/octet-stream"),
-                )
-                return httpx.Response(200, json=[])
+                return self._replace_file(handle, request)
             if rest.endswith("/file") and method == "GET":
                 if handle not in self.store["media"] or handle not in self.files:
                     return httpx.Response(404, json={"message": "not found"})
@@ -924,6 +935,80 @@ class FakeGramps:
                 self.post_error_after_commit, text="<h1>Internal Server Error</h1>"
             )
         return httpx.Response(201, json=self._change_record(typ, obj, "add"))
+
+    def _create_media(self, request: httpx.Request) -> httpx.Response:
+        """POST /api/media/, as 3.21.1 to 3.23.1 answer it (``MediaObjectsResource.post``).
+
+        The body is the file, not a Media object: whatever is sent is stored
+        as the file under its md5, its Content-Type becomes the mime type, and
+        the server makes the handle. A Media object sent as JSON is stored as
+        a ``.json`` file (docs/PITFALLS.md section 32).
+        """
+        if self.write_forbidden:
+            return httpx.Response(403, json={"message": "Forbidden: database is read-only"})
+        if self.post_error:
+            return httpx.Response(self.post_error, text="<h1>Internal Server Error</h1>")
+        mime = request.headers.get("content-type")
+        if not mime:
+            return httpx.Response(406, json={"message": "Media type not recognized"})
+        self.media_posts.append(mime)
+        if self.upload_drop == "before":
+            raise httpx.ReadError("connection lost", request=request)
+        content = request.content
+        checksum = hashlib.md5(content).hexdigest()  # noqa: S324 - the server's own
+        stored = self.media_mime_stored or mime
+        obj = _complete(
+            "Media",
+            {
+                "_class": "Media",
+                "checksum": checksum,
+                "path": f"{checksum}{mimetypes.guess_extension(stored) or ''}",
+                "mime": stored,
+            },
+        )
+        obj["handle"] = self._new_handle()
+        obj["gramps_id"] = self._new_gid("media")
+        obj["change"] = int(time.time())
+        self.store["media"][obj["handle"]] = obj
+        self.files[obj["handle"]] = (content, mime)
+        self.requests.append(("POST", "media", {"mime": mime, "bytes": len(content)}))
+        if self.upload_drop == "after":
+            raise httpx.ReadError("connection lost", request=request)
+        if self.post_error_after_commit:
+            return httpx.Response(
+                self.post_error_after_commit, text="<h1>Internal Server Error</h1>"
+            )
+        return httpx.Response(201, json=self._change_record("media", obj, "add"))
+
+    def _replace_file(self, handle: str, request: httpx.Request) -> httpx.Response:
+        """PUT /api/media/{handle}/file: the file replaced, and the object's
+        checksum, path and mime type with it (``MediaFileResource.put``)."""
+        media = self.store["media"].get(handle)
+        if media is None:
+            return httpx.Response(404, json={"message": "not found"})
+        mime = request.headers.get("content-type")
+        if not mime:
+            return httpx.Response(406, json={"message": "Media type not recognized"})
+        if self.upload_drop == "before":
+            raise httpx.ReadError("connection lost", request=request)
+        checksum = hashlib.md5(request.content).hexdigest()  # noqa: S324
+        if checksum == media.get("checksum"):
+            return httpx.Response(
+                409,
+                json={
+                    "message": "Uploaded file has the same checksum as the existing media object"
+                },
+            )
+        self.files[handle] = (request.content, mime)
+        media.update(
+            checksum=checksum,
+            path=f"{checksum}{mimetypes.guess_extension(mime) or ''}",
+            mime=mime,
+            change=int(time.time()),
+        )
+        if self.upload_drop == "after":
+            raise httpx.ReadError("connection lost", request=request)
+        return httpx.Response(200, json=self._change_record("media", media, "update"))
 
     def _update(self, typ: str, handle: str, request: httpx.Request) -> httpx.Response:
         if self.write_forbidden:

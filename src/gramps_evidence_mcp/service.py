@@ -1787,6 +1787,7 @@ class GrampsService:
                 "attach a Media object already in the tree.",
             }
 
+        notes: list[str] = []
         if media_ref:
             media = await self._resolve("media", media_ref, keys="handle,gramps_id,desc")
             media_handle = media["handle"]
@@ -1798,6 +1799,7 @@ class GrampsService:
             media_handle = uploaded["handle"]
             media = {"handle": media_handle, "gramps_id": uploaded.get("gramps_id")}
             created = uploaded.get("created", True)
+            notes = uploaded.get("notes", [])
 
         def edit(obj: dict) -> str | bool:
             media_list = obj.setdefault("media_list", [])
@@ -1814,7 +1816,12 @@ class GrampsService:
             )
             return "media attached"
 
-        result = await self._mutate(target_type, target_ref, edit, label="attached to")
+        try:
+            result = await self._mutate(target_type, target_ref, edit, label="attached to")
+        except (GrampsApiError, httpx.TransportError) as exc:
+            if not created:
+                raise
+            return _unattached_upload(media, target_type, target_ref, exc)
         attached = result.get("gramps_id")
         verified = await self._verify_in_list(
             target_type, result["handle"], "media_list", media_handle
@@ -1831,7 +1838,8 @@ class GrampsService:
                 if verified
                 else f"WARNING: media {media.get('gramps_id')} does NOT appear on "
                 f"{target_type} {attached} after the write. Nothing was attached."
-            ),
+            )
+            + "".join(f"; {n}" for n in notes),
         }
 
     # ------------------------------------------------------------------ #
@@ -5409,7 +5417,14 @@ class GrampsService:
 
         One image, one Media object. The same photograph uploaded once per
         person it depicts produces duplicates that are tedious to unpick later,
-        so the default checks the md5 first.
+        so the default checks the md5 first; a reused object without a
+        description is given this one.
+
+        The file goes in the request that creates the object
+        (:meth:`GrampsWebClient.create_media`), so the object holds the whole
+        file or does not exist; one the server stored with another checksum
+        or mime type is removed again (TOOL-REQUESTS #31). The description
+        takes a second write, the create's body being the file.
         """
         path = Path(file_path).expanduser()
         if not path.exists():
@@ -5431,6 +5446,10 @@ class GrampsService:
             )
             if existing:
                 hit = existing[0]
+                # A retry after an upload whose description never landed.
+                if description and not hit.get("desc"):
+                    await self.update_media(hit["handle"], description=description)
+                    hit["desc"] = description
                 return {
                     "handle": hit["handle"],
                     "gramps_id": hit.get("gramps_id"),
@@ -5442,21 +5461,62 @@ class GrampsService:
                     f"Reusing it instead of uploading a duplicate.",
                 }
 
-        media = await self.client.create_object(
-            "media", {"_class": "Media", "path": path.name, "mime": mime, "desc": description}
+        media = await self.client.create_media(content, mime)
+        label = media.get("gramps_id") or media["handle"]
+        stored = await self.client.get_object(
+            "media", media["handle"], keys="handle,gramps_id,checksum,mime"
         )
-        await self.client.upload_media_bytes(media["handle"], content, mime)
-        # The create can land with an empty desc; set it explicitly afterwards.
+        if (stored.get("checksum"), stored.get("mime")) != (checksum, mime):
+            return await self._unwanted_media(label, media["handle"], path.name, stored)
+        notes = []
+        if media.get("late_error"):
+            notes.append(
+                f"the upload's request failed ({media['late_error']}) after the server had "
+                "stored it; a look-up by checksum found it"
+            )
         if description:
-            await self.update_media(media["handle"], description=description)
+            try:
+                await self.update_media(media["handle"], description=description)
+            except (GrampsApiError, httpx.TransportError) as exc:
+                logger.warning("media %s: description not set (%s)", label, type(exc).__name__)
+                notes.append(
+                    f"its description could not be set ({type(exc).__name__}): "
+                    f"update_media(ref='{label}', description=...)"
+                )
         return {
             "handle": media["handle"],
             "gramps_id": media.get("gramps_id"),
             "object_type": "media",
             "created": True,
             "checksum": checksum,
-            "message": f"Uploaded {path.name} as media {media.get('gramps_id')}. "
-            f"Attach it with attach_media(media_ref=...).",
+            **({"notes": notes} if notes else {}),
+            "message": f"Uploaded {path.name} as media {label}"
+            + "".join(f"; {n}" for n in notes)
+            + ". Attach it with attach_media(media_ref=...).",
+        }
+
+    async def _unwanted_media(self, label: str, handle: str, name: str, stored: dict) -> dict:
+        """Remove a new media object that does not hold the file sent.
+
+        It is junk -- a request body, say, where the image should be -- that
+        nothing references yet (TOOL-REQUESTS #31).
+        """
+        held = f"checksum {stored.get('checksum')}, mime {stored.get('mime')}"
+        try:
+            await self.client.delete_object("media", handle)
+        except (GrampsApiError, httpx.TransportError):
+            return {
+                "error": "upload_mismatch",
+                "written": True,
+                "message": f"The server stored media {label}, which does not hold {name} "
+                f"({held}), and it could not be removed again: delete it with "
+                f"delete_object('media', '{label}'). Nothing was attached.",
+            }
+        return {
+            "error": "upload_mismatch",
+            "written": False,
+            "message": f"The server stored a media object that does not hold {name} "
+            f"({held}), so it was removed again. Nothing was attached; retrying is safe.",
         }
 
     # ------------------------------------------------------------------ #
@@ -8406,6 +8466,34 @@ def _reused_citation_refused(tool: str) -> dict:
         "message": f"{tool} records a claim of its own and mints its own citation. "
         "Pass source (or source_title) with page and confidence instead of an "
         "existing citation.",
+    }
+
+
+def _unattached_upload(media: dict, target_type: str, target: str, exc: Exception) -> dict:
+    """Say that a file was uploaded and its attach failed, naming the object.
+
+    The upload is kept: the file is on the server whatever happens, since the
+    server never removes one (``docs/PITFALLS.md`` section 16), and a retry
+    with the same file finds the object by checksum.
+    """
+    label = media.get("gramps_id") or media["handle"]
+    written = exc.written if isinstance(exc, FailedWriteError) else None
+    if isinstance(exc, GrampsApiError) and exc.status < 500:
+        written = False
+    attach = (
+        "it was not attached"
+        if written is False
+        else f"whether it was attached is unknown: read {target_type} {target} before retrying"
+    )
+    return {
+        "error": "not_attached",
+        "handle": media["handle"],
+        "gramps_id": media.get("gramps_id"),
+        "media_created": True,
+        "written": written,
+        "message": f"The file was uploaded as media {label}, but attaching it to "
+        f"{target_type} {target} failed ({exc.args[0] if exc.args else type(exc).__name__}); "
+        f"{attach}. Retry with media_ref='{label}', or with the same file, which finds it.",
     }
 
 

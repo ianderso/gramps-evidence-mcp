@@ -31,6 +31,26 @@ adding one is a minor release.
   A family's timeline with `ancestors` or `offspring` failed with the
   server's 422, since its endpoint takes neither; it is now refused with a
   message saying to pass a member as a person.
+- `attach_media` and `add_media` could leave a media object holding the
+  request body instead of the file (TOOL-REQUESTS #31). `POST /api/media/`
+  stores its body as the file (`docs/PITFALLS.md` section 32), and the tools
+  sent a JSON Media object there and the file afterwards, in a second
+  request; when that one's connection dropped, the object kept path
+  `<md5>.json` and mime `application/json`, with no description. Every
+  upload also left a `<md5>.json` file of a few hundred bytes in the media
+  directory, since the server never removes a file. Now the file goes in
+  the request that creates the object, so the object holds the whole file
+  or does not exist:
+  - A request that fails -- a 5xx, a connection lost before the answer -- is
+    looked up by the file's checksum, the handle being the server's: found,
+    the upload goes on and the result says what failed; not found, the error
+    says nothing was written (`"error": "connection"`, `written: false` for
+    a lost connection).
+  - An object the server stored with another checksum or mime type than the
+    file's is deleted before the error is returned.
+  - When the attach fails after the upload, the error (`not_attached`) names
+    the media object, which is kept; a retry with the same file finds it,
+    and gives it the description if it has none.
 
 ## [2.2.1] — 2026-10-09
 

@@ -191,8 +191,14 @@ def _error(exc: Exception) -> dict:
     if isinstance(exc, TranskribusError):
         return {"error": "transkribus", "status": exc.status, "message": exc.message}
     if isinstance(exc, FailedWriteError):
-        # A 5xx from a write, and what a re-read showed it did (TOOL-REQUESTS #28).
-        return {"error": "api", "status": exc.status, "written": exc.written, "message": exc.detail}
+        # A 5xx from a write, or a connection lost before its answer, and what
+        # a re-read showed it did (TOOL-REQUESTS #28, #31).
+        return {
+            "error": "api" if exc.status else "connection",
+            "status": exc.status,
+            "written": exc.written,
+            "message": exc.detail,
+        }
     if isinstance(exc, GrampsApiError):
         hint = ""
         if exc.status in (401, 403):

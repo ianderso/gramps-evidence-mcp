@@ -625,6 +625,9 @@ nothing was written; present, the create landed before a later step failed,
 and is taken as done. A retry of a create that did land is refused rather
 than duplicated. The live suite checks the kept handle and the refusal.
 
+A media object is the exception: `POST /api/media/` takes no object at all,
+and makes its own handle (section 32).
+
 ## 29. Attribute names on an event reference are in no vocabulary
 
 Gramps adds a custom attribute name to the tree's vocabulary when it stores a
@@ -693,3 +696,30 @@ tree the same day, read-only: a printed page's OCR came back as a task, a
 PDF's as `{}`, and both thumbnails as AVIF. The live suite checks the 422, the
 `{}`, the 501 or the text, and the AVIF; `ocr_media` polls the task, reads
 `string` as text, and does not send a PDF.
+
+## 32. `POST /api/media/` takes the file, not a Media object
+
+The body of `POST /api/media/` is stored as the media file, whatever it is:
+its md5 is the checksum, its Content-Type the mime type, the path
+`<md5><extension>`, and the server makes the handle and the gramps_id
+(`MediaObjectsResource.post` in `api/resources/media.py`, 3.21.1 to 3.23.1).
+A Media object sent there as JSON -- path, mime, description, handle -- is
+stored as a `.json` file, its fields ignored. `PUT /api/media/{handle}/file`
+replaces the file, and the checksum, path and mime with it, in a second
+transaction, and refuses the same checksum again with 409; the old file stays
+(section 16).
+
+Up to 2.2.1 the tools created a media object with a JSON `POST` and then sent
+the file with that `PUT`. So every upload left a `<md5>.json` file of a few
+hundred bytes in the media directory, and one whose `PUT` failed left a media
+object holding the request body: on 2026-10-09 a connection lost mid-upload
+left O1777, path `….json`, mime `application/json`, no description and no
+reference, on a research tree (TOOL-REQUESTS #31). Now the file goes in the
+`POST` (`GrampsWebClient.create_media`), so the object holds the whole file or
+does not exist. Since the handle is the server's, a request that fails -- a
+5xx, a lost connection -- is looked up by the file's checksum instead
+(section 28). The description takes a second write.
+
+Read from the 3.21.1 and 3.23.1 source on 2026-10-09. The live suite checks
+that a JSON body is stored as a `.json` file under a handle of the server's,
+and that a file sent in the `POST` is stored with its own checksum and mime.
