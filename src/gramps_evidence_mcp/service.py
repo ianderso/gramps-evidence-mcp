@@ -1787,6 +1787,8 @@ class GrampsService:
                 "attach a Media object already in the tree.",
             }
 
+        # Resolved first, so a bad target fails before an orphan upload exists.
+        target_handle = await self._resolve_handle(target_type, target_ref)
         notes: list[str] = []
         if media_ref:
             media = await self._resolve("media", media_ref, keys="handle,gramps_id,desc")
@@ -1817,7 +1819,7 @@ class GrampsService:
             return "media attached"
 
         try:
-            result = await self._mutate(target_type, target_ref, edit, label="attached to")
+            result = await self._mutate(target_type, target_handle, edit, label="attached to")
         except (GrampsApiError, httpx.TransportError) as exc:
             if not created:
                 raise
@@ -2389,6 +2391,7 @@ class GrampsService:
                 "citation_count": len(before.get("citation_list") or []),
             },
             "message": result["message"],
+            **({"repaired": result["repaired"]} if result.get("repaired") else {}),
         }
         if remove and before.get("citation_list"):
             rows = await self.client.list_objects(
@@ -2397,8 +2400,8 @@ class GrampsService:
             left = [r.get("gramps_id") or r["handle"] for r in rows]
             out["citations_left"] = left
             out["message"] += (
-                f". Its citations stay in the tree: {', '.join(left)}; uncite or delete "
-                "any that now supports nothing"
+                f". Its citations stay in the tree: {', '.join(left)}; delete any that "
+                "now supports nothing"
             )
         return out
 
@@ -8605,9 +8608,10 @@ def _unattached_upload(media: dict, target_type: str, target: str, exc: Exceptio
     with the same file finds the object by checksum.
     """
     label = media.get("gramps_id") or media["handle"]
-    written = exc.written if isinstance(exc, FailedWriteError) else None
-    if isinstance(exc, GrampsApiError) and exc.status < 500:
-        written = False
+    if isinstance(exc, FailedWriteError):
+        written = exc.written
+    else:  # a refusal (4xx) wrote nothing; a lost connection may have
+        written = False if isinstance(exc, GrampsApiError) and exc.status < 500 else None
     attach = (
         "it was not attached"
         if written is False

@@ -373,8 +373,8 @@ class FakeGramps:
         #: When set, a POST of one object writes and then answers this status.
         self.post_error_after_commit: int | None = None
         #: When set, the request carrying a file's bytes loses its connection,
-        #: "before" the server stores anything or "after" it has committed
-        #: (TOOL-REQUESTS #31).
+        #: "before" the server stores anything or "after" it has committed, or
+        #: is "refused" a connection at all (TOOL-REQUESTS #31).
         self.upload_drop: str | None = None
         #: Content-Type of every POST /api/media/, newest last.
         self.media_posts: list[str] = []
@@ -951,6 +951,8 @@ class FakeGramps:
         mime = request.headers.get("content-type")
         if not mime:
             return httpx.Response(406, json={"message": "Media type not recognized"})
+        if self.upload_drop == "refused":
+            raise httpx.ConnectError("connection refused", request=request)
         self.media_posts.append(mime)
         if self.upload_drop == "before":
             raise httpx.ReadError("connection lost", request=request)

@@ -63,6 +63,8 @@ adding one is a minor release.
   - When the attach fails after the upload, the error (`not_attached`) names
     the media object, which is kept; a retry with the same file finds it,
     and gives it the description if it has none.
+  - The target is looked up before the upload, so a mistyped one leaves no
+    media object behind.
 
 ## [2.2.1] — 2026-10-09
 

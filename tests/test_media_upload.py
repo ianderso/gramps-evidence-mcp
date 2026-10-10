@@ -14,6 +14,11 @@ from __future__ import annotations
 
 import hashlib
 
+import httpx
+
+from gramps_evidence_mcp.client import FailedWriteError
+from gramps_evidence_mcp.service import _unattached_upload
+
 PAGE = b"\xff\xd8\xff\xe0 a yearbook page, 1931"
 MD5 = hashlib.md5(PAGE).hexdigest()  # noqa: S324 - the server's own checksum
 
@@ -109,3 +114,33 @@ async def test_a_failed_attach_names_the_media_object_it_left(tools, tmp_path):
     assert retry["verified"] is True and retry["media_created"] is False, retry
     assert _media(tools)[0]["desc"] == "Yearbook page"
     assert _source_media(tools, source) == [media["handle"]]
+
+
+async def test_a_refused_connection_is_reported_as_one(tools, tmp_path):
+    """Nothing was sent, so there is nothing to look up."""
+    tools.fake.upload_drop = "refused"
+    _, out = await _attach(tools, tmp_path)
+    assert out["error"] == "connection", out
+    assert "written" not in out
+    assert _media(tools) == []
+
+
+async def test_an_unknown_target_uploads_nothing(tools, tmp_path):
+    path = tmp_path / "page.jpg"
+    path.write_bytes(PAGE)
+    out = await tools("attach_media", target="S9999", target_type="source", file_path=str(path))
+    assert out["error"] == "not_found", out
+    assert _media(tools) == []
+    assert tools.fake.media_posts == []
+
+
+def test_an_attach_lost_with_its_connection_may_have_landed():
+    """A lost connection carries no status; the result says to look."""
+    lost = FailedWriteError(httpx.ReadError("lost"), None, "source S0001 changed")
+    out = _unattached_upload({"handle": "h1", "gramps_id": "O0001"}, "source", "S0001", lost)
+    assert out["written"] is None
+    assert "read source S0001 before retrying" in out["message"]
+    out = _unattached_upload(
+        {"handle": "h1", "gramps_id": "O0001"}, "source", "S0001", httpx.ReadError("lost")
+    )
+    assert out["written"] is None

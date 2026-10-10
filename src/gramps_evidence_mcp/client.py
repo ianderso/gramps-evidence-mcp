@@ -808,6 +808,8 @@ class GrampsWebClient:
         except (GrampsApiError, httpx.TransportError) as exc:
             if isinstance(exc, GrampsApiError) and exc.status < 500:
                 raise
+            if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                raise  # never connected, so nothing was sent
             checksum = hashlib.md5(content).hexdigest()  # noqa: S324 - the server's own
             try:
                 found = await self.list_objects(
