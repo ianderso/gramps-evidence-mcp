@@ -764,11 +764,14 @@ async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
     county = await live("add_place", name="Brannock", place_type="County")
     town = await live("add_place", name="Cedar Flat", place_type="City", parent=county["gramps_id"])
     cited = {"source_title": "Register", "page": "p. 1"}
+    # The server drops what falls before the anchor's first event (its
+    # `first`), so the father's birth never shows on the son's timeline.
     father = await live(
         "add_person",
         given="Elias",
         surname="Wren",
         birth={"date": "1740", "place": town["gramps_id"], "citation": cited},
+        death={"date": "1800", "citation": cited},
     )
     son = await live(
         "add_person",
@@ -792,8 +795,8 @@ async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
 
     wider = await live("get_timeline", target=son["gramps_id"], ancestors=1)
     fathers = [e for e in wider["events"] if e["person"]["gramps_id"] == father["gramps_id"]]
-    assert fathers, wider
-    assert fathers[0]["person"]["relationship"] != "self"
+    assert [e["type"] for e in fathers] == ["Death"], wider
+    assert fathers[0]["person"]["relationship"] not in (None, "self")
 
     of_family = await live("get_timeline", target=family["gramps_id"], object_type="family")
     assert "error" not in of_family, of_family
