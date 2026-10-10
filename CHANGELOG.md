@@ -8,6 +8,8 @@ adding one is a minor release.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-10-09
+
 ### Added
 
 - `update_attribute`: set or remove one attribute on a person, family,
@@ -559,7 +561,8 @@ The first public release.
 - A `.env` file is read from the working directory only. Logs carry ids,
   handles and operation names, never record contents.
 
-[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.2.0...v2.2.1
 [2.2.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.1.0...release-2.2.0
 [2.1.0]: https://github.com/ianderso/gramps-evidence-mcp/compare/release-2.0.0...release-2.1.0
