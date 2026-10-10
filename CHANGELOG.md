@@ -8,7 +8,19 @@ adding one is a minor release.
 
 ## [Unreleased]
 
-### Fixed
+### Added
+
+- `update_attribute`: set or remove one attribute on a person, family,
+  event, media object, source or citation, in place (TOOL-REQUESTS #32).
+  `add_attribute` only appends and `update_object_fields` refuses
+  `attribute_list`, so a value could not be corrected or taken out: a
+  number moved into its own attribute stayed in the old one too. The
+  attribute is picked by name, ignoring case, and by `match`, part of its
+  value, where the name repeats; matching none, or several that differ,
+  changes nothing and lists them. A value set keeps the attribute's
+  citations, notes and privacy; a removed attribute's citations stay in the
+  tree and are named in the result. `add_attribute`'s description points at
+  it.
 
 - `get_timeline` reported every event uncited, with `citations: 0` and
   `confidence: null` (TOOL-REQUESTS #30). gramps-webapi counts an event's

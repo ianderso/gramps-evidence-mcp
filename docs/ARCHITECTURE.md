@@ -7,7 +7,7 @@ How the server is put together. [PITFALLS.md](PITFALLS.md) covers
 ## Layers
 
 ```
-server.py     96 MCP tool functions, their annotations, and the entry point.
+server.py     97 MCP tool functions, their annotations, and the entry point.
               Parameter validation, no business logic.
 service.py    Genealogy operations. Enforces the evidence model, resolves
               references, shapes results.

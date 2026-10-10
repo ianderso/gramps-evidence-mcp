@@ -2274,6 +2274,134 @@ class GrampsService:
             result,
         )
 
+    async def update_attribute(
+        self,
+        object_type: str,
+        ref: str,
+        name: str,
+        value: str | None = None,
+        match: str | None = None,
+        remove: bool = False,
+    ) -> dict:
+        """Set or remove one attribute of an object in place (TOOL-REQUESTS #32).
+
+        ``add_attribute`` only appends, and ``update_object_fields`` refuses
+        ``attribute_list``, a structural list, so a value could be neither
+        corrected nor taken out. The attribute is chosen by its name, and,
+        where the name repeats, by ``match`` against its value. Several left
+        are refused with the candidates, unless they are identical in every
+        field, when any one is the same as another and the last is taken. A
+        value set keeps the attribute's citations, notes and privacy; an
+        attribute removed has its citations named, since nothing else may
+        reference them.
+
+        Parameters
+        ----------
+        object_type : {"person", "family", "event", "media", "source", "citation"}
+            Type of the object carrying the attribute.
+        ref : str
+            Handle or gramps_id.
+        name : str
+            The attribute's name (type), matched ignoring case and punctuation.
+        value : str, optional
+            The new value. Not with ``remove``.
+        match : str, optional
+            Case-insensitive substring of the current value.
+        remove : bool, optional
+            Remove the attribute instead of setting its value.
+
+        Returns
+        -------
+        dict
+            Handle, gramps_id, the attribute as it now is (or was, removed),
+            and a message; or an ``error`` key naming the candidates.
+        """
+        if object_type not in _ATTRIBUTE_HOLDERS:
+            return {
+                "error": "unsupported",
+                "message": f"Attributes are carried by {', '.join(sorted(_ATTRIBUTE_HOLDERS))}, "
+                f"not {object_type}. An event reference's are update_event_ref's.",
+            }
+        if remove == (value is not None):
+            return {
+                "error": "nothing_to_do",
+                "message": "Pass value to set the attribute's value, or remove=True to "
+                "remove it; not both.",
+            }
+        needle = (match or "").strip().lower()
+        found: dict[str, Any] = {}
+
+        def edit(obj: dict) -> str | bool:
+            attrs = obj.get("attribute_list") or []
+            named = [a for a in attrs if _type_key(_type_string(a.get("type"))) == _type_key(name)]
+            hits = [a for a in named if needle in str(a.get("value") or "").lower()]
+            found["listing"] = (
+                "; ".join(
+                    f"{_type_string(a.get('type'))}: {str(a.get('value') or '')[:60]}"
+                    for a in (named or attrs)
+                )
+                or f"(no attributes on this {object_type})"
+            )
+            if not hits:
+                found["error"] = "not_found"
+                return False
+            if any(a != hits[0] for a in hits[1:]):
+                found["error"] = "ambiguous"
+                found["count"] = len(hits)
+                return False
+            attr = hits[-1]
+            found["before"] = copy.deepcopy(attr)
+            label = _type_string(attr.get("type"))
+            if remove:
+                obj["attribute_list"] = [a for a in attrs if a is not attr]
+                return f"attribute '{label}' removed"
+            if attr.get("value") == value:
+                return False
+            attr["value"] = value
+            return f"attribute '{label}' set"
+
+        result = await self._mutate(object_type, ref, edit, label="updated")
+        who = f"{object_type} {result.get('gramps_id') or result['handle']}"
+        if "error" in found:
+            wanted = f"'{name}'" + (f" with '{match}' in its value" if match else "")
+            return _with_repairs(
+                {
+                    "error": found["error"],
+                    "message": (
+                        f"No attribute {wanted} on {who}."
+                        if found["error"] == "not_found"
+                        else f"{found['count']} attributes {wanted} on {who}: pass match, a "
+                        "part of the value that only the one you mean has."
+                    )
+                    + f" Attributes: {found['listing']}. Nothing was changed.",
+                },
+                result,
+            )
+        before = found["before"]
+        out = {
+            "object_type": object_type,
+            "handle": result["handle"],
+            "gramps_id": result.get("gramps_id"),
+            "changed": result.get("changed", True),
+            "attribute": {
+                "type": _type_string(before.get("type")),
+                "value": before.get("value") if remove else value,
+                "citation_count": len(before.get("citation_list") or []),
+            },
+            "message": result["message"],
+        }
+        if remove and before.get("citation_list"):
+            rows = await self.client.list_objects(
+                "citation", handles=before["citation_list"], keys="handle,gramps_id"
+            )
+            left = [r.get("gramps_id") or r["handle"] for r in rows]
+            out["citations_left"] = left
+            out["message"] += (
+                f". Its citations stay in the tree: {', '.join(left)}; uncite or delete "
+                "any that now supports nothing"
+            )
+        return out
+
     async def add_url(
         self,
         object_type: str,
@@ -9365,6 +9493,9 @@ def _placeref_key(ref: dict) -> tuple:
 
 #: Object types with a media_list, and with a note_list.
 _MEDIA_HOLDERS = {"person", "family", "event", "place", "source", "citation"}
+#: Objects with an ``attribute_list``: a SrcAttribute on a source or citation,
+#: an Attribute on the rest.
+_ATTRIBUTE_HOLDERS = {"person", "family", "event", "media", "source", "citation"}
 _NOTE_HOLDERS = _MEDIA_HOLDERS | {"media", "repository"}
 
 

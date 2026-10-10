@@ -729,14 +729,42 @@ async def add_attribute(
     value: str = Field(description="Attribute value, e.g. 'Blacksmith'."),
     allow_new_type: bool = _allow_new_type(),
 ) -> dict:
-    """Add a typed key/value attribute to an object.
-
-    Sources and citations use a SrcAttribute; everything else uses an Attribute.
-    The right class is chosen automatically from object_type.
-    """
+    """Add a typed key/value attribute to an object. update_attribute changes
+    or removes one already there."""
     try:
         svc = await state.service_()
         return await svc.add_attribute(object_type, target, name, value, allow_new_type)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(annotations=EDITS)
+async def update_attribute(
+    object_type: str = Field(
+        description="Type of the object: 'person', 'event', 'family', 'media', "
+        "'source', 'citation'."
+    ),
+    target: str = Field(description="Handle or gramps_id of the object."),
+    name: str = Field(description="Name (type) of the attribute to change, e.g. 'Occupation'."),
+    value: str | None = Field(default=None, description="Its new value. Omit when removing it."),
+    match: str | None = Field(
+        default=None,
+        description="Case-insensitive part of the current value, to pick one of several "
+        "attributes of this name. Matching none, or several that differ, changes nothing "
+        "and lists them.",
+    ),
+    remove: bool = Field(
+        default=False,
+        description="Remove the attribute. Its citations stay in the tree and are named.",
+    ),
+) -> dict:
+    """Set or remove ONE attribute on an object in place, keeping its
+    citations, notes and privacy."""
+    try:
+        svc = await state.service_()
+        return await svc.update_attribute(
+            object_type, target, name, value=value, match=match, remove=remove
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 

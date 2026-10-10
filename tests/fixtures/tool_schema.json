@@ -446,6 +446,14 @@
     "remove",
     "surname"
   ],
+  "update_attribute": [
+    "match",
+    "name",
+    "object_type",
+    "remove",
+    "target",
+    "value"
+  ],
   "update_child_ref": [
     "allow_new_type",
     "child",

@@ -725,6 +725,38 @@ async def test_a_private_tasks_note_is_private_and_stays_so(live):
 
 
 # --------------------------------------------------------------------------- #
+# Attributes
+# --------------------------------------------------------------------------- #
+async def test_update_attribute_sets_and_removes_one_in_place(live):
+    """TOOL-REQUESTS #32: a value trimmed keeps its citation; a removal names it."""
+    [person] = await _people(live, "Ada")
+    target = {"object_type": "person", "target": person["gramps_id"]}
+    await live("add_attribute", name="Occupation", value="Custodian, 1963; no. 000", **target)
+    await live("add_attribute", name="Nickname", value="Addie", **target)
+    citation = await live("add_citation", citation={"source_title": "Index", "page": "entry 1"})
+    raw = await live.client.get_object("person", person["handle"])
+    raw["attribute_list"][0]["citation_list"] = [citation["handle"]]
+    await live.client.update_object("person", person["handle"], raw)
+
+    out = await live("update_attribute", name="Occupation", value="Custodian, 1963", **target)
+    assert "error" not in out, out
+    stored = await live.client.get_object("person", person["handle"])
+    assert [a["value"] for a in stored["attribute_list"]] == ["Custodian, 1963", "Addie"]
+    assert stored["attribute_list"][0]["citation_list"] == [citation["handle"]]
+
+    out = await live("update_attribute", name="Occupation", remove=True, **target)
+    assert out["citations_left"] == [citation["gramps_id"]], out
+    stored = await live.client.get_object("person", person["handle"])
+    assert [_t(a["type"]) for a in stored["attribute_list"]] == ["Nickname"]
+
+    source = await live("add_source", title="Pension File W.1")
+    on_source = {"object_type": "source", "target": source["gramps_id"]}
+    await live("add_attribute", name="Bears-On", value="I0001", allow_new_type=True, **on_source)
+    out = await live("update_attribute", name="Bears-On", value="I0001, I0002", **on_source)
+    assert "error" not in out, out
+
+
+# --------------------------------------------------------------------------- #
 # Timelines
 # --------------------------------------------------------------------------- #
 async def test_a_timeline_counts_citations_and_keeps_to_the_person_asked(live):
